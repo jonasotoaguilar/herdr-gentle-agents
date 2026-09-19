@@ -1,0 +1,38 @@
+id = "herdr-gentle-agents"
+name = "Herdr Gentle Agents"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Herdr sidebar states for Pi + Gentle Shell agents: working (name/n), ask, review, error, done, idle, plus a session-changes badge."
+platforms = ["linux"]
+
+# Task 5 scaffold: identity metadata only.
+#
+# min_herdr_version tracks herdr-pi-tree (0.9.0): this plugin extends the same
+# pane-metadata transport and snapshot surface (DESIGN.md §2 E8/E10, §9).
+# platforms stays linux-only until the daemon ships: cross-platform scope is
+# unresolved (DESIGN.md §10 U6).
+#
+# [[build]], [[actions]], and [[panes]] are intentionally absent. DESIGN.md
+# §10 U1 (notification CLI syntax) and U2 (event catalog + poll cadence) are
+# unresolved, and task 6 (extensions/ producer) owns the settings paths.
+# Sections below are added only as their commands become verifiable.
+#
+# Coexistence: single-writer handoff with herdr-pi-tree, which stays installed
+# but disabled for gentle-owned panes. No Agents-panel ownership is claimed
+# here (DESIGN.md §3 O1, §9).
+
+# Consumer daemon (task 7): poll snapshot → reduce → publish owned gentle_*
+# tokens, ask notify exactly once per intentId, scoped orphan sweep.
+# No-args mode only ensures the daemon is running; --run is the loop.
+# Poll cadence is a provisional 10 s default (GENTLE_STATUS_POLL_MS
+# overrides); DESIGN §10 U2 sets no normative cadence yet, only << 60 s TTL.
+[[startup]]
+command = ["node", "bin/gentle-status.js"]
+
+# Watchdog, not the wake mechanism: the daemon polls on its own cadence and
+# a crashed daemon comes back on the next agent detection (same pattern as
+# herdr-pi-tree's agent-state watchdog). No per-flip event hooks: U2's event
+# catalog is unresolved, so no [[events]] beyond this restart hook is wired.
+[[events]]
+on = "pane.agent_detected"
+command = ["node", "bin/gentle-status.js"]
