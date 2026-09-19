@@ -289,6 +289,22 @@ function saveLedger(ledger) {
 
 const lastSent = new Map(); // paneId -> JSON of last published family
 
+// Single scoped sweeper (R3-orphan + R4-live-loop): the owned gentle_*
+// family only, cleared under this daemon's own source tag. Foreign tokens
+// (pi-tree, native, other plugins) are never touched. All sweep paths —
+// per-frame departed-pane sweep, shutdown sweep, --stop handover/purge —
+// go through clearOwnedFamily; no duplicated clear logic.
+function ownedClearPatch() {
+  const clear = {};
+  for (const name of contract.OWNED_TOKENS) clear[name] = null;
+  return clear;
+}
+
+async function clearOwnedFamily(paneId) {
+  lastSent.delete(paneId);
+  return reportChunked(SOURCE, paneId, ownedClearPatch());
+}
+
 async function frame(state) {
   const now = Date.now();
   const agents = await agentsAsync();
@@ -343,6 +359,17 @@ async function frame(state) {
     saveLedger(state.ledger);
     state.ledgerDirty = false;
   }
+  // Live-set-change orphan sweep (R3-orphan + R4-live-loop): panes that
+  // dropped out of the live agent set keep presence-encoded owned tokens;
+  // clear the owned family under our own source (never foreign tokens).
+  const departed = [...state.live].filter((id) => !live.has(id));
+  for (const id of departed) {
+    try {
+      await clearOwnedFamily(id);
+    } catch (error) {
+      logError(error);
+    }
+  }
   state.live = live;
 }
 
@@ -357,10 +384,7 @@ async function sweepOrphans(live) {
     if (typeof id !== 'string' || live.has(id)) continue;
     const tokens = pane?.tokens && typeof pane.tokens === 'object' ? pane.tokens : {};
     if (!contract.OWNED_TOKENS.some((name) => name in tokens)) continue;
-    const clear = {};
-    for (const name of contract.OWNED_TOKENS) clear[name] = null;
-    lastSent.delete(id);
-    jobs.push(reportChunked(SOURCE, id, clear));
+    jobs.push(clearOwnedFamily(id));
   }
   if (jobs.length === 0) return true;
   return (await Promise.all(jobs)).every(Boolean);
@@ -415,7 +439,7 @@ async function run() {
   }
   const state = { ledger: loadLedger(), ledgerDirty: false, live: new Set() };
   let stopped = false;
-  const shutdown = () => {
+  const shutdown = async () => {
     if (stopped) return;
     stopped = true;
     try {
@@ -423,21 +447,30 @@ async function run() {
     } catch {
       // Already gone.
     }
+    // Detached-child rollback (R4): terminate the poll loop and run the
+    // scoped sweep over the last-known live set, so disable/uninstall/
+    // shutdown leaves no polling child and no orphan owned tokens behind.
+    // Best-effort: transport failure is logged, never thrown from a signal.
+    try {
+      await sweepOrphans(state.live ?? new Set());
+    } catch (error) {
+      logError(error);
+    }
   };
   process.on('SIGTERM', () => {
-    shutdown();
-    process.exit(0);
+    void shutdown().finally(() => process.exit(0));
   });
   process.on('SIGINT', () => {
-    shutdown();
-    process.exit(0);
+    void shutdown().finally(() => process.exit(0));
   });
   for (;;) {
+    if (stopped) break;
     try {
       await frame(state);
     } catch (error) {
       logError(error);
     }
+    if (stopped) break;
     await new Promise((resolve) => setTimeout(resolve, POLL_MS));
   }
 }

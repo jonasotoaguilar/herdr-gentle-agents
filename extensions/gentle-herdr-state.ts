@@ -71,7 +71,7 @@
 
 import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Contract constants (DESIGN §4.3 / §8)
@@ -93,6 +93,7 @@ const MAX_TRACKED_TASKS = 128;
 const MAX_CHANGE_PATHS = 256;
 const TASK_STALE_MS = 30 * 60 * 1000;
 const TRANSPORT_FAIL_LATCH = 3;
+const CLI_FALLBACK_TIMEOUT_MS = 2500;
 
 const ASK_EVENT = "gentle-pi:ask-user-choice:blocked";
 const QUESTIONNAIRE_EVENT = "rpiv:ask-user:blocked";
@@ -206,20 +207,48 @@ async function sendTokens(tokens) {
         1500,
       ));
     if (delivered) continue;
-    if (!cliFallback(patch)) return false;
+    if (!(await cliFallback(patch))) return false;
   }
   return true;
 }
 
+// Never spawnSync on the agent event loop (R4-stall): async spawn with a
+// short timeout keeps beats off the critical path; on failure the beat is
+// skipped and the next beat repairs (at-least-once already holds). Fixed
+// argv, no shell; 60 s TTL discipline untouched.
 function cliFallback(patch) {
-  try {
-    const args = ["pane", "report-metadata", paneId, "--source", SOURCE];
-    for (const [name, value] of Object.entries(patch)) args.push("--token", `${name}=${value}`);
-    const result = spawnSync("herdr", args, { timeout: 5000, encoding: "utf8" });
-    return result.status === 0;
-  } catch {
-    return false;
-  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    let child;
+    try {
+      const args = ["pane", "report-metadata", paneId, "--source", SOURCE];
+      for (const [name, value] of Object.entries(patch)) args.push("--token", `${name}=${value}`);
+      child = spawn("herdr", args, { windowsHide: true });
+    } catch {
+      finish(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {}
+      finish(false);
+    }, CLI_FALLBACK_TIMEOUT_MS);
+    if (timer.unref) timer.unref();
+    child.on("error", () => {
+      clearTimeout(timer);
+      finish(false);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      finish(code === 0);
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
