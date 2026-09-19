@@ -177,7 +177,21 @@ function sendRequestAttempt(request, timeoutMs) {
         finish(false);
       }
     });
-    socket.on("data", () => finish(true));
+    socket.on("data", (chunk) => {
+      let body;
+      try {
+        body = JSON.parse(String(chunk));
+      } catch {
+        // Fail closed on unparseable bodies: retry + CLI fallback engage.
+        finish(false);
+        return;
+      }
+      if (isRecord(body) && body.error !== undefined && body.error !== null) {
+        finish(false);
+        return;
+      }
+      finish(true);
+    });
     socket.on("end", () => finish(false));
     timeout = setTimeout(() => finish(false), timeoutMs);
     if (timeout.unref) timeout.unref();
@@ -738,6 +752,7 @@ export default function (pi) {
   });
 
   pi.on("session_shutdown", () => {
+    rootSession = false;
     if (beatTimer) {
       clearInterval(beatTimer);
       beatTimer = undefined;
