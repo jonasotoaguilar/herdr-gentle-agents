@@ -2,7 +2,7 @@ id = "herdr-gentle-agents"
 name = "Herdr Gentle Agents"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
-description = "Herdr sidebar states for Pi + Gentle Shell agents: working (name/n), ask, review, error, done, idle, plus a session-changes badge."
+description = "Herdr sidebar states for Pi + Gentle Shell agents: working (n), ask, review, blocked, done, idle, plus exact +N/-N SessionChanges segments and ↑N behind-upstream marker."
 platforms = ["linux"]
 
 # Task 5 scaffold: identity metadata only.
@@ -30,16 +30,22 @@ platforms = ["linux"]
 [[startup]]
 command = ["node", "bin/gentle-status.js"]
 
-# Watchdog, not the wake mechanism: the daemon polls on its own cadence and
-# a crashed daemon comes back on the next agent detection (same pattern as
-# herdr-pi-tree's agent-state watchdog). No per-flip event hooks: U2's event
-# catalog is unresolved, so no [[events]] beyond this restart hook is wired.
+# Watchdog + immediate refresh: --once renders one frame then exits, so a
+# newly opened project name/state appears immediately instead of waiting for
+# the next 10 s poll tick. The daemon stays the polling loop (see [[startup]]
+# above); --once is the per-event one-frame refresh, not the wake mechanism
+# for a crashed daemon (a crashed daemon still comes back via ensure-running
+# on the next agent detection — same pattern as herdr-pi-tree's agent-state
+# watchdog). No per-flip event hooks: U2's event catalog is unresolved, so
+# no [[events]] beyond this refresh hook is wired.
 [[events]]
 on = "pane.agent_detected"
-command = ["node", "bin/gentle-status.js"]
+command = ["node", "bin/gentle-status.js", "--once"]
 
 # Sidebar wiring (DESIGN.md §5.3 install configuration): the daemon publishes
-# presence-encoded gentle_title_* labels plus $gentle_badge, and
+# presence-encoded gentle_title_* labels plus the exact +N/-N SessionChanges
+# segments ($gentle_changes_added/$gentle_changes_deleted) and the ↑N
+# behind-upstream marker ($gentle_changes_pull), and
 # bin/configure.js appends exactly one marked pi-only
 # [ui.sidebar.agents.rows_by_agent] override for canonical agent `pi`. The
 # parent [ui.sidebar.agents] table stays user-owned; --apply refuses when an
@@ -47,15 +53,17 @@ command = ["node", "bin/gentle-status.js"]
 # installed herdr-pi-tree convention (action_id/command/description/
 # platforms/title, observed via `herdr plugin action list`); platforms stays
 # linux-only to match this manifest. No [[build]] hook is wired: the plugin
-# ships no build step, so public install is
-# `herdr plugin install jonasotoaguilar/herdr-gentle-agents --ref <tag>`
-# (local development uses `herdr plugin link --enabled .`) followed by the
-# configure action below. The Pi side installs separately via
-# `pi install git:github.com/jonasotoaguilar/herdr-gentle-agents@<tag>`.
+# ships no build step, so the supported entrypoint is the combined remote
+# installer `install.sh`, which installs + enables this plugin, atomically copies
+# extensions/gentle-herdr-state.ts into the Pi agent dir, and runs the
+# configure action below (public pinned example:
+# `curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/v0.1.0/install.sh | sh -s -- --ref v0.1.0`).
+# Local development uses `herdr plugin link --enabled .` followed by the
+# configure action below; the Pi side stays a managed copy, never `pi install`.
 [[actions]]
 id = "configure"
 command = ["node", "bin/configure.js", "--apply", "--reload"]
-description = "Append (or repair) the managed pi-only [ui.sidebar.agents.rows_by_agent] override (gentle_title_* + $gentle_badge) without touching the user [ui.sidebar.agents] table, then reload."
+description = "Append (or repair) the managed pi-only [ui.sidebar.agents.rows_by_agent] override (gentle_title_* + exact +N/-N SessionChanges segments + ↑N behind-upstream marker) without touching the user [ui.sidebar.agents] table, then reload."
 platforms = ["linux"]
 title = "Configure: install the pi-only sidebar override"
 

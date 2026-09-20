@@ -55,6 +55,59 @@ const SOCKET_TIMEOUT_MS = 4000;
 const CLI_TIMEOUT_MS = 5000;
 const MAX_IN_FLIGHT = 16;
 
+// DESIGN §5.3 pull marker: behind-upstream count per pane cwd, read from
+// fixed-argv `git status --porcelain=2 --branch` ONLY (the `# branch.ab`
+// line). No shell, no diff, no fetch. Bounded: 2 s timeout, 64 KiB cap,
+// short-TTL per-cwd cache (default 30 s, env-overridable) with in-frame
+// dedupe via the same cache, so N panes in one worktree cost ~1 git call
+// per TTL window. Any failure (no cwd, no git, no upstream, timeout)
+// resolves to 0 — fail-closed, the marker simply stays absent.
+const PULL_TTL_MS = Number(process.env.GENTLE_PULL_TTL_MS ?? 30000) || 30000;
+const PULL_CACHE_MAX = 128;
+const pullCache = new Map(); // cwd -> { behind, at }
+
+function branchBehind(cwd) {
+  const now = Date.now();
+  if (typeof cwd === 'string' && cwd.length > 0) {
+    const hit = pullCache.get(cwd);
+    if (hit && now - hit.at < PULL_TTL_MS) return hit.behind;
+  }
+  let behind = 0;
+  try {
+    if (typeof cwd === 'string' && cwd.length > 0 && cwd.length <= 4096) {
+      const result = spawnSync(
+        'git',
+        ['--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain=2', '--branch', '--untracked-files=no'],
+        { cwd, encoding: 'utf8', timeout: 2000, maxBuffer: 64 * 1024, windowsHide: true },
+      );
+      if (result.status === 0 && typeof result.stdout === 'string') {
+        const ab = /^# branch\.ab \+(\d+) -(\d+)$/m.exec(result.stdout);
+        if (ab) behind = Number(ab[2]) || 0;
+      }
+    }
+  } catch {
+    behind = 0;
+  }
+  if (typeof cwd === 'string' && cwd.length > 0) {
+    if (pullCache.size >= PULL_CACHE_MAX) pullCache.clear();
+    pullCache.set(cwd, { behind, at: now });
+  }
+  return behind;
+}
+
+function pullMarkerFor(entry) {
+  const foreground = entry?.foreground_cwd;
+  const base = entry?.cwd;
+  const cwd =
+    typeof foreground === 'string' && foreground.length > 0
+      ? foreground
+      : typeof base === 'string'
+        ? base
+        : '';
+  const behind = branchBehind(cwd);
+  return behind > 0 ? `↑${behind}` : '';
+}
+
 const DEBUG = process.env.GENTLE_STATUS_DEBUG === '1';
 function debug(...args) {
   if (DEBUG) console.error('[gentle-status]', ...args);
@@ -296,7 +349,7 @@ const lastSent = new Map(); // paneId -> JSON of last published family
 // go through clearOwnedFamily; no duplicated clear logic.
 function ownedClearPatch() {
   const clear = {};
-  for (const name of contract.OWNED_TOKENS) clear[name] = null;
+  for (const name of contract.SWEEP_TOKENS) clear[name] = null;
   return clear;
 }
 
@@ -323,6 +376,9 @@ async function frame(state) {
       debug(`pane ${paneId}: pi-tree owns; yielding`);
       continue;
     }
+    // Behind-upstream marker, resolved per cwd with TTL dedupe (no storm
+    // across panes sharing a worktree). Absent on any failure.
+    reduced.pull = pullMarkerFor(entry);
     if (reduced.display === 'ask' && reduced.notify) {
       askSessions.add(reduced.notify.sessionHash);
       const key = `${reduced.notify.sessionHash}:${reduced.notify.intentId}`;
@@ -383,7 +439,7 @@ async function sweepOrphans(live) {
     const id = pane?.pane_id;
     if (typeof id !== 'string' || live.has(id)) continue;
     const tokens = pane?.tokens && typeof pane.tokens === 'object' ? pane.tokens : {};
-    if (!contract.OWNED_TOKENS.some((name) => name in tokens)) continue;
+    if (!contract.SWEEP_TOKENS.some((name) => name in tokens)) continue;
     jobs.push(clearOwnedFamily(id));
   }
   if (jobs.length === 0) return true;
