@@ -39,11 +39,16 @@
 //                       pi-permission-system:permission-request waiting state
 //                       (tool-gated confirmation leg). One intentId minted per
 //                       ¬ask→ask episode; stable across beats in the episode.
-//   review            : RESERVED hook `gentle-pi:review:blocked`
-//                       {active, reviewId?}. DESIGN §10 U4 (review-in-progress
-//                       matcher) is UNRESOLVED: gentle-ai exposes no review
-//                       lifecycle event, so this listener has no sender yet
-//                       and `review:` never fires. Do not invent a matcher.
+//   review            : in-flight Pi review tool calls
+//                       (gentle_review, gentle_review_capture,
+//                       gentle_review_capture_group, gentle_review_scope)
+//                       tracked by toolCallId via the same in-process
+//                       tool_call/tool_result seams as subagent activity, plus
+//                       the reserved hook `gentle-pi:review:blocked`
+//                       {active, reviewId?}. `review:` fires only while a
+//                       review tool call is in flight (or the reserved hook
+//                       reports active). Fail-safe: no provider verdicts are
+//                       invented; the id is a sanitized correlation id only.
 //   error             : subagent task failed status / subagent tool error /
 //                       repeated own-transport failure. Latched until the next
 //                       agent_start (fresh snapshot), TTL-bounded display.
@@ -98,7 +103,15 @@ const CLI_FALLBACK_TIMEOUT_MS = 2500;
 const ASK_EVENT = "gentle-pi:ask-user-choice:blocked";
 const QUESTIONNAIRE_EVENT = "rpiv:ask-user:blocked";
 const PERMISSION_EVENT = "pi-permission-system:permission-request";
-const REVIEW_EVENT = "gentle-pi:review:blocked"; // reserved hook, see U4 note above
+const REVIEW_EVENT = "gentle-pi:review:blocked"; // reserved hook, OR-combined with the in-flight review tool-call signal below
+// Exact Pi tool registrations verified in the installed Gentle Shell source
+// (extensions/gentle-ai.ts): these four names are the only review leg.
+const REVIEW_TOOLS = new Set([
+  "gentle_review",
+  "gentle_review_capture",
+  "gentle_review_capture_group",
+  "gentle_review_scope",
+]);
 const CHANGE_EVENT = "gentle-pi:session-change";
 const CHANGE_ENTRY = "gentle-pi.session-change/v1";
 const BLOCKED_EVENT = "herdr:blocked";
@@ -382,9 +395,20 @@ export default function (pi) {
   const permissionPending = new Set();
   let askIntentId;
   let askCounter = 0;
-  // Review leg: reserved for the U4 matcher; no sender exists yet.
+  // Review leg: bounded in-flight signal. reviewCalls tracks live review
+  // tool calls by toolCallId; reviewEventActive is the reserved
+  // `gentle-pi:review:blocked` hook. reviewActive is the effective OR of
+  // both, so `review:` emits only while a review tool call is in flight
+  // (or the hook reports active). reviewId stays a sanitized correlation
+  // id; never a provider verdict.
   let reviewActive = false;
+  let reviewEventActive = false;
   let reviewId;
+  const reviewCalls = new Map(); // toolCallId -> at (ms)
+
+  function syncReviewActive() {
+    reviewActive = reviewEventActive || reviewCalls.size > 0;
+  }
   // Error latch: cleared on the next agent_start (fresh snapshot).
   let errorCode;
   let emittedLabel;
@@ -573,6 +597,8 @@ export default function (pi) {
     questionnaireActive = false;
     permissionPending.clear();
     askIntentId = undefined;
+    reviewEventActive = false;
+    reviewCalls.clear();
     reviewActive = false;
     reviewId = undefined;
     errorCode = undefined;
@@ -619,15 +645,16 @@ export default function (pi) {
     }
   });
 
-  // -- review leg (reserved hook; DESIGN §10 U4 unresolved — no sender yet) --
+  // -- review leg (in-flight review tool calls + reserved hook) --
 
   pi.events.on(REVIEW_EVENT, (event) => {
     if (!rootSession || !isRecord(event) || typeof event.active !== "boolean") return;
-    if (event.active === reviewActive) return;
-    reviewActive = event.active;
-    if (reviewActive && typeof event.reviewId === "string" && ID_RE.test(event.reviewId)) {
+    if (event.active === reviewEventActive) return;
+    reviewEventActive = event.active;
+    if (reviewEventActive && typeof event.reviewId === "string" && ID_RE.test(event.reviewId)) {
       reviewId = event.reviewId;
     }
+    syncReviewActive();
     updateBlocker();
   });
 
@@ -651,6 +678,14 @@ export default function (pi) {
 
   pi.on("tool_call", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
+    if (REVIEW_TOOLS.has(event.toolName)) {
+      if (typeof event.toolCallId === "string" && event.toolCallId.length > 0) {
+        reviewCalls.set(event.toolCallId, Date.now());
+        syncReviewActive();
+        updateBlocker();
+        schedulePublish();
+      }
+    }
     if (event.toolName === "subagent_run" || event.toolName === "subagent_continue") {
       const parsed = launchInput(event.input);
       if (!parsed || typeof event.toolCallId !== "string") return;
@@ -674,6 +709,15 @@ export default function (pi) {
   pi.on("tool_result", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
     if (typeof event.toolCallId === "string") pendingCalls.delete(event.toolCallId);
+    if (typeof event.toolCallId === "string" ? reviewCalls.delete(event.toolCallId) : false) {
+      const wasActive = reviewActive;
+      syncReviewActive();
+      if (reviewActive !== wasActive) updateBlocker();
+    } else if (REVIEW_TOOLS.has(event.toolName)) {
+      const wasActive = reviewActive;
+      syncReviewActive();
+      if (reviewActive !== wasActive) updateBlocker();
+    }
     const details = isRecord(event.details) ? event.details.gentleAgents : undefined;
     if (!isRecord(details) || typeof details.taskId !== "string") {
       if (event.toolName === "subagent_run" && event.isError === true && !errorCode) {

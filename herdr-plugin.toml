@@ -12,9 +12,10 @@ platforms = ["linux"]
 # platforms stays linux-only until the daemon ships: cross-platform scope is
 # unresolved (DESIGN.md §10 U6).
 #
-# [[build]], [[actions]], and [[panes]] are intentionally absent. DESIGN.md
+# [[build]] and [[panes]] are intentionally absent. DESIGN.md
 # §10 U1 (notification CLI syntax) and U2 (event catalog + poll cadence) are
 # unresolved, and task 6 (extensions/ producer) owns the settings paths.
+# [[actions]] below holds only the verified configure/unconfigure pair.
 # Sections below are added only as their commands become verifiable.
 #
 # Coexistence: single-writer handoff with herdr-pi-tree, which stays installed
@@ -36,3 +37,28 @@ command = ["node", "bin/gentle-status.js"]
 [[events]]
 on = "pane.agent_detected"
 command = ["node", "bin/gentle-status.js"]
+
+# Sidebar wiring (DESIGN.md §5.3 install configuration): the daemon publishes
+# presence-encoded gentle_title_* labels plus $gentle_badge, and
+# bin/configure.js appends exactly one marked pi-only
+# [ui.sidebar.agents.rows_by_agent] override for canonical agent `pi`. The
+# parent [ui.sidebar.agents] table stays user-owned; --apply refuses when an
+# unmanaged rows_by_agent override already exists. Action shape mirrors the
+# installed herdr-pi-tree convention (action_id/command/description/
+# platforms/title, observed via `herdr plugin action list`); platforms stays
+# linux-only to match this manifest. No [[build]] hook is wired: no verified
+# build/install hook field exists beyond startup/events/actions, so install
+# stays `herdr plugin link` + the configure action below.
+[[actions]]
+id = "configure"
+command = ["node", "bin/configure.js", "--apply", "--reload"]
+description = "Append (or repair) the managed pi-only [ui.sidebar.agents.rows_by_agent] override (gentle_title_* + $gentle_badge) without touching the user [ui.sidebar.agents] table, then reload."
+platforms = ["linux"]
+title = "Configure: install the pi-only sidebar override"
+
+[[actions]]
+id = "unconfigure"
+command = ["node", "bin/configure.js", "--uninstall", "--reload"]
+description = "Remove the managed pi-only sidebar override and reload; the user [ui.sidebar.agents] table is left intact. Run before uninstalling."
+platforms = ["linux"]
+title = "Configure: remove the pi-only sidebar override"

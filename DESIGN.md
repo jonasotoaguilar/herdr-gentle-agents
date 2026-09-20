@@ -169,7 +169,7 @@ Sidecar only: ships beside `herdr-agent-state.ts`, never modifies it.
 | `agent_start` / `isIdle=false`, 0 active subs (native + TaskStore) | `gentle_work_v1=<hash>:0:<exp>`; clear `herdr:blocked` labels | `working` (main) |
 | TaskStore `running`/`queued` non-empty (G3) | `gentle_work_v1=<hash>:<count>:<exp>` + `gentle_names_v1=<csv>` (names = `TaskRecord.label`/`agent`) | `working (name)` (1 sub) / `working (n)` (>1 or label withheld) |
 | `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt` | `herdr:blocked` label `ask:<intentId>` | `ask` |
-| review-integration `gentle-ai.review-integration/v2` consent/capture/validation in flight (G5) | `herdr:blocked` label `review:<reviewId>` | `review` |
+| Pi in-process `tool_call` opens / `tool_result` closes for the exact registered tools `gentle_review`, `gentle_review_capture`, `gentle_review_capture_group`, `gentle_review_scope` (G5), tracked by `toolCallId`; reserved `gentle-pi:review:blocked` hook remains OR-combined | `herdr:blocked` label `review:<reviewId>` | `review` |
 | agent error / task failed / transport failure | `herdr:blocked` label `error:<code>` | `error` |
 | `agent_settled` + 0 active subs | `gentle_work_v1=<hash>:0:<exp>`; clear `blocked` labels | `done` |
 | `SESSION_CHANGE_ENTRY` `gentle-pi.session-change/v1` tool outcome (G1/G2) | `gentle_changes_v1=<hash>:<files>:<added+deleted>:<exp>` | changes badge only (orthogonal to state) |
@@ -350,9 +350,7 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 - **U3. pi-tree producer file:** which file in `herdr-pi-tree` emits
   `pi_subagents_work_v1` (only `lib/state.js` consumers were traced); needed
   to confirm no shared writer path.
-- **U4. Review-in-progress matcher:** exact event/field that opens and closes
-  a `review` span from `gentle-ai.review-integration/v2` + `gentle_review`
-  tool state (consent vs capture vs validation boundaries).
+- **U4. Review-in-progress matcher — RESOLVED (task 8):** Pi in-process `tool_call`/`tool_result` seam for the exact registered tools `gentle_review`, `gentle_review_capture`, `gentle_review_capture_group`, `gentle_review_scope` (G5), tracked by `toolCallId`, OR-combined with the reserved `gentle-pi:review:blocked` hook. Fail-safe semantics: `review:` label only while a review tool call is in flight (or the hook reports active); `reviewId` is a sanitized correlation id, never a provider verdict.
 - **U5. Changes badge:** `±N` vs `~N` selection rule, aggregation
   (sum `added+deleted` vs files count), and cross-process transport of
   `SESSION_CHANGE_ENTRY` facts to the Pi producer extension.
@@ -368,7 +366,7 @@ confirming each criterion has a normative section:
 |---|------------------------------|-------------------|
 | V1 | Sidebar shows `working (name)` with live subagents | §4.2 (names source G3), §5.2–§5.3 |
 | V2 | Sidebar shows `ask` on open question | §4.2 (G4 → `ask:`), §5.2 priority, §7 notify-once |
-| V3 | Sidebar shows `review` during native review | §4.2 (G5 → `review:`), §5.2 priority |
+| V3 | Sidebar shows `review` during native review | §4.2 (review tool lifecycle → `review:`), §5.2 priority |
 | V4 | Changes badge renders from Gentle session-changes | §4.2/§4.4 (`gentle_changes_v1`), §5.3 suffix |
 | V5 | No collision with pi-tree `↳N` / `state_*` names | §3 O1/O2/O4, §9 rollback |
 | V6 | Stale panes fall back to `idle`, orphans swept on handover | §3 O5, §5.4, §6 |
