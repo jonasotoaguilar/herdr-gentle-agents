@@ -18,11 +18,61 @@ Prerequisites: Herdr meeting `min_herdr_version` in `herdr-plugin.toml`, and
 `herdr-pi-tree` installed (it stays installed but disabled for gentle-owned
 panes).
 
-Link this checkout into Herdr (from this directory):
+One repository provides two packages at the same release tag: a Herdr plugin
+and a Pi package. Install both at the same tag. Each tool owns its own
+checkout — the Herdr install never provides the Pi extension and the Pi
+install never provides the Herdr plugin — so one side alone leaves the
+sidebar without its token producer. The `configure` action only writes the
+managed Herdr sidebar block described below; it does not install the Pi
+package.
+
+### Public install (same tag on both sides)
+
+```sh
+herdr plugin install jonasotoaguilar/herdr-gentle-agents --ref v0.1.0
+pi install git:github.com/jonasotoaguilar/herdr-gentle-agents@v0.1.0
+herdr plugin action invoke configure --plugin herdr-gentle-agents
+```
+
+### Local development
+
+Point both tools at this checkout (from this directory). `herdr plugin link`
+only registers this directory; it runs no build. Never copy files into
+`~/.pi/agent/extensions` — let `pi install` own its checkout.
 
 ```sh
 herdr plugin link --enabled .
+pi install .
 herdr plugin action invoke configure --plugin herdr-gentle-agents
+```
+
+Then run `/reload` in Pi to pick up the local package.
+
+### Update
+
+Herdr v1 moves by reinstalling at a chosen `--ref`:
+
+```sh
+herdr plugin install jonasotoaguilar/herdr-gentle-agents --ref <new-tag>
+```
+
+A Pi Git ref is pinned: ordinary `pi update --extensions` reconciles the
+checkout to the configured ref but does not advance the pin. Move it with
+another install at the new ref:
+
+```sh
+pi install git:github.com/jonasotoaguilar/herdr-gentle-agents@<new-tag>
+```
+
+### Removal
+
+Unconfigure first, then remove the Pi package by its installed Git source
+identity, then uninstall the Herdr plugin:
+
+```sh
+herdr plugin action invoke unconfigure --plugin herdr-gentle-agents
+pi remove git:github.com/jonasotoaguilar/herdr-gentle-agents
+herdr plugin uninstall herdr-gentle-agents
 ```
 
 The `configure` action runs `node bin/configure.js --apply --reload`: it

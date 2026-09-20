@@ -46,9 +46,12 @@ command = ["node", "bin/gentle-status.js"]
 # unmanaged rows_by_agent override already exists. Action shape mirrors the
 # installed herdr-pi-tree convention (action_id/command/description/
 # platforms/title, observed via `herdr plugin action list`); platforms stays
-# linux-only to match this manifest. No [[build]] hook is wired: no verified
-# build/install hook field exists beyond startup/events/actions, so install
-# stays `herdr plugin link` + the configure action below.
+# linux-only to match this manifest. No [[build]] hook is wired: the plugin
+# ships no build step, so public install is
+# `herdr plugin install jonasotoaguilar/herdr-gentle-agents --ref <tag>`
+# (local development uses `herdr plugin link --enabled .`) followed by the
+# configure action below. The Pi side installs separately via
+# `pi install git:github.com/jonasotoaguilar/herdr-gentle-agents@<tag>`.
 [[actions]]
 id = "configure"
 command = ["node", "bin/configure.js", "--apply", "--reload"]
