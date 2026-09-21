@@ -1,0 +1,43 @@
+#!/bin/sh
+# release-verify: confirm the GitHub Release for RELEASE_TAG exists and is
+# sane after publish. Read-only; makes no changes.
+#
+# Environment (set by release.yml):
+#   RELEASE_TAG         tag to verify, e.g. v0.1.0 (required, strict vSemVer)
+#   RELEASE_REPOSITORY  owner/repo (optional; defaults to the gh-resolved repo)
+#   GH_TOKEN            auth token for gh (required, via environment only)
+
+set -eu
+
+fail() {
+  printf 'release-verify: error: %s\n' "$1" >&2
+  exit 1
+}
+
+pass() {
+  printf 'release-verify: %s\n' "$1"
+}
+
+TAG="${RELEASE_TAG:-}"
+[ -n "$TAG" ] || fail "RELEASE_TAG is required (e.g. RELEASE_TAG=v0.1.0)"
+
+if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  fail "RELEASE_TAG must be strict vSemVer (vX.Y.Z), got '$TAG'"
+fi
+
+command -v gh >/dev/null 2>&1 || fail "gh CLI is required"
+[ -n "${GH_TOKEN:-}" ] || fail "GH_TOKEN is required in the environment"
+
+if [ -n "${RELEASE_REPOSITORY:-}" ]; then
+  VIEW="$(gh release view "$TAG" --repo "$RELEASE_REPOSITORY" --json tagName,isDraft,isPrerelease 2>/dev/null)" \
+    || fail "release $TAG not found in $RELEASE_REPOSITORY"
+else
+  VIEW="$(gh release view "$TAG" --json tagName,isDraft,isPrerelease 2>/dev/null)" \
+    || fail "release $TAG not found"
+fi
+
+printf '%s\n' "$VIEW"
+TAG_NAME="$(printf '%s' "$VIEW" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).tagName))")"
+[ "$TAG_NAME" = "$TAG" ] || fail "release tag mismatch: expected $TAG, got $TAG_NAME"
+
+pass "verified GitHub Release $TAG"

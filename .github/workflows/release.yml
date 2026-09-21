@@ -1,0 +1,125 @@
+name: Release
+
+# Tag-only release. No PR required.
+# Flow: git tag -a vX.Y.Z + git push origin vX.Y.Z -> preflight -> release -> verify.
+# The base GitHub Release (with automatic notes) is created at release time by
+# scripts/release-publish (gh release create --generate-notes). Curation of the
+# title and notes happens afterwards by editing the published release in place.
+# This repo ships no compiled assets and publishes no packages: the release
+# target is the GitHub Release itself (install.sh's pinned raw-URL entrypoint
+# resolves against the pushed tag). No npm publishing is wired.
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "!v*-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Run release preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! -x ./scripts/release-preflight ]]; then
+            echo "::error::Missing executable scripts/release-preflight"
+            exit 1
+          fi
+          ./scripts/release-preflight
+
+  release:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: release
+    # Base authority creates/updates the GitHub release. No package registry
+    # or container publisher is wired for this repo, so no additional
+    # permissions (id-token, packages) are granted here.
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ""
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      # Creates the GitHub Release with automatic base notes. Example:
+      #   gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" \
+      #     --title "$RELEASE_TAG" --generate-notes
+      # Notes are curated afterwards by editing the published release in place;
+      # never from a PR body and never from a repo notes file.
+      - name: Run release publisher
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! -x ./scripts/release-publish ]]; then
+            echo "::error::Missing executable scripts/release-publish"
+            exit 1
+          fi
+          ./scripts/release-publish
+
+      - name: Remove temporary release material
+        if: always()
+        run: |
+          rm -rf -- "$RUNNER_TEMP/release-material"
+          test ! -e "$RUNNER_TEMP/release-material"
+
+  verify:
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! -x ./scripts/release-verify ]]; then
+            echo "::error::Missing executable scripts/release-verify"
+            exit 1
+          fi
+          ./scripts/release-verify

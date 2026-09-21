@@ -1,0 +1,71 @@
+#!/bin/sh
+# release-preflight: fail-closed gate for tag releases of herdr-gentle-agents.
+#
+# Validates that RELEASE_TAG is strict vSemVer and equals the package.json
+# version, then runs the releasable proof gates: Node tests, JS syntax checks,
+# sh/shellcheck syntax checks on install.sh, TOML manifest parse (+ version
+# consistency), and npm pack --dry-run. No publishing happens here.
+#
+# Environment (set by release.yml; overridable for local checks):
+#   RELEASE_TAG         tag being released, e.g. v0.1.0 (required)
+#   RELEASE_COMMIT      commit the tag points at (informational)
+#   RELEASE_REPOSITORY  owner/repo (informational)
+#
+# Local use: RELEASE_TAG=v0.1.0 ./scripts/release-preflight
+
+set -eu
+
+fail() {
+  printf 'release-preflight: error: %s\n' "$1" >&2
+  exit 1
+}
+
+pass() {
+  printf 'release-preflight: %s\n' "$1"
+}
+
+TAG="${RELEASE_TAG:-}"
+[ -n "$TAG" ] || fail "RELEASE_TAG is required (e.g. RELEASE_TAG=v0.1.0)"
+
+# Strict vSemVer: vMAJOR.MINOR.PATCH with no prerelease/build metadata.
+if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  fail "RELEASE_TAG must be strict vSemVer (vX.Y.Z), got '$TAG'"
+fi
+pass "tag format OK: $TAG"
+
+command -v node >/dev/null 2>&1 || fail "node is required"
+command -v npm >/dev/null 2>&1 || fail "npm is required"
+command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+command -v shellcheck >/dev/null 2>&1 || fail "shellcheck is required"
+
+# Tag must equal the package.json version.
+PKG_VERSION="$(node -p "require('./package.json').version")"
+TAG_VERSION="$(printf '%s' "$TAG" | cut -c2-)"
+[ "$TAG_VERSION" = "$PKG_VERSION" ] \
+  || fail "tag $TAG does not match package.json version $PKG_VERSION"
+pass "tag matches package.json version $PKG_VERSION"
+
+# Manifest must parse and agree on the same version.
+TOML_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('herdr-plugin.toml','rb'))['version'])")"
+[ "$TOML_VERSION" = "$PKG_VERSION" ] \
+  || fail "herdr-plugin.toml version $TOML_VERSION does not match package.json version $PKG_VERSION"
+pass "herdr-plugin.toml parses, version $TOML_VERSION"
+
+pass "running: node --test tools/"
+node --test tools/
+
+pass "running: node --check on bin/ and lib/"
+for f in bin/*.js lib/*.js; do
+  node --check "$f"
+done
+
+pass "running: sh -n install.sh"
+sh -n install.sh
+
+pass "running: shellcheck -x install.sh"
+shellcheck -x install.sh
+
+pass "running: npm pack --dry-run"
+npm pack --dry-run
+
+pass "preflight OK for $TAG"

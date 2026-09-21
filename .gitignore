@@ -1,2 +1,7 @@
 # Local Pi runtime state
 .atl/
+
+# Local override: this repo SHIPS a Herdr daemon in bin/ (task 7).
+# The global gitignore excludes bin/ (Go builds); re-include it here.
+!bin/
+!bin/**
