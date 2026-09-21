@@ -306,7 +306,7 @@ do_install() {
 
   PREV_RECORD=""
   if [ -f "$STATE_FILE" ]; then
-    PREV_RECORD="$(cat "$STATE_FILE" 2>/dev/null | tr -d ' \t\r\n' || printf '')"
+    PREV_RECORD="$(tr -d ' \t\r\n' < "$STATE_FILE" 2>/dev/null || printf '')"
   fi
 
   if [ -L "$DEST" ] || [ -e "$DEST" ]; then
@@ -417,7 +417,7 @@ do_uninstall() {
     warn "preserving $DEST (not a regular file)"
   else
     if [ -f "$STATE_FILE" ]; then
-      RECORD="$(cat "$STATE_FILE" 2>/dev/null | tr -d ' \t\r\n' || printf '')"
+      RECORD="$(tr -d ' \t\r\n' < "$STATE_FILE" 2>/dev/null || printf '')"
     else
       RECORD=""
     fi
