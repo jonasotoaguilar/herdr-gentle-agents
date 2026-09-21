@@ -1,0 +1,75 @@
+id = "herdr-gentle-agents"
+name = "Herdr Gentle Agents"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Herdr sidebar states for Pi + Gentle Shell agents: working (n), ask, review, blocked, done, idle, plus exact +N/-N SessionChanges segments and ↑N behind-upstream marker."
+platforms = ["linux"]
+
+# Task 5 scaffold: identity metadata only.
+#
+# min_herdr_version tracks herdr-pi-tree (0.9.0): this plugin extends the same
+# pane-metadata transport and snapshot surface (DESIGN.md §2 E8/E10, §9).
+# platforms stays linux-only until the daemon ships: cross-platform scope is
+# unresolved (DESIGN.md §10 U6).
+#
+# [[build]] and [[panes]] are intentionally absent. DESIGN.md
+# §10 U1 (notification CLI syntax) and U2 (event catalog + poll cadence) are
+# unresolved, and task 6 (extensions/ producer) owns the settings paths.
+# [[actions]] below holds only the verified configure/unconfigure pair.
+# Sections below are added only as their commands become verifiable.
+#
+# Coexistence: single-writer handoff with herdr-pi-tree, which stays installed
+# but disabled for gentle-owned panes. No Agents-panel ownership is claimed
+# here (DESIGN.md §3 O1, §9).
+
+# Consumer daemon (task 7): poll snapshot → reduce → publish owned gentle_*
+# tokens, ask notify exactly once per intentId, scoped orphan sweep.
+# No-args mode only ensures the daemon is running; --run is the loop.
+# Poll cadence is a provisional 10 s default (GENTLE_STATUS_POLL_MS
+# overrides); DESIGN §10 U2 sets no normative cadence yet, only << 60 s TTL.
+[[startup]]
+command = ["node", "bin/gentle-status.js"]
+
+# Watchdog + immediate refresh: --once renders one frame then exits, so a
+# newly opened project name/state appears immediately instead of waiting for
+# the next 10 s poll tick. The daemon stays the polling loop (see [[startup]]
+# above); --once is the per-event one-frame refresh, not the wake mechanism
+# for a crashed daemon (a crashed daemon still comes back via ensure-running
+# on the next agent detection — same pattern as herdr-pi-tree's agent-state
+# watchdog). No per-flip event hooks: U2's event catalog is unresolved, so
+# no [[events]] beyond this refresh hook is wired.
+[[events]]
+on = "pane.agent_detected"
+command = ["node", "bin/gentle-status.js", "--once"]
+
+# Sidebar wiring (DESIGN.md §5.3 install configuration): the daemon publishes
+# presence-encoded gentle_title_* labels plus the exact +N/-N SessionChanges
+# segments ($gentle_changes_added/$gentle_changes_deleted) and the ↑N
+# behind-upstream marker ($gentle_changes_pull), and
+# bin/configure.js appends exactly one marked pi-only
+# [ui.sidebar.agents.rows_by_agent] override for canonical agent `pi`. The
+# parent [ui.sidebar.agents] table stays user-owned; --apply refuses when an
+# unmanaged rows_by_agent override already exists. Action shape mirrors the
+# installed herdr-pi-tree convention (action_id/command/description/
+# platforms/title, observed via `herdr plugin action list`); platforms stays
+# linux-only to match this manifest. No [[build]] hook is wired: the plugin
+# ships no build step, so the supported entrypoint is the combined remote
+# installer `install.sh`, which installs + enables this plugin, atomically copies
+# extensions/gentle-herdr-state.ts into the Pi agent dir, and runs the
+# configure action below (public pinned example:
+# `curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/v0.1.0/install.sh | sh -s -- --ref v0.1.0`).
+# Local development uses `herdr plugin link --enabled .` followed by the
+# configure action below; the Pi side stays a managed copy, never `pi install`.
+[[actions]]
+id = "configure"
+command = ["node", "bin/configure.js", "--apply", "--reload"]
+description = "Append (or repair) the managed pi-only [ui.sidebar.agents.rows_by_agent] override (gentle_title_* + exact +N/-N SessionChanges segments + ↑N behind-upstream marker) without touching the user [ui.sidebar.agents] table, then reload."
+platforms = ["linux"]
+title = "Configure: install the pi-only sidebar override"
+
+[[actions]]
+id = "unconfigure"
+command = ["node", "bin/configure.js", "--uninstall", "--reload"]
+description = "Remove the managed pi-only sidebar override and reload; the user [ui.sidebar.agents] table is left intact. Run before uninstalling."
+platforms = ["linux"]
+title = "Configure: remove the pi-only sidebar override"
