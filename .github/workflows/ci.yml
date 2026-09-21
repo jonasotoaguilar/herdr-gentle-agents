@@ -1,0 +1,65 @@
+name: CI
+
+# Smallest real CI for this repo: Node tests, JS syntax checks, installer
+# shell checks, and TOML manifest validation. Runs the same gates locally via:
+#   node --test tools/
+#   node --check on bin/ and lib/
+#   sh -n install.sh && shellcheck -x install.sh
+#   python3 TOML parse of herdr-plugin.toml
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Show toolchain versions
+        run: |
+          node --version
+          npm --version
+          python3 --version
+
+      - name: Run Node tests
+        run: node --test tools/
+
+      - name: Check JS syntax
+        run: |
+          set -euo pipefail
+          for f in bin/*.js lib/*.js; do
+            node --check "$f"
+          done
+
+      - name: Check installer syntax
+        run: sh -n install.sh
+
+      - name: Run shellcheck on installer
+        run: |
+          set -euo pipefail
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck -x install.sh
+
+      - name: Validate TOML manifest
+        run: |
+          python3 -c 'import tomllib; tomllib.load(open("herdr-plugin.toml", "rb")); print("herdr-plugin.toml OK")'

@@ -1,0 +1,61 @@
+#!/bin/sh
+# release-publish: create the GitHub Release for RELEASE_TAG.
+#
+# Publishes ONLY a GitHub Release via `gh release create --generate-notes`.
+# No npm publishing, no registry uploads, no asset builds. Base notes are
+# curated afterwards by editing the published release in place.
+#
+# Environment (set by release.yml):
+#   RELEASE_TAG         tag to publish, e.g. v0.1.0 (required, strict vSemVer)
+#   RELEASE_COMMIT      commit the release targets (required)
+#   RELEASE_REPOSITORY  owner/repo (optional; defaults to the gh-resolved repo)
+#   GH_TOKEN            auth token for gh (required, via environment only)
+#
+# Refuses to overwrite an existing release for the tag.
+
+set -eu
+
+fail() {
+  printf 'release-publish: error: %s\n' "$1" >&2
+  exit 1
+}
+
+pass() {
+  printf 'release-publish: %s\n' "$1"
+}
+
+TAG="${RELEASE_TAG:-}"
+[ -n "$TAG" ] || fail "RELEASE_TAG is required (e.g. RELEASE_TAG=v0.1.0)"
+
+if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  fail "RELEASE_TAG must be strict vSemVer (vX.Y.Z), got '$TAG'"
+fi
+
+COMMIT="${RELEASE_COMMIT:-}"
+[ -n "$COMMIT" ] || fail "RELEASE_COMMIT is required"
+
+command -v gh >/dev/null 2>&1 || fail "gh CLI is required"
+[ -n "${GH_TOKEN:-}" ] || fail "GH_TOKEN is required in the environment"
+
+if [ -n "${RELEASE_REPOSITORY:-}" ]; then
+  if gh release view "$TAG" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+    fail "release $TAG already exists in $RELEASE_REPOSITORY; refusing to overwrite"
+  fi
+  pass "creating GitHub Release $TAG targeting $COMMIT"
+  gh release create "$TAG" \
+    --repo "$RELEASE_REPOSITORY" \
+    --target "$COMMIT" \
+    --title "$TAG" \
+    --generate-notes
+else
+  if gh release view "$TAG" >/dev/null 2>&1; then
+    fail "release $TAG already exists; refusing to overwrite"
+  fi
+  pass "creating GitHub Release $TAG targeting $COMMIT"
+  gh release create "$TAG" \
+    --target "$COMMIT" \
+    --title "$TAG" \
+    --generate-notes
+fi
+
+pass "published GitHub Release $TAG"
