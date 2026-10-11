@@ -107,6 +107,14 @@ curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents
 
 A modified managed Pi copy is backed up before replacement, same as on install.
 
+If the installed plugin is locally linked, the installer refuses the remote
+replacement by default; pass `--force` to unlink it first and then proceed
+with the remote install:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/<new-tag>/install.sh | sh -s -- --ref <new-tag> --force
+```
+
 ### Removal
 
 ```sh

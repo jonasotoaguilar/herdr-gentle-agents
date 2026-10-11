@@ -61,11 +61,13 @@ info() {
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--ref REF] [--uninstall] [--help]
+usage: install.sh [--ref REF] [--force] [--uninstall] [--help]
 
   (no flags)     install or update the Herdr plugin, the managed Pi
                  extension copy, and the managed sidebar configuration
   --ref REF      plugin release ref (default: v0.1.0; never main)
+  --force        when the installed plugin is locally linked, unlink it
+                 first, then proceed with the remote install
   --uninstall    remove the managed install (ownership-checked)
   --help         print this help and exit
 
@@ -81,11 +83,16 @@ EOF
 # --- argument parsing (POSIX, shift-based) ---
 MODE="install"
 REF="$DEFAULT_REF"
+FORCE="0"
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h)
       usage
       exit 0
+      ;;
+    --force)
+      FORCE="1"
+      shift
       ;;
     --uninstall)
       MODE="uninstall"
@@ -311,7 +318,14 @@ do_install() {
       _local_rc=0
       is_local_source "$_pre" || _local_rc=$?
       if [ "$_local_rc" = "10" ]; then
-        die "refusing remote install: plugin $PLUGIN_ID is locally linked (source.kind=local). Unlink it first or install locally; nothing was changed." 2
+        if [ "$FORCE" = "1" ]; then
+          info "removing locally linked plugin $PLUGIN_ID (--force; source.kind=local)"
+          "$HERDR_BIN" plugin unlink "$PLUGIN_ID" \
+            || die "herdr plugin unlink failed"
+          info "removed locally linked plugin $PLUGIN_ID (source.kind=local)"
+        else
+          die "refusing remote install: plugin $PLUGIN_ID is locally linked (source.kind=local). Unlink it first or install locally; nothing was changed." 2
+        fi
       fi
     fi
   fi
