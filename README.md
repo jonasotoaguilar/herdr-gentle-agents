@@ -4,9 +4,11 @@
 
 Local Herdr plugin so the sidebar recognises Pi + Gentle Shell agents.
 
-![Agents panel showing gentle states with change counts](docs/images/sidebar-example.png)
-
 ## What It Does
+
+<p align="center">
+  <img src="docs/images/sidebar-example.png" width="480" alt="Agents panel showing gentle states with change counts">
+</p>
 
 Reports per-pane agent state (`gentle` for generic activity — machine key
 `working` — e.g. the orchestrator/main agent when settled with no fresh
