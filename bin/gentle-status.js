@@ -48,8 +48,64 @@ const SOURCE = `plugin:${process.env.HERDR_PLUGIN_ID ?? PLUGIN_ID}`;
 // DESIGN §10 U2 is unresolved (no normative cadence); the provisional poll
 // is comfortably below the 60 s token TTL and the producer's 15 s beat so
 // every beat is observed at least once. Env-overridable, documented here
-// rather than normatively fixed.
+// rather than normatively fixed. P1 adaptive poll: the loop idles at the
+// baseline cadence and drops to a fast cycle while recent ask activity or
+// send/publish failures are observed, recovering after N quiet frames or
+// when the TTL-bounded fast window expires. Single setTimeout chain with a
+// dynamic delay — never a busy loop, never setInterval.
 const POLL_MS = Number(process.env.GENTLE_STATUS_POLL_MS ?? 10000) || 10000;
+const POLL_MIN_MS = 250;
+
+function toPollMs(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}
+
+// Pure and env-injectable so tests can assert overrides without reloading
+// the module or touching live timers. fastMs is clamped to <= baselineMs
+// so a misconfigured fast value can never poll faster than intended.
+function resolvePollConfig(env = process.env) {
+  const baselineMs = Math.max(POLL_MIN_MS, toPollMs(env?.GENTLE_STATUS_POLL_MS, 10000));
+  const fastMs = Math.max(
+    POLL_MIN_MS,
+    Math.min(toPollMs(env?.GENTLE_STATUS_FAST_POLL_MS, 2000), baselineMs),
+  );
+  const quietFrames = Math.min(
+    100,
+    Math.max(1, toPollMs(env?.GENTLE_STATUS_FAST_QUIET_FRAMES, 3)),
+  );
+  const windowMs = Math.max(POLL_MIN_MS, toPollMs(env?.GENTLE_STATUS_FAST_WINDOW_MS, 60000));
+  return { baselineMs, fastMs, quietFrames, windowMs };
+}
+
+function createPollState() {
+  return { fastUntil: 0, quietFrames: 0 };
+}
+
+function createPollStateObserved() {
+  return { askActivity: false, failure: false };
+}
+
+// Decide the next loop delay and advance pollState. Any ask activity or
+// send/publish failure (re)arms the TTL-bounded fast window; N consecutive
+// quiet frames inside the window recover to baseline early.
+function nextPollDelay(pollState, now, observed = {}, config = resolvePollConfig()) {
+  if (observed.askActivity || observed.failure) {
+    pollState.fastUntil = now + config.windowMs;
+    pollState.quietFrames = 0;
+  } else if (pollState.fastUntil > now) {
+    pollState.quietFrames += 1;
+    if (pollState.quietFrames >= config.quietFrames) {
+      pollState.fastUntil = 0;
+      pollState.quietFrames = 0;
+    }
+  } else {
+    pollState.fastUntil = 0;
+    pollState.quietFrames = 0;
+  }
+  return pollState.fastUntil > now ? config.fastMs : config.baselineMs;
+}
 const MAX_TOKENS_PER_REPORT = 16;
 const SOCKET_TIMEOUT_MS = 4000;
 const CLI_TIMEOUT_MS = 5000;
@@ -301,19 +357,50 @@ async function reportChunked(source, paneId, tokens) {
 // DESIGN §7 + §10 U1: the consumer-side ¬ask→ask transition gate is the
 // normative dedup mechanism (Herdr-side dedup is unconfirmed). `herdr
 // notification show` flags verified against the installed CLI; review and
-// error transitions never call this. No session material, paths, or token
-// values enter the title/body — pane id + intent id only.
-function notifyAsk(paneId, intentId) {
-  try {
-    const result = spawnSync(
-      binary(),
-      ['notification', 'show', 'Gentle: input needed', '--body', `Pane ${paneId} is waiting (ask ${intentId}).`, '--sound', 'request'],
-      { encoding: 'utf8', timeout: CLI_TIMEOUT_MS, windowsHide: true },
-    );
-    return result.status === 0;
-  } catch {
-    return false;
-  }
+// error transitions never call this. Visible copy is a fixed private-safe
+// intervention message — no session material, pane/intent ids, paths, or
+// token values enter the title/body.
+//
+// P2 non-blocking send: async spawn with a bounded kill timeout, resolved
+// true only on exit 0. Callers dispatch sends in agent-list order (one
+// flight per intent key, tracked in state.pendingNotify) and run them
+// concurrently with metadata publishes; the ledger is written only in the
+// completion callback on observed success, so a slow or hanging notify
+// binary can never head-of-line block sibling panes. paneId/intentId are
+// accepted for call-site symmetry (as before); they never enter argv.
+function notifyAskAsync(paneId, intentId, timeoutMs = CLI_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let child = null;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        if (child) child.kill('SIGKILL');
+      } catch {
+        // Already gone.
+      }
+      resolve(false);
+    }, timeoutMs);
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    try {
+      child = spawn(
+        binary(),
+        ['notification', 'show', 'Gentle: response needed', '--body', 'Your input is needed. Return to Pi to respond.', '--sound', 'request'],
+        { windowsHide: true, stdio: 'ignore' },
+      );
+    } catch {
+      finish(false);
+      return;
+    }
+    child.on('error', () => finish(false));
+    child.on('close', (code) => finish(code === 0));
+  });
 }
 
 /* ------------------------------------------------------------ ledger */
@@ -358,15 +445,38 @@ async function clearOwnedFamily(paneId) {
   return reportChunked(SOURCE, paneId, ownedClearPatch());
 }
 
-async function frame(state) {
+async function frame(state, opts = {}) {
+  if (!(state.pendingNotify instanceof Map)) state.pendingNotify = new Map();
+  // Daemon loop passes waitForNotify:false so the frame returns once
+  // publishes land; --once (tests/debugging) drains in-flight sends for a
+  // deterministic ledger. Either way the sends below never gate publishes.
+  const waitForNotify = opts.waitForNotify !== false;
   const now = Date.now();
+  if (state.pollObserved) {
+    state.pollObserved.askActivity = false;
+    state.pollObserved.failure = false;
+  }
   const agents = await agentsAsync();
   if (agents === null) {
     debug('snapshot failed; skipping frame');
+    if (waitForNotify && state.pendingNotify.size > 0) {
+      await Promise.all([...state.pendingNotify.values()]);
+      if (state.ledgerDirty) {
+        saveLedger(state.ledger);
+        state.ledgerDirty = false;
+      }
+    }
     return;
   }
   const askSessions = new Set();
   const live = new Set();
+  // P2 dispatch: one flight per intent key, launched in agent-list order
+  // (per-intent ordering preserved), concurrent with the publishes below.
+  // Ledger write happens only in the completion callback on observed
+  // success; a failed send leaves no ledger entry and retries next frame.
+  // Dispatch itself counts as ask activity so P1 fast-cycle timing is
+  // unchanged by send latency.
+  const publishJobs = [];
   for (const entry of agents) {
     const paneId = entry?.pane_id;
     if (typeof paneId !== 'string') continue;
@@ -382,22 +492,58 @@ async function frame(state) {
     if (reduced.display === 'ask' && reduced.notify) {
       askSessions.add(reduced.notify.sessionHash);
       const key = `${reduced.notify.sessionHash}:${reduced.notify.intentId}`;
-      if (!state.ledger[key]) {
-        if (notifyAsk(paneId, reduced.notify.intentId)) {
-          state.ledger[key] = { expiry: reduced.notify.expiry };
-          state.ledgerDirty = true;
-          debug(`notified ask ${key} on ${paneId}`);
-        } else {
-          debug(`notify failed for ask ${key}; will retry next frame`);
-        }
+      if (state.ledger[key]) {
+        if (state.pollObserved) state.pollObserved.askActivity = true;
+      } else if (state.pendingNotify.has(key)) {
+        // Still asking (already notified): recent ask activity keeps the
+        // fast cycle armed without re-firing the exactly-once toast.
+        if (state.pollObserved) state.pollObserved.askActivity = true;
+      } else {
+        if (state.pollObserved) state.pollObserved.askActivity = true;
+        const expiry = reduced.notify.expiry;
+        const send = notifyAskAsync(paneId, reduced.notify.intentId).then(
+          (ok) => {
+            state.pendingNotify.delete(key);
+            if (ok) {
+              state.ledger[key] = { expiry };
+              state.ledgerDirty = true;
+              saveLedger(state.ledger);
+              state.ledgerDirty = false;
+              if (state.pollObserved) state.pollObserved.askActivity = true;
+              debug(`notified ask ${key} on ${paneId}`);
+            } else {
+              if (state.pollObserved) state.pollObserved.failure = true;
+              debug(`notify failed for ask ${key}; will retry next frame`);
+            }
+            return ok;
+          },
+          () => {
+            state.pendingNotify.delete(key);
+            if (state.pollObserved) state.pollObserved.failure = true;
+            debug(`notify failed for ask ${key}; will retry next frame`);
+            return false;
+          },
+        );
+        state.pendingNotify.set(key, send);
+        debug(`dispatching ask notify ${key} on ${paneId}`);
       }
     }
     const patch = contract.displayTokens(reduced);
     const signature = JSON.stringify(patch);
     if (lastSent.get(paneId) === signature) continue;
-    const ok = await reportChunked(SOURCE, paneId, patch);
-    if (ok) lastSent.set(paneId, signature);
-    else debug(`publish failed for pane ${paneId}; will retry next frame`);
+    publishJobs.push({ paneId, patch, signature });
+  }
+  // Publishes race the in-flight sends above: sibling panes and metadata
+  // are never head-of-line blocked behind a slow notify binary.
+  const publishResults = await Promise.all(
+    publishJobs.map(async (job) => ({ job, ok: await reportChunked(SOURCE, job.paneId, job.patch) })),
+  );
+  for (const { job, ok } of publishResults) {
+    if (ok) lastSent.set(job.paneId, job.signature);
+    else {
+      if (state.pollObserved) state.pollObserved.failure = true;
+      debug(`publish failed for pane ${job.paneId}; will retry next frame`);
+    }
   }
   // An intent re-arms only via a NEW intentId: ledger entries persist past
   // token TTL and are forgotten when their session is no longer asking (or
@@ -414,6 +560,15 @@ async function frame(state) {
   if (state.ledgerDirty) {
     saveLedger(state.ledger);
     state.ledgerDirty = false;
+  }
+  if (waitForNotify && state.pendingNotify.size > 0) {
+    // --once determinism: the daemon loop never waits here (its sends
+    // reconcile the ledger from the completion callback instead).
+    await Promise.all([...state.pendingNotify.values()]);
+    if (state.ledgerDirty) {
+      saveLedger(state.ledger);
+      state.ledgerDirty = false;
+    }
   }
   // Live-set-change orphan sweep (R3-orphan + R4-live-loop): panes that
   // dropped out of the live agent set keep presence-encoded owned tokens;
@@ -493,7 +648,9 @@ async function run() {
     console.error(`gentle-status: cannot write pidfile: ${error.message}`);
     process.exit(1);
   }
-  const state = { ledger: loadLedger(), ledgerDirty: false, live: new Set() };
+  const state = { ledger: loadLedger(), ledgerDirty: false, live: new Set(), pollObserved: createPollStateObserved(), pendingNotify: new Map() };
+  const pollConfig = resolvePollConfig();
+  const pollState = createPollState();
   let stopped = false;
   const shutdown = async () => {
     if (stopped) return;
@@ -522,12 +679,19 @@ async function run() {
   for (;;) {
     if (stopped) break;
     try {
-      await frame(state);
+      // waitForNotify:false: dispatched sends complete in the background
+      // and reconcile the ledger via callback; the next poll delay is
+      // computed without waiting on the notify binary.
+      await frame(state, { waitForNotify: false });
     } catch (error) {
       logError(error);
     }
     if (stopped) break;
-    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+    // Single-loop dynamic delay: fast cycle while recent ask activity or
+    // failures were observed, baseline otherwise. No setInterval, no busy
+    // loop (delays floored at POLL_MIN_MS via resolvePollConfig).
+    const delay = nextPollDelay(pollState, Date.now(), state.pollObserved, pollConfig);
+    await new Promise((resolve) => setTimeout(resolve, delay));
   }
 }
 
@@ -538,7 +702,7 @@ async function main() {
     return;
   }
   if (mode === '--once') {
-    const state = { ledger: loadLedger(), ledgerDirty: false, live: new Set() };
+    const state = { ledger: loadLedger(), ledgerDirty: false, live: new Set(), pollObserved: createPollStateObserved(), pendingNotify: new Map() };
     await frame(state);
     if (state.ledgerDirty) saveLedger(state.ledger);
     return;
@@ -592,8 +756,21 @@ async function main() {
   ensureRunning();
 }
 
-main().catch((error) => {
-  logError(error);
-  console.error(`gentle-status: ${error?.message ?? error}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    logError(error);
+    console.error(`gentle-status: ${error?.message ?? error}`);
+    process.exit(1);
+  });
+} else {
+  module.exports = {
+    POLL_MS,
+    POLL_MIN_MS,
+    CLI_TIMEOUT_MS,
+    notifyAskAsync,
+    resolvePollConfig,
+    createPollState,
+    createPollStateObserved,
+    nextPollDelay,
+  };
+}
