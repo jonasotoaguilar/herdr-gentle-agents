@@ -6,10 +6,6 @@ Local Herdr plugin so the sidebar recognises Pi + Gentle Shell agents.
 
 ## What It Does
 
-<p align="center">
-  <img src="docs/images/sidebar-example.png" width="480" alt="Agents panel showing gentle states with change counts">
-</p>
-
 Reports per-pane agent state (`gentle` for generic activity — machine key
 `working` — e.g. the orchestrator/main agent when settled with no fresh
 root marker; `gentle` in pink while the principal
@@ -31,6 +27,15 @@ pane-metadata tokens. It coexists with `herdr-pi-tree` through a single-writer h
 this plugin owns a pane, `herdr-pi-tree` stays disabled for that pane, so the
 two never share token names or the 16-token budget. Details live in
 [DESIGN.md](DESIGN.md).
+
+## What It Looks Like
+
+<p align="center">
+  <img src="docs/images/sidebar-example.png" width="420" alt="Agents panel showing gentle states with change counts">
+</p>
+
+The Agents panel renders the active role (`worker`), the principal state (`gentle`),
+and compact `+N` / `-N` change segments in one row per pane.
 
 ## Quick Start
 
