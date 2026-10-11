@@ -2,6 +2,11 @@
 # release-verify: confirm the GitHub Release for RELEASE_TAG exists and is
 # sane after publish. Read-only; makes no changes.
 #
+# Fails when the release is a draft or a prerelease (the stable
+# releases/latest/download/install.sh entrypoint cannot resolve to it), then
+# downloads the install.sh release asset and fails unless its sha256 equals
+# the tagged ./install.sh.
+#
 # Environment (set by release.yml):
 #   RELEASE_TAG         tag to verify, e.g. v0.1.0 (required, strict vSemVer)
 #   RELEASE_REPOSITORY  owner/repo (optional; defaults to the gh-resolved repo)
@@ -26,18 +31,73 @@ if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
 fi
 
 command -v gh >/dev/null 2>&1 || fail "gh CLI is required"
+command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 [ -n "${GH_TOKEN:-}" ] || fail "GH_TOKEN is required in the environment"
+[ -f install.sh ] || fail "install.sh is required"
 
+VERIFY_TMPDIR="$(mktemp -d)" || fail "mktemp failed"
+trap 'rm -rf "$VERIFY_TMPDIR"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+VIEW_ERR="$VERIFY_TMPDIR/view.err"
+VIEW_STATUS=0
+VIEW=""
 if [ -n "${RELEASE_REPOSITORY:-}" ]; then
-  VIEW="$(gh release view "$TAG" --repo "$RELEASE_REPOSITORY" --json tagName,isDraft,isPrerelease 2>/dev/null)" \
-    || fail "release $TAG not found in $RELEASE_REPOSITORY"
+  if VIEW="$(gh release view "$TAG" --repo "$RELEASE_REPOSITORY" --json tagName,isDraft,isPrerelease 2>"$VIEW_ERR")"; then
+    VIEW_STATUS=0
+  else
+    VIEW_STATUS=$?
+  fi
 else
-  VIEW="$(gh release view "$TAG" --json tagName,isDraft,isPrerelease 2>/dev/null)" \
-    || fail "release $TAG not found"
+  if VIEW="$(gh release view "$TAG" --json tagName,isDraft,isPrerelease 2>"$VIEW_ERR")"; then
+    VIEW_STATUS=0
+  else
+    VIEW_STATUS=$?
+  fi
 fi
+if [ "$VIEW_STATUS" -ne 0 ]; then
+  if [ "$VIEW_STATUS" -eq 1 ] && grep -q "release not found" "$VIEW_ERR" 2>/dev/null; then
+    if [ -n "${RELEASE_REPOSITORY:-}" ]; then
+      fail "release $TAG not found in $RELEASE_REPOSITORY"
+    else
+      fail "release $TAG not found"
+    fi
+  else
+    VIEW_DETAIL="$(cat "$VIEW_ERR" 2>/dev/null || true)"
+    [ -n "$VIEW_DETAIL" ] || VIEW_DETAIL="exit $VIEW_STATUS"
+    fail "gh release view $TAG failed ($VIEW_DETAIL)"
+  fi
+fi
+[ -n "$VIEW" ] || fail "gh release view $TAG failed (empty response)"
 
 printf '%s\n' "$VIEW"
 TAG_NAME="$(printf '%s' "$VIEW" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).tagName))")"
 [ "$TAG_NAME" = "$TAG" ] || fail "release tag mismatch: expected $TAG, got $TAG_NAME"
+
+IS_DRAFT="$(printf '%s' "$VIEW" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).isDraft))")"
+[ "$IS_DRAFT" = "false" ] || fail "release $TAG is a draft; releases/latest cannot resolve to it"
+
+IS_PRERELEASE="$(printf '%s' "$VIEW" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).isPrerelease))")"
+[ "$IS_PRERELEASE" = "false" ] || fail "release $TAG is a prerelease; releases/latest cannot resolve to it"
+
+if [ -n "${RELEASE_REPOSITORY:-}" ]; then
+  gh release download "$TAG" --repo "$RELEASE_REPOSITORY" \
+    --dir "$VERIFY_TMPDIR" --pattern "install.sh" \
+    || fail "downloading install.sh asset from $TAG failed"
+else
+  gh release download "$TAG" \
+    --dir "$VERIFY_TMPDIR" --pattern "install.sh" \
+    || fail "downloading install.sh asset from $TAG failed"
+fi
+
+[ -f "$VERIFY_TMPDIR/install.sh" ] || fail "install.sh asset not found in release $TAG"
+
+EXPECTED="$(sha256sum install.sh | cut -d ' ' -f1)"
+ACTUAL="$(sha256sum "$VERIFY_TMPDIR/install.sh" | cut -d ' ' -f1)"
+[ "$EXPECTED" = "$ACTUAL" ] || fail "install.sh asset sha256 mismatch for $TAG"
+
+rm -rf "$VERIFY_TMPDIR"
+trap - EXIT INT TERM
 
 pass "verified GitHub Release $TAG"

@@ -5,9 +5,11 @@ name: Release
 # The base GitHub Release (with automatic notes) is created at release time by
 # scripts/release-publish (gh release create --generate-notes). Curation of the
 # title and notes happens afterwards by editing the published release in place.
-# This repo ships no compiled assets and publishes no packages: the release
-# target is the GitHub Release itself (install.sh's pinned raw-URL entrypoint
-# resolves against the pushed tag). No npm publishing is wired.
+# This repo ships install.sh and install.sh.sha256 as release assets and
+# publishes no packages: the release target is the GitHub Release itself (the
+# stable releases/latest/download/install.sh entrypoint resolves to the newest
+# non-draft, non-prerelease release, and each release freezes its asset bytes).
+# No npm publishing is wired.
 
 on:
   push:
@@ -71,9 +73,14 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
-      # Creates the GitHub Release with automatic base notes. Example:
-      #   gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" \
-      #     --title "$RELEASE_TAG" --generate-notes
+      # Creates the GitHub Release with automatic base notes and the
+      # install.sh assets in one call, so a failed upload leaves a draft
+      # instead of a live asset-less release. Example:
+      #   sha256sum install.sh > install.sh.sha256
+      #   gh release create "$RELEASE_TAG" install.sh install.sh.sha256 \
+      #     --target "$RELEASE_COMMIT" --title "$RELEASE_TAG" --generate-notes
+      # An existing draft is deleted (release only, never --cleanup-tag) and
+      # recreated; an existing published release keeps refusing to overwrite.
       # Notes are curated afterwards by editing the published release in place;
       # never from a PR body and never from a repo notes file.
       - name: Run release publisher
