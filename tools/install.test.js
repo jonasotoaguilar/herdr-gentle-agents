@@ -61,6 +61,7 @@ if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "list" ]; then
   esac
   exit 0
 fi
+if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "unlink" ]; then exit 0; fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "install" ]; then exit 0; fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "enable" ]; then exit 0; fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "uninstall" ]; then
@@ -343,6 +344,48 @@ describe('install.sh isolated behavior', () => {
     assert.doesNotMatch(readLog(fx.herdrLog), /plugin install/);
     assert.ok(!fs.existsSync(fx.dest), 'destination must not be created on refusal');
     assert.ok(!fs.existsSync(fx.stateFile), 'no ownership record on refusal');
+  });
+
+  it('local refusal message stays byte-identical without --force', (t) => {
+    const fx = setup(t, { listMode: 'local' });
+    const r = run(['--ref', 'v0.1.0'], fx.env);
+    assert.notEqual(r.status, 0);
+    assert.ok(
+      r.stderr.includes('refusing remote install: plugin herdr-gentle-agents is locally linked (source.kind=local). Unlink it first or install locally; nothing was changed.'),
+      `refusal bytes changed: ${r.stderr}`,
+    );
+    assert.doesNotMatch(readLog(fx.herdrLog), /plugin unlink/);
+  });
+
+  it('--force unlinks a locally linked plugin then installs', (t) => {
+    const fx = setup(t, { listMode: 'local' });
+    const r = run(['--force', '--ref', 'v0.1.0'], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    const log = readLog(fx.herdrLog);
+    assert.match(log, /plugin unlink herdr-gentle-agents/);
+    assert.match(log, /plugin install jonasotoaguilar\/herdr-gentle-agents --ref v0\.1\.0 --yes/);
+    assert.ok(log.indexOf('plugin unlink') < log.indexOf('plugin install'), 'unlink must precede install');
+    assert.match(`${r.stdout}\n${r.stderr}`, /removed.*local/i);
+    assert.ok(fs.existsSync(fx.dest), 'managed extension must exist after forced update');
+    assert.equal(fs.readFileSync(fx.stateFile, 'utf8').trim(), sha256File(fx.dest));
+  });
+
+  it('--force with a remote source installs without unlink', (t) => {
+    const fx = setup(t);
+    const r = run(['--force'], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    const log = readLog(fx.herdrLog);
+    assert.doesNotMatch(log, /plugin unlink/);
+    assert.match(log, /plugin install jonasotoaguilar\/herdr-gentle-agents/);
+    assert.ok(fs.existsSync(fx.dest));
+  });
+
+  it('--help documents --force', (t) => {
+    const fx = setup(t);
+    const r = run(['--help'], fx.env);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /--force/);
+    assert.equal(readLog(fx.herdrLog), '', 'help must not call herdr');
   });
 
   it('absent-server reload warns but the install succeeds', (t) => {
