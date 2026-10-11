@@ -20,8 +20,9 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const DAEMON = path.join(REPO_ROOT, 'bin', 'gentle-status.js');
 const contract = require('../lib/gentle-tokens.js');
 
-const EXPECTED_TITLE = 'Gentle: response needed';
-const EXPECTED_BODY = 'Your input is needed. Return to Pi to respond.';
+const EXPECTED_TITLE = 'Gentle needs response';
+const PROJECT_NAME = 'myproj';
+const EXPECTED_BODY = `${PROJECT_NAME} needs your input. Return to Pi to respond.`;
 
 const FAKE_HERDR = `#!/bin/sh
 # Fake herdr for notify-copy tests: replays canned agent/pane JSON, logs
@@ -85,17 +86,19 @@ function sessionPath(sb, name) {
   return path.join(sb.root, `session-${name}`);
 }
 
-function askEntry(sb, session, { paneId = 'pane-1', intentId = 'q1', roles = 'worker', count = 1 } = {}) {
+function askEntry(sb, session, { paneId = 'pane-1', intentId = 'q1', roles = 'worker', count = 1, group = 'myproj', cwd = sb.workDir } = {}) {
   const entry = {
     pane_id: paneId,
     agent_session: { agent: 'pi', kind: 'path', value: session },
     agent_status: 'unknown',
-    group: 'myproj',
-    cwd: sb.workDir,
-    foreground_cwd: sb.workDir,
     state_labels: { 0: `ask:${intentId}` },
     tokens: { gentle_roles_v1: roles },
   };
+  if (group !== null) entry.group = group;
+  if (cwd !== null) {
+    entry.cwd = cwd;
+    entry.foreground_cwd = cwd;
+  }
   const hash = contract.expectedSessionHash(entry);
   assert.match(hash, /^[A-Za-z0-9_-]{43}$/);
   const expiry = Date.now() + 30000;
@@ -171,6 +174,35 @@ describe('clear intervention copy', () => {
     assert.equal(c[5], '--sound');
     assert.equal(c[6], 'request');
     assert.equal(Object.keys(c).length, 7);
+  });
+
+  it('ask body names the project from the workspace group', () => {
+    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'd'), { group: 'raguard' })]);
+    runOnce(sandbox);
+    const calls = notificationCalls(sandbox);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][2], EXPECTED_TITLE);
+    assert.equal(calls[0][4], 'raguard needs your input. Return to Pi to respond.');
+  });
+
+  it('ask falls back to Gentle when no project name is available', () => {
+    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'e'), { group: null, cwd: null })]);
+    runOnce(sandbox);
+    const calls = notificationCalls(sandbox);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][2], EXPECTED_TITLE);
+    assert.equal(calls[0][4], 'Gentle needs your input. Return to Pi to respond.');
+  });
+
+  it('a hostile project name cannot inject argv or control characters', () => {
+    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'f'), { group: 'bad\nname\tx$(id)' })]);
+    runOnce(sandbox);
+    const calls = notificationCalls(sandbox);
+    assert.equal(calls.length, 1);
+    assert.equal(Object.keys(calls[0]).length, 7);
+    const body = calls[0][4];
+    assert.ok(!/[\x00-\x1f\x7f]/.test(body), `body carries control characters: ${body}`);
+    assert.ok(body.startsWith('badnamex$(id) needs your input.'), body);
   });
 
   it('visible copy carries no ids, paths, or question data', () => {

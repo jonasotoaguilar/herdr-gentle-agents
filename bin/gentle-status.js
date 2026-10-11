@@ -357,9 +357,11 @@ async function reportChunked(source, paneId, tokens) {
 // DESIGN §7 + §10 U1: the consumer-side ¬ask→ask transition gate is the
 // normative dedup mechanism (Herdr-side dedup is unconfirmed). `herdr
 // notification show` flags verified against the installed CLI; review and
-// error transitions never call this. Visible copy is a fixed private-safe
-// intervention message — no session material, pane/intent ids, paths, or
-// token values enter the title/body.
+// error transitions never call this. Visible copy is the fixed title
+// `Gentle needs response` plus a body naming the project
+// (`<project> needs your input. Return to Pi to respond.`). The name comes
+// from the snapshot's validated workspace group only — never a cwd-derived
+// path segment, pane/intent ids, session material, or token values.
 //
 // P2 non-blocking send: async spawn with a bounded kill timeout, resolved
 // true only on exit 0. Callers dispatch sends in agent-list order (one
@@ -368,7 +370,24 @@ async function reportChunked(source, paneId, tokens) {
 // completion callback on observed success, so a slow or hanging notify
 // binary can never head-of-line block sibling panes. paneId/intentId are
 // accepted for call-site symmetry (as before); they never enter argv.
-function notifyAskAsync(paneId, intentId, timeoutMs = CLI_TIMEOUT_MS) {
+//
+// Project name for the ask toast: the snapshot's validated workspace/group
+// name only, sanitized and bounded, failing closed to `Gentle`. The
+// cwd-derived fallback the sidebar uses is deliberately NOT used here: a
+// desktop toast outlives the terminal (notification history, lock screen),
+// so it never carries a path segment.
+function askProjectName(entry) {
+  const group = entry?.group;
+  if (typeof group === 'string') {
+    const clean = group.replace(/[\x00-\x1f\x7f-\x9f]/g, '').trim().slice(0, 64);
+    if (clean) return clean;
+  }
+  return 'Gentle';
+}
+
+function notifyAskAsync(paneId, intentId, project, timeoutMs = CLI_TIMEOUT_MS) {
+  const projectName = typeof project === 'string' && project.length > 0 ? project : 'Gentle';
+  const body = `${projectName} needs your input. Return to Pi to respond.`;
   return new Promise((resolve) => {
     let settled = false;
     let child = null;
@@ -391,7 +410,7 @@ function notifyAskAsync(paneId, intentId, timeoutMs = CLI_TIMEOUT_MS) {
     try {
       child = spawn(
         binary(),
-        ['notification', 'show', 'Gentle: response needed', '--body', 'Your input is needed. Return to Pi to respond.', '--sound', 'request'],
+        ['notification', 'show', 'Gentle needs response', '--body', body, '--sound', 'request'],
         { windowsHide: true, stdio: 'ignore' },
       );
     } catch {
@@ -501,7 +520,7 @@ async function frame(state, opts = {}) {
       } else {
         if (state.pollObserved) state.pollObserved.askActivity = true;
         const expiry = reduced.notify.expiry;
-        const send = notifyAskAsync(paneId, reduced.notify.intentId).then(
+        const send = notifyAskAsync(paneId, reduced.notify.intentId, askProjectName(entry)).then(
           (ok) => {
             state.pendingNotify.delete(key);
             if (ok) {

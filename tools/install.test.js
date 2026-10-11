@@ -36,12 +36,18 @@ if [ -n "\${ORDER_LOG:-}" ]; then printf 'herdr %s\\n' "$*" >>"$ORDER_LOG"; fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "list" ]; then
   mode="\${FAKE_LIST_MODE:-valid}"
   root="\${FAKE_PLUGIN_ROOT:-/nonexistent}"
+  ver="\${FAKE_PLUGIN_VERSION:-}"
+  if [ -n "$ver" ]; then
+    vfrag=',"version":"'"$ver"'"'
+  else
+    vfrag=""
+  fi
   case "$mode" in
     valid)
-      printf '{"result":{"plugins":[{"plugin_id":"herdr-gentle-agents","plugin_root":"%s","source":{"kind":"remote"}}]}}\\n' "$root"
+      printf '{"result":{"plugins":[{"plugin_id":"herdr-gentle-agents","plugin_root":"%s","source":{"kind":"remote"}%s}]}}\\n' "$root" "$vfrag"
       exit 0 ;;
     local)
-      printf '{"result":{"plugins":[{"plugin_id":"herdr-gentle-agents","plugin_root":"%s","source":{"kind":"local"}}]}}\\n' "$root"
+      printf '{"result":{"plugins":[{"plugin_id":"herdr-gentle-agents","plugin_root":"%s","source":{"kind":"local"}%s}]}}\\n' "$root" "$vfrag"
       exit 0 ;;
     empty)
       printf '{"result":{"plugins":[]}}\\n'
@@ -77,6 +83,33 @@ if [ "\${1:-}" = "server" ]; then
 fi
 echo "herdr: unknown command $*" >&2
 exit 1
+`;
+
+const FAKE_CURL = `#!/bin/sh
+# Fake curl for install.sh tests: logs argv, replays canned release-latest JSON.
+log="\${CURL_LOG:-/dev/null}"
+printf '%s\\n' "$*" >>"$log"
+mode="\${FAKE_CURL_MODE:-ok}"
+tag="\${FAKE_LATEST_TAG:-v0.2.0}"
+if [ "$mode" = "fail" ]; then echo "curl: stub failure" >&2; exit 1; fi
+if [ "$mode" = "spaced" ]; then printf '{ "tag_name" : "%s" }\\n' "$tag"; exit 0; fi
+printf '{"tag_name":"%s","prerelease":false,"draft":false}\\n' "$tag"
+exit 0
+`;
+
+const FAKE_GIT = `#!/bin/sh
+# Fake git for install.sh tests: logs argv, replays canned ls-remote tags.
+log="\${GIT_LOG:-/dev/null}"
+printf '%s\\n' "$*" >>"$log"
+if [ "\${1:-}" = "ls-remote" ]; then
+  mode="\${FAKE_GIT_MODE:-fail}"
+  if [ "$mode" = "fail" ]; then echo "git: stub ls-remote failure" >&2; exit 1; fi
+  for t in \${FAKE_GIT_TAGS:-v0.2.0}; do
+    printf '0000000000000000000000000000000000000000\\trefs/tags/%s\\n' "$t"
+  done
+  exit 0
+fi
+exec "__REAL_GIT__" "$@"
 `;
 
 const STUB_CONFIGURE = `#!/usr/bin/env node
@@ -143,10 +176,24 @@ function setup(t, opts = {}) {
   const orderLog = path.join(tmp, 'order.log');
   const configureLog = path.join(tmp, 'configure.log');
   const statusLog = path.join(tmp, 'status.log');
-  for (const f of [herdrLog, orderLog, configureLog, statusLog]) fs.writeFileSync(f, '');
+  const curlLog = path.join(tmp, 'curl.log');
+  const gitLog = path.join(tmp, 'git.log');
+  for (const f of [herdrLog, orderLog, configureLog, statusLog, curlLog, gitLog]) fs.writeFileSync(f, '');
 
   const herdrPath = path.join(fakeBin, 'herdr');
   fs.writeFileSync(herdrPath, FAKE_HERDR, { mode: 0o755 });
+
+  // Fake curl replays the releases/latest JSON without network; fake git
+  // replays ls-remote tags (default: failure, so no network is ever hit).
+  fs.writeFileSync(path.join(fakeBin, 'curl'), FAKE_CURL, { mode: 0o755 });
+  let realGit = '/usr/bin/git';
+  try {
+    const found = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim().split('\n')[0];
+    if (found) realGit = found;
+  } catch {
+    // Fall back to /usr/bin/git for non-ls-remote delegation.
+  }
+  fs.writeFileSync(path.join(fakeBin, 'git'), FAKE_GIT.split('__REAL_GIT__').join(realGit), { mode: 0o755 });
 
   const withSource = opts.withSource !== false;
   const withConfigure = opts.withConfigure !== false;
@@ -177,6 +224,14 @@ function setup(t, opts = {}) {
   delete env.FAKE_UNINSTALL_MODE;
   delete env.FAKE_RELOAD_FAIL;
   delete env.FAKE_LIST_MODE;
+  delete env.FAKE_PLUGIN_VERSION;
+  delete env.FAKE_CURL_MODE;
+  delete env.FAKE_LATEST_TAG;
+  delete env.FAKE_GIT_MODE;
+  delete env.FAKE_GIT_TAGS;
+  delete env.CURL_LOG;
+  delete env.GIT_LOG;
+  delete env.HERDR_GENTLE_LATEST_URL;
   Object.assign(env, {
     HOME: home,
     XDG_STATE_HOME: stateBase,
@@ -186,6 +241,12 @@ function setup(t, opts = {}) {
     ORDER_LOG: orderLog,
     CONFIGURE_LOG: configureLog,
     STATUS_LOG: statusLog,
+    CURL_LOG: curlLog,
+    GIT_LOG: gitLog,
+    HERDR_GENTLE_LATEST_URL: 'https://example.invalid/releases/latest',
+    FAKE_LATEST_TAG: 'v0.2.0',
+    FAKE_CURL_MODE: 'ok',
+    FAKE_GIT_MODE: 'fail',
     FAKE_PLUGIN_ROOT: pluginRoot,
     FAKE_LIST_MODE: opts.listMode || 'valid',
   }, opts.fakeEnv || {});
@@ -195,7 +256,7 @@ function setup(t, opts = {}) {
   const stateFile = path.join(stateBase, 'herdr', 'plugins', 'herdr-gentle-agents', 'installer-state');
   const settingsFile = path.join(piDir, 'settings.json');
   const exclusionMarker = path.join(stateBase, 'herdr', 'plugins', 'herdr-gentle-agents', 'pi-extension-exclusion-owned');
-  return { tmp, home, stateBase, pluginRoot, env, herdrLog, orderLog, configureLog, statusLog, piDir, dest, stateFile, settingsFile, exclusionMarker };
+  return { tmp, home, stateBase, pluginRoot, env, herdrLog, orderLog, configureLog, statusLog, curlLog, gitLog, piDir, dest, stateFile, settingsFile, exclusionMarker };
 }
 
 function run(args, env) {
@@ -236,18 +297,22 @@ describe('install.sh isolated behavior', () => {
     assert.equal(r.status, 0, `sh -n failed: ${r.stderr}`);
   });
 
-  it('--help exits zero and documents the pinned flow', (t) => {
+  it('--help exits zero and documents the update contract', (t) => {
     const fx = setup(t);
     const r = run(['--help'], fx.env);
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /--ref/);
+    assert.match(r.stdout, /--allow-downgrade/);
+    assert.match(r.stdout, /--force/);
+    assert.match(r.stdout, /deprecat/i);
     assert.match(r.stdout, /--uninstall/);
-    assert.match(r.stdout, /v0\.1\.0/);
+    assert.match(r.stdout, /HERDR_GENTLE_LATEST_URL/);
+    assert.doesNotMatch(r.stdout, /default: v0\.1\.0/);
     assert.equal(readLog(fx.herdrLog), '', 'help must not call herdr');
   });
 
-  it('fresh install copies bytes, records ownership, and pins default ref v0.1.0', (t) => {
-    const fx = setup(t);
+  it('fresh install without --ref resolves the newest release tag', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_LATEST_TAG: 'v0.2.0' } });
     const r = run([], fx.env);
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     assert.ok(fs.existsSync(fx.dest), 'managed extension must exist');
@@ -258,7 +323,8 @@ describe('install.sh isolated behavior', () => {
     );
     assert.equal(fs.readFileSync(fx.stateFile, 'utf8').trim(), sha256File(fx.dest));
     const log = readLog(fx.herdrLog);
-    assert.match(log, /plugin install jonasotoaguilar\/herdr-gentle-agents --ref v0\.1\.0 --yes/);
+    assert.match(log, /plugin install jonasotoaguilar\/herdr-gentle-agents --ref v0\.2\.0 --yes/);
+    assert.match(readLog(fx.curlLog), /example\.invalid/, 'latest resolution must run without network');
     assert.match(log, /plugin enable herdr-gentle-agents/);
     assert.match(log, /server reload-config/);
     assert.doesNotMatch(log, /\bmain\b/);
@@ -336,25 +402,33 @@ describe('install.sh isolated behavior', () => {
     );
   });
 
-  it('locally linked plugin refuses remote replacement before install', (t) => {
+  it('locally linked plugin is replaced automatically without --force', (t) => {
     const fx = setup(t, { listMode: 'local' });
     const r = run(['--ref', 'v0.1.0'], fx.env);
-    assert.notEqual(r.status, 0);
-    assert.match(r.stderr, /local/);
-    assert.doesNotMatch(readLog(fx.herdrLog), /plugin install/);
-    assert.ok(!fs.existsSync(fx.dest), 'destination must not be created on refusal');
-    assert.ok(!fs.existsSync(fx.stateFile), 'no ownership record on refusal');
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    const log = readLog(fx.herdrLog);
+    assert.match(log, /plugin unlink herdr-gentle-agents/);
+    assert.match(log, /plugin install jonasotoaguilar\/herdr-gentle-agents --ref v0\.1\.0 --yes/);
+    assert.ok(log.indexOf('plugin unlink') < log.indexOf('plugin install'), 'unlink must precede install');
+    const out = `${r.stdout}\n${r.stderr}`;
+    assert.match(out, /herdr-gentle-agents/, 'warning names the plugin id');
+    assert.match(out, /herdr plugin link/, 'warning names the re-link command');
+    assert.ok(!out.includes('refusing remote install'), 'the S6 refusal text must never appear');
+    assert.ok(fs.existsSync(fx.dest), 'managed extension must exist after replacement');
+    assert.equal(fs.readFileSync(fx.stateFile, 'utf8').trim(), sha256File(fx.dest));
   });
 
-  it('local refusal message stays byte-identical without --force', (t) => {
-    const fx = setup(t, { listMode: 'local' });
-    const r = run(['--ref', 'v0.1.0'], fx.env);
-    assert.notEqual(r.status, 0);
-    assert.ok(
-      r.stderr.includes('refusing remote install: plugin herdr-gentle-agents is locally linked (source.kind=local). Unlink it first or install locally; nothing was changed.'),
-      `refusal bytes changed: ${r.stderr}`,
-    );
-    assert.doesNotMatch(readLog(fx.herdrLog), /plugin unlink/);
+  it('local replacement warning never prints the old refusal text', (t) => {
+    for (const args of [['--ref', 'v0.1.0'], ['--force', '--ref', 'v0.1.0']]) {
+      const fx = setup(t, { listMode: 'local' });
+      const r = run(args, fx.env);
+      assert.equal(r.status, 0, `args ${args.join(' ')}: ${r.stderr}`);
+      const out = `${r.stdout}\n${r.stderr}`;
+      assert.ok(
+        !out.includes('refusing remote install: plugin herdr-gentle-agents is locally linked (source.kind=local). Unlink it first or install locally; nothing was changed.'),
+        `S6 refusal bytes must be gone (args ${args.join(' ')}): ${out}`,
+      );
+    }
   });
 
   it('--force unlinks a locally linked plugin then installs', (t) => {
@@ -380,12 +454,147 @@ describe('install.sh isolated behavior', () => {
     assert.ok(fs.existsSync(fx.dest));
   });
 
-  it('--help documents --force', (t) => {
+  it('--help marks --force as a deprecated no-op', (t) => {
     const fx = setup(t);
     const r = run(['--help'], fx.env);
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /--force/);
+    assert.match(r.stdout, /deprecat/i);
     assert.equal(readLog(fx.herdrLog), '', 'help must not call herdr');
+  });
+
+  it('--force still exits 0 as a deprecated no-op', (t) => {
+    const fx = setup(t);
+    const r = run(['--force', '--ref', 'v0.2.0'], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(`${r.stdout}\n${r.stderr}`, /deprecat/i);
+    assert.ok(fs.existsSync(fx.dest));
+  });
+
+  it('omitted --ref uses the tag from HERDR_GENTLE_LATEST_URL', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_LATEST_TAG: 'v9.8.7' } });
+    const r = run([], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(readLog(fx.herdrLog), /plugin install jonasotoaguilar\/herdr-gentle-agents --ref v9\.8\.7 --yes/);
+    assert.match(readLog(fx.curlLog), /example\.invalid/);
+  });
+
+  it('spaced tag_name JSON still resolves without jq', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_CURL_MODE: 'spaced', FAKE_LATEST_TAG: 'v1.2.3' } });
+    const r = run([], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(readLog(fx.herdrLog), /--ref v1\.2\.3/);
+  });
+
+  it('git ls-remote fallback resolves the newest tag when curl fails', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_CURL_MODE: 'fail', FAKE_GIT_MODE: 'ok', FAKE_GIT_TAGS: 'v0.1.0 v0.3.0 v0.2.0' } });
+    const r = run([], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(readLog(fx.herdrLog), /plugin install jonasotoaguilar\/herdr-gentle-agents --ref v0\.3\.0 --yes/);
+    assert.ok(fs.existsSync(fx.dest));
+  });
+
+  it('unresolvable latest fails closed naming --ref', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_CURL_MODE: 'fail', FAKE_GIT_MODE: 'fail' } });
+    const r = run([], fx.env);
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}: ${r.stderr}`);
+    assert.match(r.stderr, /--ref/);
+    assert.doesNotMatch(readLog(fx.herdrLog), /plugin install/);
+    assert.ok(!fs.existsSync(fx.dest), 'nothing must be installed on resolution failure');
+    assert.ok(!fs.existsSync(fx.stateFile), 'no ownership record on resolution failure');
+  });
+
+  it('explicit --ref equal to a clean installed version is a no-op with zero mutation', (t) => {
+    const fx = setup(t);
+    assert.equal(run(['--ref', 'v0.2.0'], fx.env).status, 0);
+    const destBefore = fs.readFileSync(fx.dest);
+    const settingsBefore = fs.readFileSync(fx.settingsFile, 'utf8');
+    const past = new Date('2001-01-01T00:00:00Z');
+    fs.utimesSync(fx.settingsFile, past, past);
+    for (const f of [fx.herdrLog, fx.orderLog, fx.configureLog, fx.statusLog]) truncate(f);
+    const r = run(['--ref', 'v0.2.0'], { ...fx.env, FAKE_PLUGIN_VERSION: 'v0.2.0' });
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(r.stdout, /install\.sh: already up to date \(v0\.2\.0\)/);
+    const log = readLog(fx.herdrLog);
+    assert.doesNotMatch(log, /plugin install/);
+    assert.doesNotMatch(log, /plugin enable/);
+    assert.doesNotMatch(log, /plugin unlink/);
+    assert.doesNotMatch(log, /server reload-config/);
+    assert.ok(destBefore.equals(fs.readFileSync(fx.dest)), 'managed copy must be byte-identical');
+    assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), settingsBefore, 'settings file must not be written');
+    assert.equal(fs.statSync(fx.settingsFile).mtimeMs, past.getTime(), 'settings mtime must be untouched');
+    assert.equal(readLog(fx.configureLog), '', 'configure must not run on no-op');
+    assert.equal(readLog(fx.statusLog), '', 'daemon status must not run on no-op');
+    assert.equal(backupsBeside(fx.dest).length, 0, 'no-op creates no backup');
+  });
+
+  it('omitted --ref matching the installed version is a no-op', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_LATEST_TAG: 'v0.2.0' } });
+    assert.equal(run([], fx.env).status, 0);
+    for (const f of [fx.herdrLog, fx.configureLog, fx.statusLog]) truncate(f);
+    const r = run([], { ...fx.env, FAKE_PLUGIN_VERSION: 'v0.2.0' });
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(r.stdout, /already up to date \(v0\.2\.0\)/);
+    assert.doesNotMatch(readLog(fx.herdrLog), /plugin install/);
+    assert.equal(readLog(fx.configureLog), '', 'configure must not run on no-op');
+  });
+
+  it('drifted managed copy repairs instead of reporting current', (t) => {
+    const fx = setup(t);
+    assert.equal(run(['--ref', 'v0.2.0'], fx.env).status, 0);
+    fs.writeFileSync(fx.dest, '// drifted content\n');
+    const r = run(['--ref', 'v0.2.0'], { ...fx.env, FAKE_PLUGIN_VERSION: 'v0.2.0' });
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.doesNotMatch(`${r.stdout}\n${r.stderr}`, /already up to date/);
+    assert.equal(
+      fs.readFileSync(fx.dest, 'utf8'),
+      fs.readFileSync(path.join(fx.pluginRoot, 'extensions', 'gentle-herdr-state.ts'), 'utf8'),
+      'drifted copy must be repaired from the plugin source',
+    );
+    assert.equal(backupsBeside(fx.dest).length, 1, 'drift repair backs up the drifted copy');
+  });
+
+  it('installed version greater than the target aborts naming both versions and --allow-downgrade', (t) => {
+    const fx = setup(t);
+    const r = run(['--ref', 'v0.2.0'], { ...fx.env, FAKE_PLUGIN_VERSION: 'v0.3.0' });
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}: ${r.stderr}`);
+    assert.match(r.stderr, /v0\.3\.0/);
+    assert.match(r.stderr, /v0\.2\.0/);
+    assert.match(r.stderr, /--allow-downgrade/);
+    assert.doesNotMatch(readLog(fx.herdrLog), /plugin install/);
+    assert.ok(!fs.existsSync(fx.dest), 'aborted downgrade must not install');
+  });
+
+  it('--allow-downgrade proceeds when the installed version is newer', (t) => {
+    const fx = setup(t);
+    const r = run(['--ref', 'v0.2.0', '--allow-downgrade'], { ...fx.env, FAKE_PLUGIN_VERSION: 'v0.3.0' });
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(readLog(fx.herdrLog), /plugin install jonasotoaguilar\/herdr-gentle-agents --ref v0\.2\.0 --yes/);
+    assert.ok(fs.existsSync(fx.dest));
+  });
+
+  it('version comparison is numeric across minor segments', (t) => {
+    const fx = setup(t);
+    const lower = run(['--ref', 'v0.10.0'], { ...fx.env, FAKE_PLUGIN_VERSION: 'v0.9.0' });
+    assert.equal(lower.status, 0, `lower installed must proceed: ${lower.stderr}`);
+    assert.match(readLog(fx.herdrLog), /--ref v0\.10\.0/);
+    const fx2 = setup(t);
+    const higher = run(['--ref', 'v0.9.0'], { ...fx2.env, FAKE_PLUGIN_VERSION: 'v0.10.0' });
+    assert.equal(higher.status, 1, `higher installed must abort: ${higher.stderr}`);
+    assert.match(higher.stderr, /--allow-downgrade/);
+  });
+
+  it('missing or non-numeric installed version proceeds and never aborts', (t) => {
+    for (const ver of [null, 'not-a-version', '']) {
+      const fx = setup(t);
+      const env = { ...fx.env };
+      if (ver === null) delete env.FAKE_PLUGIN_VERSION;
+      else env.FAKE_PLUGIN_VERSION = ver;
+      const r = run(['--ref', 'v0.0.1'], env);
+      assert.equal(r.status, 0, `version ${JSON.stringify(ver)} must proceed: ${r.stderr}`);
+      assert.match(readLog(fx.herdrLog), /plugin install/);
+      assert.ok(fs.existsSync(fx.dest));
+    }
   });
 
   it('absent-server reload warns but the install succeeds', (t) => {
@@ -827,6 +1036,119 @@ describe('install.sh isolated behavior', () => {
     assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), settingsBefore, 'settings untouched');
     assert.equal(fs.readFileSync(fx.exclusionMarker, 'utf8'), markerBefore, 'foreign marker untouched');
     assert.match(r.stderr, /foreign or invalid/i, `must name the cause: ${r.stderr}`);
+  });
+
+  it('git fallback version-sorts and ignores prereleases', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_CURL_MODE: 'fail', FAKE_GIT_MODE: 'ok', FAKE_GIT_TAGS: 'v0.9.0 v0.10.0 v1.0.0-rc1' } });
+    const r = run([], fx.env);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(readLog(fx.herdrLog), /--ref v0\.10\.0/);
+    assert.ok(fs.existsSync(fx.dest));
+  });
+
+  it('resolved-latest downgrade aborts without writing', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_LATEST_TAG: 'v0.2.0' } });
+    assert.equal(run([], fx.env).status, 0);
+    const destBefore = fs.readFileSync(fx.dest);
+    const stateBefore = fs.readFileSync(fx.stateFile, 'utf8');
+    const settingsBefore = fs.readFileSync(fx.settingsFile, 'utf8');
+    for (const f of [fx.herdrLog, fx.orderLog, fx.configureLog, fx.statusLog]) truncate(f);
+    const r = run([], { ...fx.env, FAKE_LATEST_TAG: 'v0.1.0', FAKE_PLUGIN_VERSION: 'v0.2.0' });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /v0\.2\.0/);
+    assert.match(r.stderr, /v0\.1\.0/);
+    assert.match(r.stderr, /--allow-downgrade/);
+    assert.doesNotMatch(readLog(fx.herdrLog), /plugin install/);
+    assert.ok(destBefore.equals(fs.readFileSync(fx.dest)), 'managed copy must be byte-identical');
+    assert.equal(fs.readFileSync(fx.stateFile, 'utf8'), stateBefore, 'ownership record must be untouched');
+    assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), settingsBefore, 'settings must be untouched');
+    assert.equal(backupsBeside(fx.dest).length, 0, 'aborted downgrade creates no backup');
+  });
+
+  it('--force on an already-current install does not mutate', (t) => {
+    const fx = setup(t);
+    assert.equal(run(['--ref', 'v0.2.0'], fx.env).status, 0);
+    const destBefore = fs.readFileSync(fx.dest);
+    const settingsBefore = fs.readFileSync(fx.settingsFile, 'utf8');
+    for (const f of [fx.herdrLog, fx.orderLog, fx.configureLog, fx.statusLog]) truncate(f);
+    const r = run(['--force', '--ref', 'v0.2.0'], { ...fx.env, FAKE_PLUGIN_VERSION: 'v0.2.0' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /already up to date/);
+    assert.match(r.stdout + '\n' + r.stderr, /deprecat/i);
+    const log = readLog(fx.herdrLog);
+    assert.doesNotMatch(log, /plugin install/);
+    assert.doesNotMatch(log, /plugin enable/);
+    assert.doesNotMatch(log, /plugin unlink/);
+    assert.doesNotMatch(log, /server reload/);
+    assert.equal(readLog(fx.configureLog), '', 'configure must not run on no-op');
+    assert.equal(readLog(fx.statusLog), '', 'daemon status must not run on no-op');
+    assert.ok(destBefore.equals(fs.readFileSync(fx.dest)), 'managed copy must be byte-identical');
+    assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), settingsBefore, 'settings file must not be written');
+    assert.equal(backupsBeside(fx.dest).length, 0, 'no-op creates no backup');
+  });
+
+  it('non-strict installed versions proceed and never abort', (t) => {
+    for (const ver of ['v1.2', 'v1.2.3.4', 'v1.2.3-rc1', '1.2.3', '']) {
+      const fx = setup(t);
+      const r = run(['--ref', 'v0.2.0'], { ...fx.env, FAKE_PLUGIN_VERSION: ver });
+      assert.equal(r.status, 0, ver + ' must proceed: ' + r.stderr);
+      assert.match(readLog(fx.herdrLog), /plugin install/, ver + ' must install');
+      assert.doesNotMatch(r.stdout + '\n' + r.stderr, /newer than target/, ver + ' must never abort');
+      assert.ok(fs.existsSync(fx.dest), ver + ' must install dest');
+    }
+  });
+
+  it('symlinked managed copy is never reported current', (t) => {
+    const fx = setup(t);
+    assert.equal(run(['--ref', 'v0.2.0'], fx.env).status, 0);
+    const outside = path.join(fx.tmp, 'outside.txt');
+    fs.writeFileSync(outside, 'outside target\n');
+    fs.rmSync(fx.dest);
+    fs.symlinkSync(outside, fx.dest);
+    for (const f of [fx.herdrLog, fx.orderLog, fx.configureLog, fx.statusLog]) truncate(f);
+    const r = run(['--ref', 'v0.2.0'], { ...fx.env, FAKE_PLUGIN_VERSION: 'v0.2.0' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stdout + '\n' + r.stderr, /already up to date/);
+    assert.ok(!fs.lstatSync(fx.dest).isSymbolicLink(), 'destination must be a regular managed copy');
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'outside target\n', 'link target untouched');
+    assert.equal(fs.readFileSync(fx.dest, 'utf8'), fs.readFileSync(path.join(fx.pluginRoot, 'extensions', 'gentle-herdr-state.ts'), 'utf8'));
+    assert.equal(backupsBeside(fx.dest).length, 1, 'symlink must be moved aside');
+  });
+
+  it('missing managed copy is repaired instead of reporting current', (t) => {
+    const fx = setup(t);
+    assert.equal(run(['--ref', 'v0.2.0'], fx.env).status, 0);
+    fs.rmSync(fx.dest);
+    for (const f of [fx.herdrLog, fx.orderLog, fx.configureLog, fx.statusLog]) truncate(f);
+    const r = run(['--ref', 'v0.2.0'], { ...fx.env, FAKE_PLUGIN_VERSION: 'v0.2.0' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stdout + '\n' + r.stderr, /already up to date/);
+    assert.equal(fs.readFileSync(fx.dest, 'utf8'), fs.readFileSync(path.join(fx.pluginRoot, 'extensions', 'gentle-herdr-state.ts'), 'utf8'), 'missing copy must be repaired');
+    assert.match(readLog(fx.herdrLog), /plugin install/);
+    assert.equal(backupsBeside(fx.dest).length, 0, 'repair of a missing copy creates no backup');
+  });
+
+  it('PATH without curl or git fails closed naming --ref', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_CURL_MODE: 'fail', FAKE_GIT_MODE: 'fail' } });
+    const onlyBin = path.join(fx.tmp, 'nonetbin');
+    fs.mkdirSync(onlyBin, { recursive: true });
+    const tools = ['sh', 'node', 'sha256sum', 'date', 'sed', 'cut', 'tr', 'expr', 'grep', 'sort', 'tail', 'head', 'mkdir', 'cp', 'mv', 'rm', 'rmdir', 'uname', 'chmod'];
+    for (const name of tools) {
+      const found = spawnSync('sh', ['-c', 'command -v ' + name], { encoding: 'utf8', env: fx.env }).stdout.trim().split('\n')[0];
+      assert.ok(found && found.startsWith('/'), name + ' must resolve for the no-network PATH');
+      fs.symlinkSync(found, path.join(onlyBin, name));
+    }
+    fs.symlinkSync(path.join(fx.tmp, 'fakebin', 'herdr'), path.join(onlyBin, 'herdr'));
+    const env = { ...fx.env, PATH: onlyBin };
+    assert.equal(spawnSync('sh', ['-c', 'command -v herdr >/dev/null'], { encoding: 'utf8', env }).status, 0, 'fake herdr must stay reachable');
+    assert.notEqual(spawnSync('sh', ['-c', 'command -v curl >/dev/null'], { encoding: 'utf8', env }).status, 0, 'curl must be absent from PATH');
+    assert.notEqual(spawnSync('sh', ['-c', 'command -v git >/dev/null'], { encoding: 'utf8', env }).status, 0, 'git must be absent from PATH');
+    const r = run([], env);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /--ref/);
+    assert.doesNotMatch(readLog(fx.herdrLog), /plugin install/);
+    assert.ok(!fs.existsSync(fx.dest), 'nothing must be installed without resolution');
+    assert.ok(!fs.existsSync(fx.stateFile), 'no ownership record without resolution');
   });
 
   it('touches nothing outside the temp fixture', (t) => {

@@ -545,9 +545,13 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 - The consumer emits `herdr notification` for `ask` only, on the `¬ask → ask`
   transition per `(sessionHash, intentId)`. Polls that remain in `ask` for the
   same intent are silent. A new `intentId` re-arms. Visible copy is fixed
-  and private-safe — title `Gentle: response needed`, body `Your input is
-  needed. Return to Pi to respond.`, `--sound request`; no pane/intent
-  ids, paths, or prompt content ever enter the title/body. Sends are async
+  and private-safe — title `Gentle needs response`, body `<project> needs
+  your input. Return to Pi to respond.`, `--sound request`. `<project>` is
+  the snapshot's validated workspace/group name only, sanitized and bounded
+  to 64 characters, failing closed to `Gentle`; the cwd-derived fallback the
+  sidebar uses is deliberately never used here, because a desktop toast
+  outlives the terminal (notification history, lock screen). No pane/intent
+  ids, session material, paths, or prompt content ever enter the title/body. Sends are async
   off the frame critical path (single flight per intent, ledger written
   only on observed success, retry next frame) so a slow send never
   head-of-line-blocks sibling panes.

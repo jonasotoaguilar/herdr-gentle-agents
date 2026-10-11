@@ -43,23 +43,38 @@ Prerequisites: Linux, Node >= 18, Herdr meeting `min_herdr_version` in `herdr-pl
 `herdr-pi-tree` installed (it stays installed but disabled for gentle-owned
 panes).
 
-One pinned script installs both halves at the same release tag: the Herdr plugin
+One script installs both halves: the Herdr plugin
 plus a managed copy of `extensions/gentle-herdr-state.ts` at
 `~/.pi/agent/extensions/gentle-herdr-state.ts`.
 
-Review the pinned script before piping it to a shell — fetch the tag URL
+The stable entrypoint always resolves to the newest release, while each
+release freezes its uploaded asset bytes — the URL moves forward, the bytes
+it served for a given release never change.
+
+Review the script before piping it to a shell — fetch the URL
 (never `main`) and read it first. The installer never uses `sudo` and never
 handles credentials.
 
-### Public install (pinned, one command)
+### Public install (stable, one command)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/v0.1.0/install.sh | sh -s -- --ref v0.1.0
+curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh
 ```
+
+With no `--ref` the installer resolves the newest release tag automatically.
+
+### Pinned install (explicit tag)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/v0.2.0/install.sh | sh -s -- --ref v0.2.0
+```
+
+Pass `--ref <tag>` to pin an older release instead of following latest.
 
 What the installer does:
 
-- Installs and enables the Herdr plugin at the pinned `--ref`.
+- Installs and enables the Herdr plugin at the resolved `--ref` (the newest
+  release when `--ref` is omitted).
 - Atomically copies `extensions/gentle-herdr-state.ts` from the Herdr-managed
   checkout into `~/.pi/agent/extensions/gentle-herdr-state.ts` (temp file plus
   rename) with a SHA-256 ownership record. A conflicting destination — including
@@ -104,32 +119,44 @@ Then run `/reload` in Pi to pick up the local package.
 
 For isolated/local use the installer honors a `PI_AGENT_DIR` override (default
 `$HOME/.pi/agent`) without touching the live Pi dir, e.g.
-`PI_AGENT_DIR=/tmp/pi-agent-test sh install.sh --ref v0.1.0`. Do not use
+`PI_AGENT_DIR=/tmp/pi-agent-test sh install.sh --ref v0.2.0`. Do not use
 `pi install` as the production path for this installer — the managed copy at
 `~/.pi/agent/extensions/gentle-herdr-state.ts` is the supported Pi half.
 
 ### Update
 
-Re-run the same script pattern at the new tag with the new `--ref`:
+Re-run the same command — no tag lookup needed:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/<new-tag>/install.sh | sh -s -- --ref <new-tag>
+curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh
+```
+
+The installer compares the installed plugin version with the resolved target:
+an older install updates, an already-current install is a no-op, and a newer
+installed version aborts naming both versions unless `--allow-downgrade` is
+given:
+
+```sh
+curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh -s -- --allow-downgrade
 ```
 
 A modified managed Pi copy is backed up before replacement, same as on install.
 
-If the installed plugin is locally linked, the installer refuses the remote
-replacement by default; pass `--force` to unlink it first and then proceed
-with the remote install:
+If the installed plugin is locally linked, the remote install replaces it
+automatically and warns naming the plugin id; to restore a checkout afterwards
+re-link it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/<new-tag>/install.sh | sh -s -- --ref <new-tag> --force
+herdr plugin link --enabled .
 ```
+
+`--force` is deprecated and a no-op kept only so commands documented in v0.1.1
+keep working; use `--allow-downgrade` for downgrades instead.
 
 ### Removal
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/v0.1.0/install.sh | sh -s -- --uninstall
+curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh -s -- --uninstall
 ```
 
 Uninstall runs `configure --uninstall`, best-effort daemon `--stop --purge` and
