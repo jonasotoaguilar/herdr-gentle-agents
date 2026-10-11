@@ -49,9 +49,9 @@ function roleEntry(roleCsv, { count = 0, stateLabels, extraTokens, ...rest } = {
 describe('fresh count=0 role hint', () => {
   const cases = [
     { roles: 'worker', display: 'worker', label: 'worker' },
-    { roles: 'explorer', display: 'explorer', label: 'explore' },
+    { roles: 'explorer', display: 'explorer', label: 'explorer' },
     { roles: 'verify', display: 'verify', label: 'verify' },
-    { roles: 'rdd', display: 'review', label: 'review' },
+    { roles: 'rdd', display: 'review', label: 'rdd' },
   ];
   for (const { roles, display, label } of cases) {
     it(`${roles} yields ${display}/${label} with no (n)`, () => {
@@ -73,7 +73,7 @@ describe('fresh count=0 role hint', () => {
     });
   }
 
-  it('newest recognized role wins most-recent-first', () => {
+  it('oldest recognized role wins oldest-first', () => {
     const { entry } = roleEntry('verify,worker', { count: 0 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'verify');
@@ -178,7 +178,7 @@ describe('ask and blocked precedence', () => {
     });
     const reviewReduced = tokens.reducePane(reviewEntry, NOW);
     assert.equal(reviewReduced.display, 'review');
-    assert.equal(reviewReduced.label, 'review');
+    assert.equal(reviewReduced.label, 'rdd');
     assert.equal(reviewReduced.notify, null);
 
     const { entry: askWins } = roleEntry('worker', {
@@ -269,7 +269,7 @@ describe('orchestrating reduction', () => {
     const { entry } = orchEntry('worker,explorer', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
     assert.equal(reduced.owned, true);
     assert.equal(reduced.notify, null);
   });
@@ -298,19 +298,21 @@ describe('orchestrating reduction', () => {
     assert.equal(reduced.notify, null);
   });
 
-  it('terminal done outranks roles and a fresh marker', () => {
-    const built = orchEntry('worker', { count: 0 });
-    built.entry.agent_status = 'done';
-    const reduced = tokens.reducePane(built.entry, NOW);
-    assert.equal(reduced.display, 'done');
-    assert.equal(reduced.label, 'done');
+  it('terminal done yields to live evidence: roles or a fresh marker veto it', () => {
+    // Count is running-only: a settled principal with a queued delegate
+    // (count 0 + fresh marker + role hint) is NOT done.
+    const { entry } = orchEntry('worker', { count: 0 });
+    entry.agent_status = 'done';
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker');
   });
 
   it('attention states outrank the marker', () => {
     const cases = [
       [{ 0: 'ask:q1' }, 'ask', 'ask'],
       [{ 0: 'error:e1' }, 'error', 'blocked'],
-      [{ 0: 'review:r1' }, 'review', 'review'],
+      [{ 0: 'review:r1' }, 'review', 'rdd'],
     ];
     for (const [labels, display, label] of cases) {
       const { entry } = orchEntry('worker', { count: 1, stateLabels: labels });
@@ -332,6 +334,7 @@ describe('orchestrating reduction', () => {
     const workingBuilt = roleEntry('', { count: 3 });
     const workingReduced = tokens.reducePane(workingBuilt.entry, NOW);
     assert.equal(workingReduced.display, 'working');
+    assert.equal(workingReduced.label, 'gentle');
   });
 });
 
@@ -351,10 +354,10 @@ describe('role-over-root-marker precedence', () => {
   }
 
   const cases = [
-    { roles: 'explorer', display: 'explorer', label: 'explore' },
+    { roles: 'explorer', display: 'explorer', label: 'explorer' },
     { roles: 'worker', display: 'worker', label: 'worker' },
     { roles: 'verify', display: 'verify', label: 'verify' },
-    { roles: 'rdd', display: 'review', label: 'review' },
+    { roles: 'rdd', display: 'review', label: 'rdd' },
   ];
   for (const { roles, display, label } of cases) {
     it(`${roles} beats a fresh marker (${display}/${label})`, () => {
@@ -370,12 +373,13 @@ describe('role-over-root-marker precedence', () => {
     assert.equal(tokens.roleToDisplay('explorer'), 'explorer');
     const reduced = tokens.reducePane(markedRoleEntry('explorer', 0), NOW);
     assert.equal(reduced.display, 'explorer');
-    assert.equal(reduced.label, 'explore');
+    assert.equal(reduced.label, 'explorer');
   });
 
-  it('newest role wins over a fresh marker', () => {
+  it('oldest role wins over a fresh marker', () => {
     const reduced = tokens.reducePane(markedRoleEntry('worker,explorer', 2), NOW);
     assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
   });
 
   it('marker still renders with no recognized role', () => {
@@ -388,7 +392,7 @@ describe('role-over-root-marker precedence', () => {
 describe('orchestrating display family', () => {
   it('display key stays orchestrating; label, icon, heading, row use gentle', () => {
     assert.ok(tokens.DISPLAYS.includes('orchestrating'));
-    assert.equal(tokens.DISPLAYS.length, 10);
+    assert.equal(tokens.DISPLAYS.length, 11);
     assert.equal(tokens.DISPLAY_LABELS.orchestrating, 'gentle');
     assert.equal(tokens.iconValueFor('orchestrating'), '●');
     assert.equal(tokens.headingValueFor('orchestrating', 'myproj'), '● myproj');
@@ -424,8 +428,8 @@ describe('orchestrating display family', () => {
     }
   });
 
-  it('owned and sweep lists grow by the project + summary addition (64 + 2 = 66)', () => {
-    assert.equal(tokens.OWNED_TOKENS.length, 66);
+  it('owned and sweep lists include judge (66 + 6 = 72)', () => {
+    assert.equal(tokens.OWNED_TOKENS.length, 72);
     const names = [
       'gentle_state_orchestrating',
       'gentle_title_orchestrating',
@@ -601,6 +605,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
       '$gentle_title_explorer',
       '$gentle_title_worker',
       '$gentle_title_verify',
+      '$gentle_title_judge',
       '$gentle_title_ask',
       '$gentle_title_review',
       '$gentle_title_error',
@@ -616,7 +621,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
       assert.ok(idx > prev, token + ' in order on row 2');
       prev = idx;
     }
-    assert.equal(cells(row2), 13);
+    assert.equal(cells(row2), 14);
     assert.ok(!row2.includes('rules'));
     assert.ok(!row2.includes('$gentle_heading_'));
     assert.ok(!row2.includes('$gentle_project'));
@@ -632,6 +637,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
       ['$gentle_title_explorer', 'SIDEBAR_BLUE'],
       ['$gentle_title_worker', 'SIDEBAR_AMBER'],
       ['$gentle_title_verify', 'SIDEBAR_TEAL'],
+      ['$gentle_title_judge', 'SIDEBAR_PURPLE'],
       ['$gentle_title_ask', 'SIDEBAR_ORANGE'],
       ['$gentle_title_review', 'SIDEBAR_BLUE'],
       ['$gentle_title_error', 'SIDEBAR_RED'],
@@ -658,10 +664,11 @@ describe('README managed example matches generated config exactly', () => {
     assert.ok(readme.includes(configure.PI_ROW));
   });
 
-  it('README block carries the managed markers and review-blue title cell', () => {
+  it('README block carries the managed markers, review-blue and judge-purple title cells', () => {
     assert.ok(readme.includes(configure.MANAGED_BEGIN));
     assert.ok(readme.includes(configure.MANAGED_END));
     assert.ok(readme.includes('{ token = "$gentle_title_review", fg = "#89b4fa" }'));
+    assert.ok(readme.includes('{ token = "$gentle_title_judge", fg = "#cba6f7" }'));
     assert.ok(readme.includes('{ token = "$gentle_title_idle", fg = "#7c7f93" }'));
   });
 
@@ -675,7 +682,7 @@ describe('README managed example matches generated config exactly', () => {
     assert.ok(!block.includes('$gentle_project'));
     assert.ok(!block.includes('$gentle_changes_summary'));
     assert.ok(!block.includes('rules ='));
-    assert.ok(!block.includes('#cba6f7'));
+    assert.ok(block.includes('#cba6f7'));
   });
 });
 
@@ -778,7 +785,7 @@ describe('consent-eligible review start (ask while pending, review on resolve)',
     });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'review');
-    assert.equal(reduced.label, 'review');
+    assert.equal(reduced.label, 'rdd');
     assert.equal(reduced.notify, null);
     assert.equal(reduced.owned, true);
   });
@@ -801,18 +808,18 @@ describe('durable review token (gentle_review_v1)', () => {
     assert.ok(!('gentle_work_v1' in entry.tokens));
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'review');
-    assert.equal(reduced.label, 'review');
+    assert.equal(reduced.label, 'rdd');
     assert.equal(reduced.notify, null);
     assert.equal(reduced.owned, true);
     const patch = tokens.displayTokens(reduced);
-    assert.equal(patch[tokens.ROW_TOKENS.review], 'pi · review');
+    assert.equal(patch[tokens.ROW_TOKENS.review], 'pi · rdd');
   });
 
   it('fresh review token repairs a missed review label and outranks roles', () => {
     const { entry, hash } = reviewCase({ roles: 'worker', count: 1 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'review');
-    assert.equal(reduced.label, 'review');
+    assert.equal(reduced.label, 'rdd');
     assert.equal(reduced.notify, null);
     assert.deepEqual(tokens.parseReview(entry.tokens.gentle_review_v1, hash, NOW), {
       reviewId: 'r1',
@@ -887,7 +894,7 @@ describe('durable review token (gentle_review_v1)', () => {
     const { entry: reviewBoth } = reviewCase({ stateLabels: { 0: 'review:r9' }, count: 1 });
     const reviewReduced = tokens.reducePane(reviewBoth, NOW);
     assert.equal(reviewReduced.display, 'review');
-    assert.equal(reviewReduced.label, 'review');
+    assert.equal(reviewReduced.label, 'rdd');
     assert.equal(reviewReduced.notify, null);
   });
 
@@ -902,5 +909,328 @@ describe('durable review token (gentle_review_v1)', () => {
 
     const { entry: workingEntry } = reviewCase({ roles: '', count: 3 });
     assert.equal(tokens.reducePane(workingEntry, NOW).display, 'review');
+  });
+});
+
+describe('T2b judge role and oldest-running count suffix', () => {
+  it('grammar accepts judge; judge maps distinctly (not rdd)', () => {
+    assert.deepEqual(tokens.parseRoles('judge'), ['judge']);
+    assert.equal(tokens.roleToDisplay('judge'), 'judge');
+    assert.ok(tokens.DISPLAYS.includes('judge'));
+    assert.equal(tokens.DISPLAY_LABELS.judge, 'judge');
+    assert.equal(tokens.iconValueFor('judge'), '●');
+    assert.equal(tokens.headingValueFor('judge', 'myproj'), '● myproj');
+    assert.equal(tokens.rowValueFor('judge', 'pi', 'judge'), 'pi · judge');
+  });
+
+  it('single judge has no count suffix', () => {
+    const { entry } = roleEntry('judge', { count: 1 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'judge');
+    assert.equal(reduced.label, 'judge');
+  });
+
+  it('visible explorer label is exactly explorer (user-requested, not explore)', () => {
+    const { entry } = roleEntry('explorer', { count: 3 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'explorer');
+    assert.equal(reduced.label, 'explorer (3)');
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.TITLE_TOKENS.explorer], 'explorer (3)');
+    assert.equal(patch[tokens.ROW_TOKENS.explorer], 'pi · explorer (3)');
+    assert.equal(tokens.rowValueFor('explorer', 'pi', 'explorer'), 'pi · explorer');
+  });
+
+  it('mixed judge,worker,rdd uses oldest judge with total count (3)', () => {
+    const { entry } = roleEntry('judge,worker,rdd', { count: 3 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'judge');
+    assert.equal(reduced.label, 'judge (3)');
+  });
+
+  it('visible review word is rdd; machine key stays review', () => {
+    const { entry } = roleEntry('rdd', { count: 1 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'review');
+    assert.equal(reduced.label, 'rdd');
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.TITLE_TOKENS.review], 'rdd');
+    assert.equal(patch[tokens.ROW_TOKENS.review], 'pi · rdd');
+  });
+
+  it('delegated rdd with true count suffixes the visible rdd word', () => {
+    const { entry } = roleEntry('rdd', { count: 2 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'review');
+    assert.equal(reduced.label, 'rdd (2)');
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.TITLE_TOKENS.review], 'rdd (2)');
+  });
+
+  it('native done with zero count but a fresh marker settles to gentle (queued cover)', () => {
+    const built = roleEntry('', { count: 0 });
+    built.entry.tokens[tokens.ORCH_TOKEN] = `${built.hash}:${EXPIRY}`;
+    built.entry.agent_status = 'done';
+    const reduced = tokens.reducePane(built.entry, NOW);
+    assert.equal(reduced.display, 'orchestrating');
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('native done with running delegates preserves the oldest role (never done)', () => {
+    const { entry } = roleEntry('worker,explorer', { count: 2 });
+    entry.agent_status = 'done';
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
+  });
+
+  it('native done with zero running count settles to done', () => {
+    const { entry } = roleEntry('', { count: 0 });
+    entry.agent_status = 'done';
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'done');
+    assert.equal(reduced.label, 'done');
+  });
+
+  it('three same-role running explorers suffix the oldest role (3)', () => {
+    const { entry } = roleEntry('explorer', { count: 3 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'explorer');
+    assert.equal(reduced.label, 'explorer (3)');
+  });
+
+  it('oldest explorer plus worker uses oldest role with total count (2)', () => {
+    const { entry } = roleEntry('explorer,worker', { count: 2 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'explorer');
+    assert.equal(reduced.label, 'explorer (2)');
+  });
+
+  it('oldest-first order: first CSV entry wins', () => {
+    const { entry } = roleEntry('worker,explorer', { count: 2 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
+  });
+
+  it('single running worker after completion has no suffix', () => {
+    const { entry } = roleEntry('worker', { count: 1 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker');
+  });
+
+  it('no suffix on ask/error/idle/done/gentle even with count > 1', () => {
+    const { entry: askEntry } = roleEntry('worker', { count: 3, stateLabels: { 0: 'ask:q1' } });
+    assert.equal(tokens.reducePane(askEntry, NOW).label, 'ask');
+    const { entry: errEntry } = roleEntry('worker', { count: 3, stateLabels: { 0: 'error:e1' } });
+    assert.equal(tokens.reducePane(errEntry, NOW).label, 'blocked');
+    // Done needs settled-plus-empty: count 0 with no roles and no marker.
+    // (Count excludes queued; the veto cases are pinned below.)
+    const doneBuilt = roleEntry('', { count: 0 });
+    doneBuilt.entry.agent_status = 'done';
+    assert.equal(tokens.reducePane(doneBuilt.entry, NOW).label, 'done');
+    const orchBuilt = roleEntry('', { count: 3 });
+    orchBuilt.entry.tokens[tokens.ORCH_TOKEN] = `${orchBuilt.hash}:${EXPIRY}`;
+    assert.equal(tokens.reducePane(orchBuilt.entry, NOW).label, 'gentle');
+    const idleBuilt = roleEntry('', { count: 0 });
+    idleBuilt.entry.agent_status = 'idle';
+    assert.equal(tokens.reducePane(idleBuilt.entry, NOW).label, 'idle');
+  });
+
+  it('delegated rdd role suffixes with true running count; tool-only review does not invent counts', () => {
+    const { entry: delegated } = roleEntry('rdd', { count: 2 });
+    const delegatedReduced = tokens.reducePane(delegated, NOW);
+    assert.equal(delegatedReduced.display, 'review');
+    assert.equal(delegatedReduced.label, 'rdd (2)');
+    const toolOnly = baseEntry();
+    const toolHash = sessionHashFor(toolOnly);
+    toolOnly.tokens = { gentle_review_v1: `${toolHash}:r1:${EXPIRY}` };
+    const toolReduced = tokens.reducePane(toolOnly, NOW);
+    assert.equal(toolReduced.display, 'review');
+    assert.equal(toolReduced.label, 'rdd');
+  });
+
+  it('displayTokens carries the count to the title cell (not just heading)', () => {
+    const reduced = {
+      display: 'worker',
+      label: 'worker (2)',
+      agent: 'pi',
+      workspace: 'myproj',
+      added: '',
+      deleted: '',
+      pull: '',
+    };
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.TITLE_TOKENS.worker], 'worker (2)');
+    assert.equal(patch[tokens.ROW_TOKENS.worker], 'pi · worker (2)');
+  });
+
+  it('malformed roles fail closed to working/gentle without suffix', () => {
+    const { entry } = roleEntry('worker,,bogus!', { count: 2 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
+    const { entry: bad } = roleEntry('bogus!', { count: 2 });
+    const badReduced = tokens.reducePane(bad, NOW);
+    assert.equal(badReduced.display, 'working');
+    assert.equal(badReduced.label, 'gentle');
+    assert.doesNotMatch(badReduced.label, /\(/);
+  });
+
+  it('stale work token yields idle with no suffix (no stale counts)', () => {
+    const entry = baseEntry();
+    const hash = sessionHashFor(entry);
+    entry.tokens = { gentle_work_v1: `${hash}:3:${NOW}`, gentle_roles_v1: 'worker' };
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'idle');
+    assert.equal(reduced.label, 'idle');
+  });
+
+  it('owned/sweep families include judge (72 total) and row 2 holds 14 cells', () => {
+    assert.equal(tokens.DISPLAYS.length, 11);
+    assert.equal(tokens.OWNED_TOKENS.length, 72);
+    assert.ok(tokens.OWNED_TOKENS.includes('gentle_state_judge'));
+    assert.ok(tokens.OWNED_TOKENS.includes('gentle_title_judge'));
+    assert.ok(tokens.SWEEP_TOKENS.includes('gentle_title_judge'));
+  });
+});
+
+describe('visible generic activity reads gentle, never working', () => {
+  it('machine key stays working; visible label is gentle', () => {
+    assert.ok(tokens.DISPLAYS.includes('working'));
+    assert.equal(tokens.TITLE_TOKENS.working, 'gentle_title_working');
+    assert.equal(tokens.DISPLAY_LABELS.working, 'gentle');
+  });
+
+  it('count>0 with malformed roles yields gentle (machine key working)', () => {
+    const { entry } = roleEntry('bogus!', { count: 2 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
+    assert.doesNotMatch(reduced.label, /\(/);
+  });
+
+  it('count>0 with absent roles yields gentle (machine key working)', () => {
+    const { entry } = roleEntry('', { count: 3 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('native working with no metadata yields gentle (machine key working)', () => {
+    const entry = baseEntry({ agent_status: 'working' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('recognized roles still win over the generic word', () => {
+    const cases = [
+      ['worker', 'worker', 'worker'],
+      ['explorer', 'explorer', 'explorer'],
+      ['verify', 'verify', 'verify'],
+      ['judge', 'judge', 'judge'],
+      ['rdd', 'review', 'rdd'],
+    ];
+    for (const [roles, display, label] of cases) {
+      const { entry } = roleEntry(roles, { count: 1 });
+      const reduced = tokens.reducePane(entry, NOW);
+      assert.equal(reduced.display, display);
+      assert.equal(reduced.label, label);
+    }
+  });
+});
+
+describe('unknown delegation surfaces its sanitized name, never a generic word', () => {
+  it('parseRoles keeps a sanitized passthrough slug', () => {
+    assert.deepEqual(tokens.parseRoles('my-custom-scout'), ['my-custom-scout']);
+    assert.deepEqual(tokens.parseRoles('worker,my-custom-scout'), ['worker', 'my-custom-scout']);
+  });
+
+  it('parseRoles drops overlong slugs (producer truncates to 32)', () => {
+    assert.deepEqual(tokens.parseRoles('a'.repeat(33)), []);
+    assert.deepEqual(tokens.parseRoles('a'.repeat(32)), ['a'.repeat(32)]);
+  });
+
+  it('roleToDisplay routes passthrough to the working machine key', () => {
+    assert.equal(tokens.roleToDisplay('my-custom-scout'), 'working');
+    assert.equal(tokens.roleToDisplay('bogus!'), null);
+  });
+
+  it('unknown delegation renders its name (machine key working)', () => {
+    const { entry } = roleEntry('my-custom-scout', { count: 1 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'my-custom-scout');
+  });
+
+  it('unknown delegation suffixes with a true count above one', () => {
+    const { entry } = roleEntry('my-custom-scout', { count: 3 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'my-custom-scout (3)');
+  });
+
+  it('overlong role evidence falls back to gentle, never working', () => {
+    const { entry } = roleEntry('a'.repeat(40), { count: 2 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('known roles still outrank a colocated unknown name (oldest wins)', () => {
+    const { entry } = roleEntry('worker,my-custom-scout', { count: 2 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
+  });
+});
+
+describe('principal alone always reads gentle', () => {
+  it('fresh marker with zero roles and count 0 yields gentle', () => {
+    const entry = baseEntry({ agent_status: 'working' });
+    const hash = sessionHashFor(entry);
+    entry.tokens = {
+      gentle_work_v1: workToken(hash, 0),
+      gentle_roles_v1: '',
+      gentle_orchestrating_v1: `${hash}:${EXPIRY}`,
+    };
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('count-0 work token with no marker and no roles yields gentle', () => {
+    const { entry } = roleEntry('', { count: 0 });
+    entry.agent_status = 'working';
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.label, 'gentle');
+  });
+});
+
+describe('principal interleave precedence (live-reported stuck-gentle)', () => {
+  it('principal working with a live worker reduces to worker, never gentle', () => {
+    const { entry } = roleEntry('worker', { count: 1 });
+    entry.agent_status = 'working';
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker');
+  });
+
+  it('principal done with a live worker reverts to worker+count, never gentle/done', () => {
+    const { entry } = roleEntry('worker', { count: 1 });
+    entry.agent_status = 'done';
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker');
+  });
+
+  it('a sanitized unknown slug exactly equal to working degrades to gentle', () => {
+    assert.deepEqual(tokens.parseRoles('working'), ['working']);
+    assert.equal(tokens.roleToDisplay('working'), null);
+    const { entry } = roleEntry('working', { count: 1 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
   });
 });

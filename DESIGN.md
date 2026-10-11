@@ -13,10 +13,10 @@ decisions are listed explicitly in §10 and are not decided here.
 - Herdr sidebar (`[ui.sidebar.agents]` + `[ui.sidebar.spaces]` blocks): shows
   one state label per pane plus an optional session-changes badge.
 - The human operator watching Pi + Gentle Shell agents: needs to distinguish
-  `working` (orchestrator/main) vs the active TaskStore role (`explorer`,
+  generic activity (`gentle`, machine key `working`) vs the active TaskStore role (`explorer`,
   `worker`, `verify`, `rdd`), `ask` (blocked on user input), `blocked`
   (error), `done`, and `idle` at a glance. No visible text ever carries
-  a subagent count.
+  a subagent count, and generic activity never reads `working`.
 
 ### Current boundary and interaction
 
@@ -182,27 +182,46 @@ Sidecar only: ships beside `herdr-agent-state.ts`, never modifies it.
 | Producer event (source) | Tokens written | v1 state contribution |
 |---|---|---|
 | `agent_start` / `isIdle=false` (main actively working, incl. 0 active subs) | `gentle_work_v1=<hash>:0:<exp>` + `gentle_orchestrating_v1=<hash>:<exp>` (root marker while main actively works) + clear `herdr:blocked` labels | `gentle` (machine key `orchestrating`) while the principal session actively works, even with zero subagents |
-| TaskStore `running`/`queued` non-empty (G3) | `gentle_work_v1=<hash>:<count>:<exp>` (internal total, never rendered) + `gentle_roles_v1=<csv>` (roles from `TaskRecord.agent`, authoritative) + `gentle_names_v1=<csv>` (compat transport only, never rendered) + `gentle_orchestrating_v1=<hash>:<exp>` (root-only marker, §4.3) | newest recognized role (`explorer` / `worker` / `verify` / `rdd`), else `working` — count and names never render; a fresh root marker reduces to `orchestrating` only when no recognized role is active |
-| `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt`, plus direct Pi in-process `tool_call` opens / `tool_result` closes for the exact tools `ask_user_question` and `ask_user_choice`, tracked by `toolCallId` in a call-id set (overlapping calls correct; cleared on result/reset/shutdown; event legs and error > ask > review precedence unchanged; boundary: only what Pi emits as a `tool_call` event is observable — a host ask UI that never emits one stays covered by the event legs only), plus consent-eligible `gentle_review` starts (ordinary-mode `start` / `select-intended-untracked`, tracked by `toolCallId` while pending: renders `ask` until the call resolves, then falls back to `review:` or the next state) | `herdr:blocked` label `ask:<intentId>` + durable `gentle_ask_v1=<hash>:<intentId>:<exp>` on every beat while ask is active (null/clear when inactive — repairs a missed label edge; §4.3) | `ask` (existing machine key, user-facing `ask`, amber/orange, native `?`) |
-| Pi in-process `tool_call` opens / `tool_result` closes for the exact registered tools `gentle_review`, `gentle_review_capture`, `gentle_review_capture_group`, `gentle_review_scope` (G5), tracked by `toolCallId`; reserved `gentle-pi:review:blocked` hook remains OR-combined. Exception: a consent-eligible `gentle_review` start (ordinary-mode `start` / `select-intended-untracked`, fail-closed eligibility) is classified into the ask leg above while pending, never here | `herdr:blocked` label `review:<reviewId>` | `review` (machine key `review`) — during a capture-group run the single parent capture-group call stays in flight across the whole multi-reviewer span, so that one call alone holds the label |
+| TaskStore `running` non-empty (G3; queued/waiting never execute) | `gentle_work_v1=<hash>:<count>:<exp>` (running total; the consumer renders the oldest role plus this total in parentheses only when above one) + `gentle_roles_v1=<csv>` (roles from `TaskRecord.agent`, authoritative, oldest-first) + `gentle_names_v1=<csv>` (compat transport only, never rendered) + `gentle_orchestrating_v1=<hash>:<exp>` (root-only marker, §4.3) | oldest running role word (known short word or unknown sanitized name), else generic `gentle` (no delegation — a single delegate carries no suffix; a fresh root marker reduces to `orchestrating` only with no delegation active |
+| `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt`, plus direct Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes for the exact tools `ask_user_question` and `ask_user_choice`, tracked by `toolCallId` in a call-id set (a `tool_call` proposal alone never opens; an abort/error end with no result still closes; overlapping calls correct; cleared on result/end/reset/shutdown; event legs and error > ask > review precedence unchanged; boundary: only what Pi emits as execution events is observable — a host ask UI that never emits one stays covered by the event legs only). `gentle_review` starts (any operation) never enter ask: the former consent-eligible pending signal fired before any outcome/UI and falsely blocked pre-granted sessions | `herdr:blocked` label `ask:<intentId>` + durable `gentle_ask_v1=<hash>:<intentId>:<exp>` on every beat while ask is active (null/clear when inactive — repairs a missed label edge; §4.3) | `ask` (existing machine key, user-facing `ask`, amber/orange, native `?`) |
+| Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes (by `toolCallId`; a `tool_call` proposal alone never opens) for the exact tools `gentle_review_capture`, `gentle_review_capture_group` with `reviewerRunAcknowledged: true` in the runtime args; `correctionLines` (native planning, never a reviewer), forecast-only calls, `gentle_review` (any operation), `gentle_review_scope`, and all sidebar/hook signals never enter — unknown legacy shapes stay dark (conservative) | `herdr:blocked` label `review:<reviewId>` | `review` (machine key `review`) — during a capture-group run the single parent capture-group call stays in flight across the whole multi-reviewer span, so that one call alone holds the label. Bounded approximation: the acknowledged capture interval contains preparation and admission; no exact reviewer internal events exist today |
 | agent error / task failed / transport failure | `herdr:blocked` label `error:<code>` | `blocked` (machine key `error`) |
 | `agent_settled` + 0 active subs | `gentle_work_v1=<hash>:0:<exp>`; clear `blocked` labels | `done` |
 | `SESSION_CHANGE_ENTRY` `gentle-pi.session-change/v1` tool outcome (G1/G2) | `gentle_changes_v2=<hash>:<files>:<added>:<deleted>:<exp>` (+ legacy `gentle_changes_v1` dual-emit, §4.3) | change segments only (orthogonal to state) |
 
-`waiting`/`finished` TaskStore entries never count as active. Active =
-`running` + `queued` only. The count is a direct projection of the Gentle
-Shell TaskStore `running`/`queued` records carried in
-`event.details.gentleAgents` — never a calculated pending-call estimate —
-and stays internal: no visible label renders it. The visible activity state
+`waiting`/`finished` TaskStore entries never count as active, and `queued`
+never counts as executing for the visible role + total (T2b): only `running`
+feeds `gentle_work_v1` and `gentle_roles_v1`. Liveness/marker coverage
+retains `running`/`queued`/pending (the root marker still covers a queued
+subagent or a pending launch). The count is a direct projection of the
+Gentle Shell TaskStore `running` records carried in
+`event.details.gentleAgents` — never a calculated pending-call estimate.
+Background launches (`subagent_run` with `mode: background`) announce their
+lifecycle over `message_end` custom results instead of `tool_result`
+details: an ACTIVE status (running|queued) there promotes the background
+start into the tasks map exactly like a task-mode record (settle-safe,
+oldest-first, cleared by its FINAL), so a background delegate Pi shows as
+active renders its role rather than sticking on `gentle`.
+The visible activity state
 is the bounded `gentle_roles_v1` CSV derived from `TaskRecord.agent`
-(most-recent first): exact `gentle-ai-explore` (actual package agent name,
-verified in the project registry alongside `gentle-ai-worker` /
-`gentle-ai-verify` / review agents; the legacy `gentle-ai-explorer` alias
-is preserved for compatibility) → `explorer`, exact `gentle-ai-worker` →
-`worker`, exact `gentle-ai-verify` → `verify`, and a
+(oldest-first by immutable firstSeen): exact `gentle-ai-explore` (actual
+package agent name, verified in the project registry alongside
+`gentle-ai-worker` / `gentle-ai-verify` / review agents; the legacy
+`gentle-ai-explorer` alias is preserved for compatibility) → `explorer`,
+exact `gentle-ai-worker` → `worker`, exact `gentle-ai-verify` → `verify`,
+`jd-judge-a` / `jd-judge-b` / `jd-fix-agent` (plus the `jd-judge-` /
+`jd-fix-` families) → the distinct `judge` slug (never `rdd`), and a
 review agent / `gentle-ai-review*` / any role containing `review` → `rdd`;
-any other agent is unrecognized and degrades to orchestrator/main `working`.
-The consumer displays the newest recognized role when several are active.
+any other agent keeps its original sanitized name (lowercase `[a-z0-9_-]`
+slug, 32-char bound — never a generic collapse; unsalvageable shapes read
+generic `gentle`, machine key `working`).
+The consumer displays the oldest running role word (known short word or
+unknown sanitized name) plus the total
+running count in parentheses only when above one (e.g. `explorer (3)`);
+a single delegate carries no suffix and ask/error/idle/done/gentle never
+suffix. Role order is immutable first-seen (progress reads never reorder;
+sound same-session presence createdAt/startedAt may correct a late local
+first-sighting, otherwise the local firstSeen stands).
 Pending subagent tool calls are label correlation state for a later
 `gentleAgents.taskId` result and a role-only display hint while the call is
 in flight — never a count. WHY role-only: task-mode `subagent_run` stays in
@@ -210,13 +229,22 @@ flight with no TaskStore record until it returns `tool_result`, so the exact
 agent name in the pending `tool_call` input is the only live role evidence;
 counting it would inflate the normative `gentle_work_v1` total with an
 estimate, while publishing its role slug as a bounded-CSV hint keeps the
-sidebar on the active role (`worker`, not generic `working`) with the count
+sidebar on the active role (`worker`, never bare `working` — generic activity reads `gentle`) with the count
 authoritative at 0. The hint merges with authoritative active TaskStore roles
-(newest-first) and clears when the tool result arrives, the call is
+(oldest-first) and clears when the tool result arrives, the call is
 cancelled, or the agent settles. On a tool
 result the producer reads the pending record before deleting it and uses it
 only to preserve the task label on the authoritative task record; no task
-record is created when `details.gentleAgents` is missing. No local
+record is created when `details.gentleAgents` is missing. A live `running`
+record is never regressed by a racy non-final read: status observations via
+any tool other than the authoritative `subagent_run`/`subagent_continue`
+launch outcomes keep `running` (and its agent) against `queued`/`waiting`/
+`unknown`, while FINAL statuses still apply as completion truth and
+re-resolve oldest-first — so principal activity with live delegates keeps
+the oldest role+count, and a settle with running delegates reverts to it
+instead of sticking on `gentle`. A sanitized unknown slug exactly equal to
+`working` degrades to no role (generic `gentle`) on both the producer
+(`agentToRole`) and the consumer (`roleToDisplay`) sides. No local
 age/staleness timeout is applied — Gentle Shell owns lifecycle/status truth.
 Finished/failed/cancelled records may linger in the map but never count;
 old records are dropped only on session reset (plus the bounded-map guard).
@@ -227,10 +255,10 @@ coverage while the authoritative active list is non-empty or any
 once the main session settles — settled, or any non-root session. The marker carries no
 count and changes neither the work total nor the roles CSV: it is a pure
 freshness-bound presence flag (`<hash>:<exp>`, same binding/TTL style as
-gentle_work_v1) that the consumer reduces to `orchestrating` only when no
-recognized role is active (§5.2): below attention (error/ask/review),
-terminal `done`/native-`blocked`, and recognized roles; ahead of main
-`working` only.
+gentle_work_v1) that the consumer reduces to `orchestrating` only with no
+delegation active (§5.2): below attention (error/ask/review),
+terminal `done`/native-`blocked`, and role words; ahead of generic
+activity only.
 
 ### 4.3 Token formats (ABNF-ish, strict)
 
@@ -247,11 +275,15 @@ gentle_changes_v2 = sessionHash ":" count ":" count ":" count ":" expiry
                     ; the sidebar renders +N/-N without a guessed split
 gentle_names_v1   = label *("," label)   ; label = TaskRecord.label/agent, 1*64 chars
                     ; compat transport only — never rendered
-role            = "explorer" / "worker" / "verify" / "rdd"
-                    ; canonical TaskRecord.agent derivations, most-recent first
-                    ; (`review` accepted as a legacy alias of `rdd`)
+role            = "explorer" / "worker" / "verify" / "judge" / "rdd" / passthrough
+                    ; known TaskRecord.agent derivations, oldest-first
+                    ; (`review` accepted as a legacy alias of `rdd`; `judge`
+                    ; stays distinct, never `rdd`)
+                    ; passthrough = 1*32 lowercase [a-z0-9_-], leading [a-z0-9]
+                    ; (unknown delegation keeps its sanitized original name —
+                    ; never a generic collapse; producer truncates to 32)
 gentle_roles_v1   = role *("," role)       ; total <= ~512 chars; null (clear)
-                    ; when no active recognized roles
+                    ; when no delegation is active (no role words)
 gentle_orchestrating_v1 = sessionHash ":" expiry
                     ; root-only presence marker, no count — fresh while the
                     ; root main session actively works (even with zero subs),
@@ -288,16 +320,17 @@ pane.report_metadata --source gentle:v1 --token gentle_changes_v2=Ab3_xK9q2mZ7Qw
 herdr:blocked labels: ["ask:q-7f3a"] | ["review:r-42"] | ["error:transport-timeout"]
 ```
 
-Example reads: worker newest + explorer active → sidebar `worker`; 5 files
+Example reads: worker oldest + explorer active with count 2 → sidebar
+`worker (2)`; three explorers with count 3 → `explorer (3)`; 5 files
 / +110/−22 session delta → the single row-1 heading cell
 `● myproj +110 -22` (` +` green for added, ` -` red for deleted with a
 leading-space match, zero `·` separators because exactly one heading cell
 is nonempty).
-A review label renders `review` with a blue `●` (`#89b4fa`, same as explorer/pull). A fresh root
+A review label renders `rdd` with a blue `●` (`#89b4fa`, same as explorer/pull). A fresh root
 `gentle_orchestrating_v1` marker renders pink `gentle` (machine display key
 `orchestrating`, pink palette unchanged) while the principal session actively
-works — even with zero subagents — only when no recognized role is active
-(yielding to any active role and to attention (`ask`/`review`/`blocked`) and
+works — even with zero subagents — only with no delegation active
+(yielding to any active role word and to attention (`ask`/`review`/`blocked`) and
 terminal `done` states).
 
 ### 4.5 Publication and chunking
@@ -318,7 +351,7 @@ terminal `done` states).
   new/reloaded session under a different session hash cannot retain the prior
   session's change token. `gentle_names_v1` clears the same way when the
   authoritative active TaskStore list has no labels, and `gentle_roles_v1`
-  clears (null) when no active recognized roles remain. v2 stays the visible
+  clears (null) when no delegation is active. v2 stays the visible
   normative source; v1 remains legacy only.
 
 ## 5. Consumer contract (daemon; snapshot → sidebar)
@@ -326,11 +359,12 @@ terminal `done` states).
 ### 5.1 Snapshot inputs (read-only)
 
 Per pane: native `working`/`blocked`/`idle` + session ref (E1), `herdr:blocked`
-labels (§4.2), `gentle_ask_v1` (durable ask signal + freshness gate for `ask` — repairs a missed `ask:` label edge, §4.3), `gentle_work_v1` (internal running/queued total + freshness
-gate — never rendered), `gentle_orchestrating_v1` (root-only presence marker
+labels (§4.2), `gentle_ask_v1` (durable ask signal + freshness gate for `ask` — repairs a missed `ask:` label edge, §4.3), `gentle_work_v1` (running total + freshness
+gate — the consumer renders the oldest role plus this total in parentheses
+only when above one), `gentle_orchestrating_v1` (root-only presence marker
 + freshness gate for the `orchestrating` display — never rendered as a
 count), `gentle_roles_v1` (authoritative activity roles,
-most-recent first), `gentle_names_v1` (compat transport only — never
+oldest-first by immutable firstSeen), `gentle_names_v1` (compat transport only — never
 rendered), `gentle_changes_v2` (normative; a
 v1-only pane renders no change segments, §4.3). Pane cwd
 (`foreground_cwd` ?? `cwd`) feeds the daemon-side pull marker (§5.3).
@@ -345,21 +379,32 @@ ask           := fresh `gentle_ask_v1` (durable per-beat token, §4.3)
                  OR herdr:blocked has ask:* (fresh)
 review        := herdr:blocked has review:* (fresh)
 role          := gentle_work_v1 fresh AND gentle_roles_v1
-                 yields a recognized role (newest first, incl. the
+                 yields a recognized running role (oldest first, incl. the
                  in-flight pending role hint at count = 0 for task-mode
-                 launches with no TaskStore record yet)
+                 launches with no TaskStore record yet) plus the total
+                 running count in parentheses only when above one
+                 (delegated rdd `rdd` suffixes the same way; tool-only
+                 review never invents a count; ask/error/idle/done/gentle
+                 never suffix)
 orchestrating := gentle_orchestrating_v1 fresh (root-only per §4.2:
                  fresh while the main session actively works, even with
                  zero subagents, retaining running/queued-sub or pending-
-                 launch coverage; renders only when no recognized role is
-                 active; absent/stale falls through to working;
-                 attention, terminal `done`/native-`blocked`, and roles
+                 launch coverage; renders only with no delegation active;
+                 absent/stale falls through to generic activity (machine key
+                 working, visible `gentle`);
+                 attention, terminal `done`/native-`blocked`, and role words
                  stay higher)
-working(main) := gentle_work_v1 fresh AND count > 0 with no recognized role
-                 (orchestrator/main or unrecognized agents)
+working(main) := gentle_work_v1 fresh AND count > 0 with no delegation
+                 (principal alone or unrecognized shapes that sanitize to
+                 nothing)
                  OR native working (E1)
                  OR (gentle_work_v1 fresh AND count = 0 AND agent not settled)
-done          := agent_settled observed AND no fresh error/ask/review AND active subs = 0
+done          := native done AND gentle_work_v1 fresh with count = 0
+                 (no running delegates) AND no roles AND no fresh
+                 gentle_orchestrating_v1 — count 0 alone never implies
+                 empty, since the running-only count excludes queued subs
+                 the fresh marker still covers; a fresh marker or any roles
+                 veto terminal (queued cover, pending-launch hint)
 idle          := otherwise (native fallback; also all-gentle-tokens-missing-or-expired)
 ```
 
@@ -367,8 +412,10 @@ Priority: `error > ask > review > done > role activity > orchestrating > working
 `blocked` labels are namespaced, so simultaneous
 `ask:` + `review:` resolves deterministically to `ask`. Attention states
 (error/ask/review) and the terminal `done` state always outrank the root
-marker and activity roles: a review subagent task
-and an in-flight review tool call both resolve to the `review` display, and a
+marker and activity roles: the oldest running role wins the role-activity
+branch (a delegated rdd role renders `rdd` only when it is the oldest
+running role), while an in-flight attention `review` (fresh `review:` label
+or durable `gentle_review_v1` token) overrides the role list; a
 settled session renders `done` even against a stale-fresh marker.
 
 ### 5.3 Publication (sidebar tokens)
@@ -382,16 +429,18 @@ settled session renders `done` even against a stale-fresh marker.
   custom `$gentle_heading_*` / `$gentle_project` / `$gentle_agent` cells
   stay published and owned for compatibility but are wired into no visible
   row. Deleted lines stay red and added lines stay green (never swapped).
-  The visible second row is structural, with no rules: the ten
+  The visible second row is structural, with no rules: the eleven
   presence-encoded
-  `gentle_title_<working|orchestrating|explorer|worker|verify|ask|review|error|done|idle>`
+  `gentle_title_<working|orchestrating|explorer|worker|verify|judge|ask|review|error|done|idle>`
   state tokens (state word only: `working` / `gentle` (machine key
   `orchestrating`) / `explorer` / `worker` /
-  `verify` / `ask` / `blocked` / `done` / `idle` / `review`). Only the
-  current display's title token carries a value; the rest are null.
+  `verify` / `judge` / `ask` / `blocked` / `done` / `idle` / `review`; role
+  words carry the total running count in parentheses only when above one).
+  Only the current display's title token carries a value; the rest are null.
   Each state cell carries its state's semantic color as its base fg with
   no rules — working/worker golden `#f9e2af`, orchestrating pink fuchsia
-  `#f5c2e7`, explorer blue `#89b4fa`, verify teal `#94e2d5`,
+  `#f5c2e7`, explorer blue `#89b4fa`, verify teal `#94e2d5`, judge purple
+  `#cba6f7` (distinct from explorer blue, verify teal, orchestrating pink),
   ask orange `#fab387`, blocked red `#f38ba8`, done green `#a6e3a1`,
   idle grey `#7c7f93` (recedes), review blue `#89b4fa` (same as
   explorer/pull; internal TaskStore role slug stays `rdd`, machine display
@@ -402,16 +451,22 @@ settled session renders `done` even against a stale-fresh marker.
   tokens plus the row-2 title and change-segment tokens to
   the pi-only `rows_by_agent` override (E10); exact block wiring is
   install configuration, not protocol.
-- Label shapes: `working` (main agent settled with no fresh marker and no
-  roles, or active subs with no recognized role and no fresh marker) |
+- Label shapes: `gentle` (generic activity, machine key `working` — no
+  delegation: principal alone, settled with no fresh marker, or only
+  unsalvageable role shapes) |
   `gentle` (user-facing word for the `orchestrating` machine key — fresh
-  root-session marker with no recognized role active; the principal session is
-  actively working, even with zero subagents; pink palette unchanged) | `explorer` / `worker` / `verify` (newest recognized
-  TaskStore role) | `ask` | `review` (user-facing word for the `review`
-  machine key) | `blocked` (user-facing word for the `error`
-  machine key) | `done` | `idle`. No label carries a count.
+  root-session marker with no delegation active; the principal session is
+  actively working, even with zero subagents; pink palette unchanged) | `explorer` / `worker` / `verify` / `judge` (oldest running
+  TaskStore role plus the total running count in parentheses only when
+  above one) | `ask` | `rdd` (user-facing word for the `review`
+  machine key; delegated rdd suffixes with a true count, tool-only review
+  never invents one — review execution is silent, never a notification; only
+  a waiting `ask` intent notifies once) | `blocked` (user-facing word for the `error`
+  machine key) | `done` (settled-plus-empty only: principal settled with no
+  running delegates and no pending launches; a settled principal with
+  running delegates keeps the oldest role) | `idle`. No other label carries a count.
 - Row-2 changes: the nonempty `+N`/`-N`/`↑N` segments ride as their own
-  structural row-2 cells after the ten title cells (each its own color
+  structural row-2 cells after the eleven title cells (each its own color
   cell with no rules — added green, deleted red, pull blue, never
   swapped; empty segments collapse so nothing renders). `+N`/`-N` come
   from fresh `gentle_changes_v2`
@@ -431,13 +486,14 @@ settled session renders `done` even against a stale-fresh marker.
   badge is never emitted (see the §4.3 versioning rule).
 - Placement: exactly two pi-only rows — row 1 the native `state_icon` +
   `workspace` + `agent` strings (3 cells, no custom wiring, no plugin
-  colors), row 2 the ten `gentle_title_*` state cells plus the three
-  change-segment cells (13 cells: 10 state + 3 changes), each row within
+  colors), row 2 the eleven `gentle_title_*` state cells plus the three
+  change-segment cells (14 cells: 11 state + 3 changes), each row within
   Herdr's 16-token per-row ceiling — with the
   herdr-pi-tree palette (added green `#a6e3a1`,
   removed red `#f38ba8`, pull blue `#89b4fa`, working golden `#f9e2af`, ask
-  orange `#fab387`, orchestrating pink fuchsia `#f5c2e7`, explorer/review blue `#89b4fa` (same color; internal role slug stays `rdd`,
-  visible word is `review`), blocked/error red `#f38ba8`,
+  orange `#fab387`, orchestrating pink fuchsia `#f5c2e7`, explorer/rdd blue `#89b4fa` (same color; internal role slug stays `rdd`,
+  visible word is `rdd`, machine key stays `review`), judge purple `#cba6f7` (distinct),
+  blocked/error red `#f38ba8`,
   done green `#a6e3a1`, idle grey `#7c7f93` (recedes)). The rows stay pi-keyed (pi-only by
   intent); each row value still carries the snapshot-provided identity,
   with no vendor colors invented. The consumer never emits `↳` (O4).
@@ -487,6 +543,7 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 - CLI syntax and any Herdr-side dedup guarantees are unresolved (§10 U1);
   until resolved, the consumer-side transition gate above is the normative
   dedup mechanism.
+- Always-on native owner (no opt-in flag): the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq, serial latest-wins coalesced queue, bounded retries; never `done`/`finished`, never a notification method). Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus no human-wait prompt; settle-with-delegates/pending stays `working`, emitted once with no re-emit on repeat settles); `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Single publisher by design: the managed native extension file is deleted and the user controls installs (no auto-restore) — never reinstall the native publisher from Herdr for the same pane (dual publishers collide). Limits (unverified, host-owned): the host `idle`->`done`->`finished` mapping (finished text, toast/sound) and unknown-state handling are owned by Herdr.
 
 ## 8. Limits
 
@@ -494,18 +551,23 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   producer emits at most 7 tokens per beat (`gentle_work_v1`,
   `gentle_roles_v1`, `gentle_names_v1`, `gentle_orchestrating_v1`,
   `gentle_ask_v1`, `gentle_changes_v2`,
-  `gentle_changes_v1`) and the daemon publishes its 66-token owned family
-  chunked ≤ 16 per report (row 1 wires the 10 heading tokens with exactly
-  one nonempty cell = zero separators, row 2 wires 1 agent + 10 title cells
-  = 11 — each within the per-row ceiling). Names are
-  advisory and counts internal; roles are authoritative for display.
+  `gentle_changes_v1`) and the daemon publishes its 72-token owned family
+  chunked ≤ 16 per report (row 1 wires the 11 heading tokens with exactly
+  one nonempty cell = zero separators, row 2 wires 11 title + 3 change cells
+  = 14 — each within the per-row ceiling). Names are
+  advisory; roles are authoritative for display and role words carry the
+  running total in parentheses only when above one.
 - TTL: `expiry <= now + 60000` at write; readers use `now` at read.
   Clock skew assumption ≤ 5 s (documented; not compensated).
 - Field bounds: `count` ≤ 16 digits; `label` ≤ 64 chars; names/roles CSV
   totals ≤ ~512 chars each; `intentId`/`reviewId`/`code` ≤ 64 chars,
   `[A-Za-z0-9_-]+`.
 - Poll cadence: unresolved — must be ≪ 60 s TTL to avoid flapping
-  (see §10 U2). No cadence is normatively set here. The `pane.agent_detected`
+  (see §10 U2). No cadence is normatively set here. The daemon runs an
+  adaptive poll (10 s baseline, `GENTLE_STATUS_POLL_MS`-overridable, 2 s
+  fast cycle while recent ask activity or send/publish failures are
+  observed, recovering after N quiet frames or a TTL-bounded window).
+  The `pane.agent_detected`
   event (`node bin/gentle-status.js --once`) is an immediate one-frame refresh
   on agent detection, not the cadence itself; `[[startup]]` (no args)
   remains the polling-daemon bootstrap.
@@ -516,17 +578,18 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 
 - Additive only in v1: new token names (`gentle_work_v1`,
   `gentle_roles_v1`, `gentle_names_v1`, `gentle_orchestrating_v1`,
-  `gentle_ask_v1`, `gentle_changes_v1`, `gentle_changes_v2`,
+  `gentle_ask_v1`, `gentle_review_v1`, `gentle_changes_v1`, `gentle_changes_v2`,
   `gentle_state_*`, `gentle_title_*`, `gentle_agent_*`, `gentle_agent`,
   `gentle_icon_*`,
-  `gentle_heading_*`, `gentle_project`, `gentle_row_*`, plus display-only
+  `gentle_heading_*`, `gentle_project`, `gentle_row_*` (each family now
+  includes the `judge` display alongside the original ten), plus display-only
   `gentle_changes_added`, `gentle_changes_deleted`,
   `gentle_changes_pull`, `gentle_changes_summary`); no change to `pi_subagents_work_v1`, `state_*`,
   `title_*`, or native `working`/`blocked`/`idle` semantics.
   `gentle_title_error` keeps its machine-key-derived token name; only its
   user-facing value is `blocked` (§5.3). `gentle_title_review` likewise
   keeps its machine-key-derived token name; only its user-facing value is
-  `review`. `gentle_title_orchestrating` likewise keeps its machine-key-derived
+  now `rdd` (aligned from `review` by the native-owner T1). `gentle_title_orchestrating` likewise keeps its machine-key-derived
   token name; only its user-facing value is `gentle`. The retired `*_working_subs` token family (the old `working (n)`
   count display) is swept, never written.
 - Coexistence: `herdr-pi-tree` stays installed but disabled for gentle-owned
@@ -554,7 +617,7 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 - **U3. pi-tree producer file:** which file in `herdr-pi-tree` emits
   `pi_subagents_work_v1` (only `lib/state.js` consumers were traced); needed
   to confirm no shared writer path.
-- **U4. Review-in-progress matcher — RESOLVED (task 8):** Pi in-process `tool_call`/`tool_result` seam for the exact registered tools `gentle_review`, `gentle_review_capture`, `gentle_review_capture_group`, `gentle_review_scope` (G5), tracked by `toolCallId`, OR-combined with the reserved `gentle-pi:review:blocked` hook. Fail-safe semantics: `review:` label only while a review tool call is in flight (or the hook reports active); `reviewId` is a sanitized correlation id, never a provider verdict. During a capture-group run the single parent capture-group call stays in flight across the whole multi-reviewer span, so that one call alone holds `review:` — no per-reviewer tracking. The consumer renders this leg as user-facing `review` (machine key stays `review`).
+- **U4. Review-in-progress matcher — RESOLVED (task 8), narrowed (L2, corrected):** Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes (by `toolCallId`; a `tool_call` proposal alone never opens) for the exact tools `gentle_review_capture`, `gentle_review_capture_group` (G5) with `reviewerRunAcknowledged: true` in the runtime args — the sole reviewer-capable predicate. `correctionLines` is native correction planning (captureCorrectionPlan), never a reviewer, and disqualifies (including combinations invalid upstream). Sidebar `reviewing` fires at any bound capture entry BEFORE the forecast branch, so no sidebar/event signal proves a legacy reviewer route: unknown legacy shapes stay dark (documented conservative limitation; bindings stay opaque, never parsed). The reserved `gentle-pi:review:blocked` hook has no producer and is not observed. `gentle_review` in any operation (inspect / status / start / ack / assess / select-intended-untracked), `gentle_review_scope`, and forecast-only calls never enter. Fail-safe semantics: `review:` label only while acknowledged capture/group execution is in flight; `reviewId` is a sanitized correlation id, never a provider verdict. During a capture-group run the single parent capture-group call stays in flight across the whole multi-reviewer span, so that one call alone holds `review:` — no per-reviewer tracking. The consumer renders this leg as user-facing `rdd` (machine key stays `review`); execution never implies human waiting and never notifies. Exact limitation: the acknowledged capture interval contains preparation and admission; no exact reviewer internal events exist today, so the span is a bounded approximation, never exact interval proof.
 - **U5. Changes badge — RESOLVED (two-row contract):** the `±N` vs `~N`
   selection no longer exists — the combined badge is retired in favor of
   independent `+N`/`-N` segments from exact `gentle_changes_v2` added/deleted

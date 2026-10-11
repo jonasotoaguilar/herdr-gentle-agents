@@ -15,10 +15,16 @@
 #   2. Refuses remote replacement when the installed plugin source is local.
 #   3. Installs + enables the Herdr plugin at the pinned ref.
 #   4. Resolves the exact plugin_root from plugin-list JSON (fail closed).
-#   5. Atomically copies extensions/gentle-herdr-state.ts into the Pi
+#   5. Records a non-destructive force-exclusion of the managed native base
+#      extension in the Pi global settings (idempotent, preserves unrelated
+#      settings and pre-existing user exclusions; invalid settings fail
+#      closed; the base file bytes are never touched). A later ordinary
+#      failure rolls the exclusion back (best-effort) so the base is not
+#      left disabled with no replacement.
+#   6. Atomically copies extensions/gentle-herdr-state.ts into the Pi
 #      agent dir and records a SHA-256 ownership record.
-#   6. Backs up a conflicting/modified destination before replacing it.
-#   7. Runs configure --apply/--check offline, best-effort server reload,
+#   7. Backs up a conflicting/modified destination before replacing it.
+#   8. Runs configure --apply/--check offline, best-effort server reload,
 #      best-effort daemon ensure. Warns without rolling back on best-effort
 #      failures.
 #
@@ -127,6 +133,12 @@ STATE_DIR="$STATE_BASE/herdr/plugins/$PLUGIN_ID"
 STATE_FILE="$STATE_DIR/installer-state"
 DEST_DIR="$PI_DIR/extensions"
 DEST="$DEST_DIR/gentle-herdr-state.ts"
+EXCLUSION_REL="extensions/herdr-agent-state.ts"
+EXCLUSION_ENTRY="-$EXCLUSION_REL"
+EXCLUSION_LIB="lib/pi-extension-exclusion.js"
+PI_SETTINGS="$PI_DIR/settings.json"
+EXCLUSION_MARKER="$STATE_DIR/pi-extension-exclusion-owned"
+EXCLUSION_ADDED_THIS_RUN=0
 OVERRIDE_ROOT="${HERDR_GENTLE_PLUGIN_ROOT:-}"
 
 # --- validations shared by install and uninstall ---
@@ -170,6 +182,25 @@ validate_ref() {
 
 sha_of() {
   sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# Best-effort rollback for a failed install that already recorded the native
+# exclusion: re-enable the base rather than leave it disabled with no working
+# replacement. Only acts when this run added the entry (flag set after
+# ensure); silent no-op otherwise. Never fails the surrounding exit path.
+rollback_exclusion() {
+  if [ "$EXCLUSION_ADDED_THIS_RUN" = "1" ]; then
+    if [ -n "${EXCLUSION_HELPER:-}" ] && [ -f "$EXCLUSION_HELPER" ]; then
+      if node "$EXCLUSION_HELPER" remove --settings "$PI_SETTINGS" --entry "$EXCLUSION_ENTRY" --marker "$EXCLUSION_MARKER" >/dev/null 2>&1; then
+        warn "rolled back native extension exclusion in $PI_SETTINGS after failed install (re-run install to converge)"
+      else
+        warn "FAILED to roll back native extension exclusion in $PI_SETTINGS; the base may stay disabled with no replacement — remove $EXCLUSION_ENTRY manually or re-run install"
+      fi
+    else
+      warn "FAILED to roll back native extension exclusion in $PI_SETTINGS (helper unavailable); the base may stay disabled with no replacement"
+    fi
+  fi
+  return 0
 }
 
 # Emit the plugin list JSON (stdout) or fail. Never aborts the caller.
@@ -299,7 +330,32 @@ do_install() {
   STATUS_BIN="$PLUGIN_ROOT/$STATUS_REL"
   [ -f "$SRC" ] || die "plugin extension source missing: $SRC"
 
-  # 5/6. Atomic copy with ownership record + conflict backup.
+  # 5. Non-destructive native-extension exclusion: keep the managed native
+  #    base file on disk but stop Pi from auto-loading it, so the managed
+  #    copy above is the single publisher. Runs before the copy so a
+  #    settings failure leaves the destination untouched. Never reads,
+  #    writes, or deletes the base file itself. A later ordinary failure
+  #    rolls the exclusion back via rollback_exclusion (EXIT trap) so the
+  #    base is not left disabled with no replacement.
+  EXCLUSION_HELPER="$PLUGIN_ROOT/$EXCLUSION_LIB"
+  [ -f "$EXCLUSION_HELPER" ] || die "plugin exclusion helper missing: $EXCLUSION_HELPER"
+  MARKER_BEFORE=0
+  if [ -e "$EXCLUSION_MARKER" ]; then
+    MARKER_BEFORE=1
+  fi
+  _excl_out=""
+  if _excl_out="$(node "$EXCLUSION_HELPER" ensure --settings "$PI_SETTINGS" --entry "$EXCLUSION_ENTRY" --marker "$EXCLUSION_MARKER" 2>&1)"; then
+    [ -n "$_excl_out" ] && info "$_excl_out"
+  else
+    [ -n "$_excl_out" ] && printf '%s\n' "$_excl_out" >&2
+    die "could not record native extension exclusion for $PI_SETTINGS (see error above)"
+  fi
+  if [ "$MARKER_BEFORE" = "0" ] && [ -e "$EXCLUSION_MARKER" ]; then
+    EXCLUSION_ADDED_THIS_RUN=1
+  fi
+  trap 'rollback_exclusion' EXIT
+
+  # 6/7. Atomic copy with ownership record + conflict backup.
   SRC_SUM="$(sha_of "$SRC")"
   [ -n "$SRC_SUM" ] || die "could not checksum $SRC"
   mkdir -p "$DEST_DIR" "$STATE_DIR" || die "could not create $DEST_DIR / $STATE_DIR"
@@ -349,10 +405,11 @@ do_install() {
   printf '%s\n' "$SRC_SUM" >"$TMP_STATE" || die "could not stage installer state"
   mv "$TMP_STATE" "$STATE_FILE" || die "could not record installer state"
 
-  # 7. Offline configure + verify, then best-effort reload + daemon ensure.
+  # 8. Offline configure + verify, then best-effort reload + daemon ensure.
   [ -f "$CONFIGURE" ] || die "plugin configure script missing: $CONFIGURE"
   node "$CONFIGURE" --apply || die "configure --apply failed"
   node "$CONFIGURE" --check || die "configure --check failed (applied but not current)"
+  EXCLUSION_ADDED_THIS_RUN=0
 
   if "$HERDR_BIN" server reload-config >/dev/null 2>&1; then
     info "reloaded Herdr config"
@@ -370,8 +427,9 @@ do_install() {
     warn "daemon script unavailable ($STATUS_BIN); continuing (install and config are complete)"
   fi
 
-  # 8. Session reminder.
+  # 9. Session reminder.
   info "done (ref=$REF). Running Pi sessions need /reload or a restart to pick up the updated extension."
+  warn "global exclusion $EXCLUSION_ENTRY is recorded in $PI_SETTINGS; explicit project extensions entries can re-enable the base file for that project"
 }
 
 # --- uninstall ---
@@ -432,6 +490,27 @@ do_uninstall() {
         warn "preserving $DEST (modified since install; ownership checksum differs)"
       fi
     fi
+  fi
+
+  # Ownership-aware exclusion removal (best-effort): only the entry this
+  # installer added is removed; a preexisting user exclusion and unrelated
+  # settings are preserved. Runs before state cleanup (the marker lives in
+  # STATE_DIR). Never touches the native base file.
+  if [ -n "$PLUGIN_ROOT" ]; then
+    EXCLUSION_HELPER="$PLUGIN_ROOT/$EXCLUSION_LIB"
+    if [ -f "$EXCLUSION_HELPER" ]; then
+      _excl_out=""
+      if _excl_out="$(node "$EXCLUSION_HELPER" remove --settings "$PI_SETTINGS" --entry "$EXCLUSION_ENTRY" --marker "$EXCLUSION_MARKER" 2>&1)"; then
+        [ -n "$_excl_out" ] && info "$_excl_out"
+      else
+        [ -n "$_excl_out" ] && printf '%s\n' "$_excl_out" >&2
+        warn "preserving $PI_SETTINGS as-is (exclusion cleanup failed; remove $EXCLUSION_ENTRY manually if desired)"
+      fi
+    else
+      warn "preserving $PI_SETTINGS as-is (exclusion helper unavailable: $EXCLUSION_HELPER)"
+    fi
+  else
+    warn "preserving $PI_SETTINGS as-is (installed plugin root unknown)"
   fi
 
   rm -f "$STATE_FILE" 2>/dev/null || true

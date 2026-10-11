@@ -24,6 +24,9 @@ const path = require('node:path');
 const REPO_ROOT = path.resolve(__dirname, '..');
 const INSTALL_SH = path.join(REPO_ROOT, 'install.sh');
 const REAL_EXTENSION = path.join(REPO_ROOT, 'extensions', 'gentle-herdr-state.ts');
+const REAL_HELPER = path.join(REPO_ROOT, 'lib', 'pi-extension-exclusion.js');
+const EXCLUSION_ENTRY = '-extensions/herdr-agent-state.ts';
+const NATIVE_BASE = 'herdr-agent-state.ts';
 
 const FAKE_HERDR = `#!/bin/sh
 # Fake herdr for install.sh tests: logs argv, replays canned plugin-list JSON.
@@ -159,6 +162,10 @@ function setup(t, opts = {}) {
   if (withStatus) {
     fs.writeFileSync(path.join(pluginRoot, 'bin', 'gentle-status.js'), STUB_STATUS, { mode: 0o755 });
   }
+  if (fs.existsSync(REAL_HELPER)) {
+    fs.mkdirSync(path.join(pluginRoot, 'lib'), { recursive: true });
+    fs.copyFileSync(REAL_HELPER, path.join(pluginRoot, 'lib', 'pi-extension-exclusion.js'));
+  }
 
   const env = { ...process.env };
   delete env.PI_AGENT_DIR;
@@ -185,11 +192,32 @@ function setup(t, opts = {}) {
   const piDir = path.join(home, '.pi', 'agent');
   const dest = path.join(piDir, 'extensions', 'gentle-herdr-state.ts');
   const stateFile = path.join(stateBase, 'herdr', 'plugins', 'herdr-gentle-agents', 'installer-state');
-  return { tmp, home, stateBase, pluginRoot, env, herdrLog, orderLog, configureLog, statusLog, piDir, dest, stateFile };
+  const settingsFile = path.join(piDir, 'settings.json');
+  const exclusionMarker = path.join(stateBase, 'herdr', 'plugins', 'herdr-gentle-agents', 'pi-extension-exclusion-owned');
+  return { tmp, home, stateBase, pluginRoot, env, herdrLog, orderLog, configureLog, statusLog, piDir, dest, stateFile, settingsFile, exclusionMarker };
 }
 
 function run(args, env) {
   return spawnSync('sh', [INSTALL_SH, ...args], { encoding: 'utf8', env });
+}
+
+function readSettingsJson(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function plantSettings(fx, obj) {
+  fs.mkdirSync(path.dirname(fx.settingsFile), { recursive: true });
+  fs.writeFileSync(fx.settingsFile, `${JSON.stringify(obj, null, 2)}\n`);
+}
+
+function nativeBasePath(fx) {
+  return path.join(path.dirname(fx.dest), NATIVE_BASE);
+}
+
+function plantNativeBase(fx, content = '// native managed base\n') {
+  fs.mkdirSync(path.dirname(fx.dest), { recursive: true });
+  fs.writeFileSync(nativeBasePath(fx), content);
+  return content;
 }
 
 function backupsBeside(dest) {
@@ -449,6 +477,313 @@ describe('install.sh isolated behavior', () => {
     const ok = run([], { ...fx.env, HERDR_GENTLE_PLUGIN_ROOT: fx.pluginRoot });
     assert.equal(ok.status, 0, `absolute override must bypass malformed list: ${ok.stderr}`);
     assert.ok(fs.existsSync(fx.dest));
+  });
+
+  it('install records the native exclusion while preserving unrelated settings', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { theme: 'Gentleman-Cute', extensions: ['-builtin:codemode', 'extensions/custom.ts'] });
+    const r = run([], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    const doc = readSettingsJson(fx.settingsFile);
+    assert.deepEqual(doc.extensions, ['-builtin:codemode', 'extensions/custom.ts', EXCLUSION_ENTRY]);
+    assert.equal(doc.theme, 'Gentleman-Cute');
+    assert.ok(fs.existsSync(fx.exclusionMarker), 'ownership marker must exist');
+    assert.match(`${r.stdout}\n${r.stderr}`, /reload/i);
+  });
+
+  it('repeated install leaves the exclusion singular and settings bytes stable', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { extensions: [] });
+    assert.equal(run([], fx.env).status, 0);
+    const once = fs.readFileSync(fx.settingsFile, 'utf8');
+    const r = run([], fx.env);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), once, 'identical reinstall must not rewrite settings');
+    assert.equal(readSettingsJson(fx.settingsFile).extensions.filter((e) => e === EXCLUSION_ENTRY).length, 1);
+  });
+
+  it('preexisting exclusion is preserved without taking ownership', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { extensions: [EXCLUSION_ENTRY] });
+    assert.equal(run([], fx.env).status, 0);
+    assert.ok(!fs.existsSync(fx.exclusionMarker), 'preexisting entry must not gain a marker');
+    const r = run(['--uninstall'], fx.env);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(readSettingsJson(fx.settingsFile).extensions, [EXCLUSION_ENTRY]);
+  });
+
+  it('native base file bytes are retained across install and update', (t) => {
+    const fx = setup(t);
+    const content = plantNativeBase(fx, '// native base v1\n');
+    assert.equal(run([], fx.env).status, 0);
+    assert.equal(fs.readFileSync(nativeBasePath(fx), 'utf8'), content, 'install must not touch the base file');
+    // Simulate Herdr recreating the base file, then update.
+    fs.writeFileSync(nativeBasePath(fx), content);
+    assert.equal(run([], fx.env).status, 0);
+    assert.equal(fs.readFileSync(nativeBasePath(fx), 'utf8'), content, 'update must not touch the recreated base');
+    assert.ok(readSettingsJson(fx.settingsFile).extensions.includes(EXCLUSION_ENTRY));
+  });
+
+  it('uninstall removes only the owned exclusion and preserves user edits', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { theme: 'x', extensions: ['-builtin:codemode'] });
+    assert.equal(run([], fx.env).status, 0);
+    // User edits after install.
+    const mid = readSettingsJson(fx.settingsFile);
+    mid.quietStartup = true;
+    fs.writeFileSync(fx.settingsFile, `${JSON.stringify(mid, null, 2)}\n`);
+    const r = run(['--uninstall'], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    const doc = readSettingsJson(fx.settingsFile);
+    assert.deepEqual(doc.extensions, ['-builtin:codemode']);
+    assert.equal(doc.quietStartup, true);
+    assert.equal(doc.theme, 'x');
+    assert.ok(!fs.existsSync(fx.exclusionMarker), 'marker must be cleaned up');
+  });
+
+  it('invalid settings fail closed on install without destructive replacement', (t) => {
+    const cases = [
+      ['malformed-json', '{not json'],
+      ['non-array', JSON.stringify({ extensions: 'nope' })],
+      ['non-string-entry', JSON.stringify({ extensions: [42] })],
+      ['top-level-array', JSON.stringify([EXCLUSION_ENTRY])],
+    ];
+    for (const [name, raw] of cases) {
+      const fx = setup(t);
+      fs.mkdirSync(path.dirname(fx.settingsFile), { recursive: true });
+      fs.writeFileSync(fx.settingsFile, raw);
+      const r = run([], fx.env);
+      assert.notEqual(r.status, 0, `${name} must fail`);
+      assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), raw, `${name}: settings bytes must be untouched`);
+      assert.match(r.stderr, /exclusion|settings/i, `${name}: ${r.stderr}`);
+    }
+  });
+
+  it('PI_AGENT_DIR override scopes the exclusion to the override dir', (t) => {
+    const fx = setup(t);
+    const custom = path.join(fx.tmp, 'custom-agent');
+    const r = run([], { ...fx.env, PI_AGENT_DIR: custom });
+    assert.equal(r.status, 0, r.stderr);
+    const doc = JSON.parse(fs.readFileSync(path.join(custom, 'settings.json'), 'utf8'));
+    assert.ok(doc.extensions.includes(EXCLUSION_ENTRY));
+    assert.ok(!fs.existsSync(fx.settingsFile), 'default location must stay untouched');
+  });
+
+  it('missing settings file is created with only the exclusion; uninstall leaves valid JSON', (t) => {
+    const fx = setup(t);
+    assert.ok(!fs.existsSync(fx.settingsFile));
+    assert.equal(run([], fx.env).status, 0);
+    assert.deepEqual(readSettingsJson(fx.settingsFile).extensions, [EXCLUSION_ENTRY]);
+    assert.equal(run(['--uninstall'], fx.env).status, 0);
+    const doc = readSettingsJson(fx.settingsFile);
+    assert.ok(!JSON.stringify(doc).includes(EXCLUSION_ENTRY));
+  });
+
+  it('uninstall with invalid settings preserves the file and still uninstalls', (t) => {
+    const fx = setup(t);
+    assert.equal(run([], fx.env).status, 0);
+    const raw = '{broken json';
+    fs.writeFileSync(fx.settingsFile, raw);
+    const r = run(['--uninstall'], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), raw, 'invalid settings must be preserved');
+    assert.match(r.stderr, /preserv/i);
+    assert.match(readLog(fx.herdrLog), /plugin uninstall herdr-gentle-agents/);
+  });
+
+  it('symlinked settings.json stays a symlink and is updated through the link', (t) => {
+    const fx = setup(t);
+    const target = path.join(fx.tmp, 'linked-settings.json');
+    fs.writeFileSync(target, `${JSON.stringify({ extensions: [] })}\n`);
+    fs.mkdirSync(path.dirname(fx.settingsFile), { recursive: true });
+    fs.symlinkSync(target, fx.settingsFile);
+    assert.equal(run([], fx.env).status, 0);
+    assert.ok(fs.lstatSync(fx.settingsFile).isSymbolicLink(), 'symlink must survive install');
+    assert.ok(JSON.parse(fs.readFileSync(target, 'utf8')).extensions.includes(EXCLUSION_ENTRY));
+    assert.equal(run(['--uninstall'], fx.env).status, 0);
+    assert.ok(fs.lstatSync(fx.settingsFile).isSymbolicLink(), 'symlink must survive uninstall');
+    const after = JSON.parse(fs.readFileSync(target, 'utf8'));
+    assert.ok(!(after.extensions ?? []).includes(EXCLUSION_ENTRY));
+  });
+
+  it('foreign or invalid ownership record never removes a user entry', (t) => {
+    const variants = [
+      ['garbage-content', 'not-the-entry\n'],
+      ['wrong-entry', `${JSON.stringify({ version: 1, entry: '-extensions/other.ts', settings: '/elsewhere/settings.json' })}\n`],
+      ['wrong-version', `${JSON.stringify({ version: 99, entry: EXCLUSION_ENTRY, settings: '/elsewhere/settings.json' })}\n`],
+    ];
+    for (const [name, markerContent] of variants) {
+      const fx = setup(t);
+      plantSettings(fx, { extensions: [EXCLUSION_ENTRY] });
+      assert.equal(run([], fx.env).status, 0, `${name}: install must succeed`);
+      const before = fs.readFileSync(fx.settingsFile, 'utf8');
+      fs.mkdirSync(path.dirname(fx.exclusionMarker), { recursive: true });
+      fs.writeFileSync(fx.exclusionMarker, markerContent);
+      const r = run(['--uninstall'], fx.env);
+      assert.equal(r.status, 0, `${name}: uninstall must still succeed, got: ${r.stderr}`);
+      assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), before, `${name}: user entry must survive byte-identical`);
+      assert.ok(readSettingsJson(fx.settingsFile).extensions.includes(EXCLUSION_ENTRY), name);
+    }
+  });
+
+  it('ownership record bound to another settings file authorizes nothing', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { extensions: [EXCLUSION_ENTRY] });
+    assert.equal(run([], fx.env).status, 0);
+    const before = fs.readFileSync(fx.settingsFile, 'utf8');
+    const foreign = { version: 1, entry: EXCLUSION_ENTRY, settings: '/elsewhere/settings.json' };
+    fs.mkdirSync(path.dirname(fx.exclusionMarker), { recursive: true });
+    fs.writeFileSync(fx.exclusionMarker, `${JSON.stringify(foreign)}\n`);
+    const r = run(['--uninstall'], fx.env);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), before, 'entry bound elsewhere must survive byte-identical');
+  });
+
+  it('marker creation failure leaves settings byte-identical and copies nothing', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { theme: 'keep', extensions: [] });
+    const before = fs.readFileSync(fx.settingsFile, 'utf8');
+    // Break marker creation only: the marker parent is unreadable for
+    // writing, so the settings write succeeds but ownership cannot record.
+    fs.mkdirSync(path.dirname(fx.exclusionMarker), { recursive: true });
+    fs.chmodSync(path.dirname(fx.exclusionMarker), 0o555);
+    t.after(() => {
+      try {
+        fs.chmodSync(path.dirname(fx.exclusionMarker), 0o755);
+      } catch {
+        // Best-effort permission restore for fixture cleanup.
+      }
+    });
+    const r = run([], fx.env);
+    assert.notEqual(r.status, 0, 'install must fail when ownership cannot be recorded');
+    assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), before, 'settings must be byte-identical');
+    assert.ok(!fs.existsSync(fx.dest), 'managed replacement must never be copied');
+    assert.doesNotMatch(r.stderr, /left untouched/i, `must not overclaim: ${r.stderr}`);
+    assert.match(r.stderr, /cannot record ownership/i, `must report the marker failure: ${r.stderr}`);
+  });
+
+  it('leading BOM is accepted like Pi', (t) => {
+    const fx = setup(t);
+    fs.mkdirSync(path.dirname(fx.settingsFile), { recursive: true });
+    fs.writeFileSync(fx.settingsFile, '\uFEFF' + JSON.stringify({ extensions: [] }));
+    const r = run([], fx.env);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(readSettingsJson(fx.settingsFile).extensions.includes(EXCLUSION_ENTRY));
+  });
+
+  it('0600 settings mode survives install and uninstall', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { extensions: [] });
+    fs.chmodSync(fx.settingsFile, 0o600);
+    assert.equal(run([], fx.env).status, 0);
+    assert.equal(fs.statSync(fx.settingsFile).mode & 0o777, 0o600, 'install must preserve 0600');
+    assert.equal(run(['--uninstall'], fx.env).status, 0);
+    assert.equal(fs.statSync(fx.settingsFile).mode & 0o777, 0o600, 'uninstall must preserve 0600');
+  });
+
+  it('0600 target behind a symlink keeps mode and link', (t) => {
+    const fx = setup(t);
+    const target = path.join(fx.tmp, '0600-settings.json');
+    fs.writeFileSync(target, `${JSON.stringify({ extensions: [] })}\n`, { mode: 0o600 });
+    fs.chmodSync(target, 0o600);
+    fs.mkdirSync(path.dirname(fx.settingsFile), { recursive: true });
+    fs.symlinkSync(target, fx.settingsFile);
+    assert.equal(run([], fx.env).status, 0);
+    assert.ok(fs.lstatSync(fx.settingsFile).isSymbolicLink(), 'link must survive install');
+    assert.equal(fs.statSync(target).mode & 0o777, 0o600, 'install must preserve 0600 through the link');
+    assert.ok(JSON.parse(fs.readFileSync(target, 'utf8')).extensions.includes(EXCLUSION_ENTRY));
+    assert.equal(run(['--uninstall'], fx.env).status, 0);
+    assert.ok(fs.lstatSync(fx.settingsFile).isSymbolicLink(), 'link must survive uninstall');
+    assert.equal(fs.statSync(target).mode & 0o777, 0o600, 'uninstall must preserve 0600 through the link');
+  });
+
+  it('stale temp files are never clobbered and none are left behind', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { extensions: [] });
+    const dir = path.dirname(fx.settingsFile);
+    const sentinel = path.join(dir, '.settings.json.tmp.99999');
+    fs.writeFileSync(sentinel, 'sentinel\n');
+    assert.equal(run([], fx.env).status, 0);
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'sentinel\n', 'foreign temp file must survive');
+    assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes('.tmp.')), ['.settings.json.tmp.99999']);
+    assert.equal(run(['--uninstall'], fx.env).status, 0);
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'sentinel\n');
+  });
+
+  it('copy failure after exclusion rolls the exclusion back', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { theme: 'keep', extensions: ['-builtin:codemode'] });
+    fs.mkdirSync(path.dirname(fx.dest), { recursive: true });
+    fs.writeFileSync(fx.dest, '// user content\n');
+    fs.chmodSync(path.dirname(fx.dest), 0o555);
+    t.after(() => {
+      try {
+        fs.chmodSync(path.dirname(fx.dest), 0o755);
+      } catch {
+        // Best-effort permission restore for fixture cleanup.
+      }
+    });
+    const r = run([], fx.env);
+    assert.notEqual(r.status, 0, 'install must fail when the copy cannot be staged');
+    const doc = readSettingsJson(fx.settingsFile);
+    assert.ok(!(doc.extensions ?? []).includes(EXCLUSION_ENTRY), 'exclusion must be rolled back');
+    assert.deepEqual(doc.extensions, ['-builtin:codemode']);
+    assert.equal(doc.theme, 'keep');
+    assert.equal(fs.readFileSync(fx.dest, 'utf8'), '// user content\n', 'user dest untouched');
+    assert.ok(!fs.existsSync(fx.exclusionMarker), 'no misleading ownership may remain');
+    assert.match(`${r.stdout}\n${r.stderr}`, /roll/i);
+  });
+
+  it('configure failure after copy rolls the exclusion back and says the copy stays', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_CONFIGURE_FAIL: '1' } });
+    plantSettings(fx, { extensions: [] });
+    const r = run([], fx.env);
+    assert.notEqual(r.status, 0, 'install must fail when configure fails');
+    const doc = readSettingsJson(fx.settingsFile);
+    assert.ok(!(doc.extensions ?? []).includes(EXCLUSION_ENTRY), 'exclusion must be rolled back');
+    assert.ok(fs.existsSync(fx.dest), 'managed copy stays; re-run install to converge');
+    assert.ok(!fs.existsSync(fx.exclusionMarker), 'no misleading ownership may remain');
+    assert.match(`${r.stdout}\n${r.stderr}`, /roll/i);
+  });
+
+  it('second agent dir sharing state cannot orphan first ownership', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { theme: 'a', extensions: [] });
+    assert.equal(run([], fx.env).status, 0, 'A install must succeed');
+    const markerBefore = fs.readFileSync(fx.exclusionMarker, 'utf8');
+    const settingsABefore = fs.readFileSync(fx.settingsFile, 'utf8');
+
+    const dirB = path.join(fx.tmp, 'agent-b');
+    fs.mkdirSync(dirB, { recursive: true });
+    const settingsB = path.join(dirB, 'settings.json');
+    const settingsBBefore = `${JSON.stringify({ theme: 'b', extensions: [] })}\n`;
+    fs.writeFileSync(settingsB, settingsBBefore);
+    const rB = run([], { ...fx.env, PI_AGENT_DIR: dirB });
+    assert.notEqual(rB.status, 0, 'B install must fail closed on conflicting ownership');
+    assert.match(rB.stderr, /bound to/i, `must name the binding: ${rB.stderr}`);
+    assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), settingsABefore, 'A settings untouched');
+    assert.equal(fs.readFileSync(settingsB, 'utf8'), settingsBBefore, 'B settings untouched');
+    assert.equal(fs.readFileSync(fx.exclusionMarker, 'utf8'), markerBefore, 'marker untouched');
+    assert.ok(!fs.existsSync(path.join(dirB, 'extensions', 'gentle-herdr-state.ts')), 'B copy must never happen');
+
+    const rA = run(['--uninstall'], fx.env);
+    assert.equal(rA.status, 0, `A uninstall must still work: ${rA.stderr}`);
+    assert.ok(!(readSettingsJson(fx.settingsFile).extensions ?? []).includes(EXCLUSION_ENTRY), 'A entry removed');
+    assert.ok(!fs.existsSync(fx.exclusionMarker), 'marker cleaned');
+  });
+
+  it('foreign ensure marker stays byte-identical without settings mutation', (t) => {
+    const fx = setup(t);
+    plantSettings(fx, { extensions: [] });
+    const settingsBefore = fs.readFileSync(fx.settingsFile, 'utf8');
+    fs.mkdirSync(path.dirname(fx.exclusionMarker), { recursive: true });
+    fs.writeFileSync(fx.exclusionMarker, 'not-the-entry\n');
+    const markerBefore = fs.readFileSync(fx.exclusionMarker, 'utf8');
+    const r = run([], fx.env);
+    assert.notEqual(r.status, 0, 'install must fail closed on a foreign record');
+    assert.equal(fs.readFileSync(fx.settingsFile, 'utf8'), settingsBefore, 'settings untouched');
+    assert.equal(fs.readFileSync(fx.exclusionMarker, 'utf8'), markerBefore, 'foreign marker untouched');
+    assert.match(r.stderr, /foreign or invalid/i, `must name the cause: ${r.stderr}`);
   });
 
   it('touches nothing outside the temp fixture', (t) => {
