@@ -1,6 +1,10 @@
 # Herdr Gentle Agents
 
+![Herdr Gentle Agents banner](docs/images/banner.png)
+
 Local Herdr plugin so the sidebar recognises Pi + Gentle Shell agents.
+
+![Agents panel showing gentle states with change counts](docs/images/sidebar-example.png)
 
 ## What It Does
 
