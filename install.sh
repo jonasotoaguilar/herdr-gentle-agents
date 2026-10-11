@@ -1,21 +1,24 @@
 #!/bin/sh
 # herdr-gentle-agents remote installer (Linux only, POSIX sh).
 #
-# Pinned public entrypoint (example):
-#   curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/v0.1.0/install.sh \
-#     | sh -s -- --ref v0.1.0
+# Stable public entrypoint (example):
+#   curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh
 #
 # Trust/review: this script is intentionally small and reviewable. Fetch the
-# pinned tag above (never `main`), read it before piping to a shell, and
-# re-run the same pinned URL to update or with `--uninstall` to remove.
+# stable URL above (never `main`), read it before piping to a shell, and
+# re-run the same stable URL to update or with `--uninstall` to remove.
 # It never uses sudo and never handles credentials.
 #
 # What it does (install/update):
-#   1. Validates Linux, Node >= 18, herdr availability, and a safe ref.
-#   2. Refuses remote replacement when the installed plugin source is local.
-#   3. Installs + enables the Herdr plugin at the pinned ref.
+#   1. Validates Linux, Node >= 18, herdr availability, and a safe ref
+#      (resolves the newest release tag when --ref is omitted).
+#   2. Compares the installed plugin version with the target: already
+#      current exits 0 without touching anything; a newer installed
+#      version aborts unless --allow-downgrade is given.
+#   3. Replaces a locally linked plugin automatically (unlink + warning).
+#   4. Installs + enables the Herdr plugin at the target ref.
 #   4. Resolves the exact plugin_root from plugin-list JSON (fail closed).
-#   5. Records a non-destructive force-exclusion of the managed native base
+#   5. Records a non-destructive exclusion of the managed native base
 #      extension in the Pi global settings (idempotent, preserves unrelated
 #      settings and pre-existing user exclusions; invalid settings fail
 #      closed; the base file bytes are never touched). A later ordinary
@@ -34,13 +37,17 @@
 #   XDG_STATE_HOME            state base (default: $HOME/.local/state)
 #   HERDR_GENTLE_PLUGIN_ROOT  explicit plugin root (test/local override only;
 #                             must be absolute; bypasses plugin-list lookup)
+#   HERDR_GENTLE_LATEST_URL   release lookup URL for newest-tag resolution
+#                             (test/local override only; default: the GitHub
+#                             releases/latest API endpoint for this repo)
 #
 # Exit codes: 0 success; 1 operational failure; 2 usage/validation failure.
 
 set -eu
 
-DEFAULT_REF="v0.1.0"
 REPO="jonasotoaguilar/herdr-gentle-agents"
+LATEST_URL_DEFAULT="https://api.github.com/repos/jonasotoaguilar/herdr-gentle-agents/releases/latest"
+LS_REMOTE_URL="https://github.com/jonasotoaguilar/herdr-gentle-agents"
 PLUGIN_ID="herdr-gentle-agents"
 EXT_REL="extensions/gentle-herdr-state.ts"
 CONFIGURE_REL="bin/configure.js"
@@ -61,29 +68,38 @@ info() {
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--ref REF] [--force] [--uninstall] [--help]
+usage: install.sh [--ref REF] [--allow-downgrade] [--force] [--uninstall] [--help]
 
   (no flags)     install or update the Herdr plugin, the managed Pi
                  extension copy, and the managed sidebar configuration
-  --ref REF      plugin release ref (default: v0.1.0; never main)
-  --force        when the installed plugin is locally linked, unlink it
-                 first, then proceed with the remote install
+                 (resolves the newest release when --ref is omitted;
+                 already current exits 0 without changing anything)
+  --ref REF      plugin release ref (default: newest release; never main)
+  --allow-downgrade
+                 permit installing a target older than the installed
+                 version (otherwise a newer installed version aborts)
+  --force        deprecated no-op: accepted so previously documented
+                 commands keep working; a locally linked plugin is now
+                 replaced automatically with a warning
   --uninstall    remove the managed install (ownership-checked)
   --help         print this help and exit
 
 examples:
-  curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/v0.1.0/install.sh | sh -s -- --ref v0.1.0
-  curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/v0.1.0/install.sh | sh -s -- --uninstall
+  curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh
+  curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh -s -- --ref v0.2.0
+  curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh -s -- --uninstall
 
 environment:
-  HERDR_BIN_PATH, PI_AGENT_DIR, XDG_STATE_HOME, HERDR_GENTLE_PLUGIN_ROOT (test/local override only)
+  HERDR_BIN_PATH, PI_AGENT_DIR, XDG_STATE_HOME, HERDR_GENTLE_PLUGIN_ROOT (test/local override only), HERDR_GENTLE_LATEST_URL (test/local override only)
 EOF
 }
 
 # --- argument parsing (POSIX, shift-based) ---
 MODE="install"
-REF="$DEFAULT_REF"
+REF=""
+REF_SET="0"
 FORCE="0"
+ALLOW_DOWNGRADE="0"
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h)
@@ -94,18 +110,24 @@ while [ $# -gt 0 ]; do
       FORCE="1"
       shift
       ;;
+    --allow-downgrade)
+      ALLOW_DOWNGRADE="1"
+      shift
+      ;;
     --uninstall)
       MODE="uninstall"
       shift
       ;;
     --ref=*)
       REF="${1#--ref=}"
+      REF_SET="1"
       shift
       ;;
     --ref)
       [ $# -ge 2 ] || die "missing value for --ref (usage: --ref REF)" 2
       shift
       REF="$1"
+      REF_SET="1"
       shift
       ;;
     --ref-*)
@@ -175,7 +197,7 @@ validate_ref() {
   _ref="$1"
   [ -n "$_ref" ] || die "ref must be nonempty (usage: --ref REF)" 2
   if [ "$_ref" = "main" ]; then
-    die "ref 'main' is mutable and not allowed (use a pinned release ref such as v0.1.0)" 2
+    die "ref 'main' is mutable and not allowed (use a pinned release ref such as v0.2.0)" 2
   fi
   case "$_ref" in
     -*) die "ref must not look like an option: $_ref" 2 ;;
@@ -215,27 +237,110 @@ plugin_list_json() {
   "$HERDR_BIN" plugin list --plugin "$PLUGIN_ID" --json 2>/dev/null
 }
 
-# Exit 0 (silent) unless the installed plugin source.kind is local,
-# in which case exit 10. Parse errors / absent plugin mean "not local".
-is_local_source() {
-  _json="$1"
-  printf '%s' "$_json" | node -e '
+# Parse plugin-list JSON from stdin; prints matches/distinct/root/kind/version
+# lines (best-effort: prints parse_error=1 on any failure). Never fails.
+plugin_info() {
+  node -e '
 let raw = "";
 process.stdin.on("data", (d) => { raw += d; });
 process.stdin.on("end", () => {
   try {
     const doc = JSON.parse(raw);
-    const plugins = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
-    if (!Array.isArray(plugins)) process.exit(0);
-    const hit = plugins.find((p) => p && (p.plugin_id === "herdr-gentle-agents" || p.id === "herdr-gentle-agents"));
-    if (hit && hit.source && hit.source.kind === "local") process.exit(10);
-    process.exit(0);
+    const arr = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
+    if (!Array.isArray(arr)) throw new Error("no plugins array");
+    const hits = arr.filter((p) => p && (p.plugin_id === "herdr-gentle-agents" || p.id === "herdr-gentle-agents"));
+    const roots = hits.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0);
+    const uniq = [...new Set(roots)];
+    const first = hits[0] || {};
+    const kind = (first.source && first.source.kind) || "";
+    const version = (typeof first.version === "string") ? first.version : "";
+    console.log("matches=" + hits.length);
+    console.log("distinct=" + uniq.length);
+    console.log("root=" + (uniq.length === 1 ? uniq[0] : ""));
+    console.log("kind=" + kind);
+    console.log("version=" + version);
   } catch (e) {
-    process.exit(0);
+    console.log("parse_error=1");
   }
 });
 ' 2>/dev/null
-  return $?
+  return 0
+}
+
+# Extract "tag_name" from release JSON on stdin (no jq). Prints the tag.
+extract_tag() {
+  sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# Resolve the newest release tag and echo it. curl first, then a git
+# ls-remote version sort when curl is absent or fails; returns 1 when both
+# are unavailable so the caller can fail closed naming --ref.
+resolve_latest_ref() {
+  _latest_url="${HERDR_GENTLE_LATEST_URL:-$LATEST_URL_DEFAULT}"
+  if command -v curl >/dev/null 2>&1; then
+    _latest_json=""
+    if _latest_json="$(curl -fsSL "$_latest_url" 2>/dev/null)"; then
+      _latest_tag="$(printf '%s' "$_latest_json" | extract_tag)"
+      if [ -n "$_latest_tag" ]; then
+        printf '%s' "$_latest_tag"
+        return 0
+      fi
+    fi
+  fi
+  if command -v git >/dev/null 2>&1; then
+    _ls_remote=""
+    if _ls_remote="$(git ls-remote --tags --refs "$LS_REMOTE_URL" 2>/dev/null)"; then
+      _best_tag="$(printf '%s\n' "$_ls_remote" | sed -e 's|.*refs/tags/||' -e 's|\^{}||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+      if [ -n "$_best_tag" ]; then
+        printf '%s' "$_best_tag"
+        return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
+# Normalize a non-negative integer (strip leading zeros; empty means 0).
+_norm_num() {
+  _norm_n="$(printf '%s' "$1" | sed -e 's/^0*//')"
+  [ -z "$_norm_n" ] && _norm_n="0"
+  printf '%s' "$_norm_n"
+}
+
+# Strict vX.Y.Z numeric comparison of two refs. Prints -1, 0, or 1;
+# returns 1 when either side is missing, empty, or non-numeric (the caller
+# then treats the install as not current and never aborts on it).
+semver_cmp() {
+  _cmp_a="$1"
+  _cmp_b="$2"
+  case "$_cmp_a" in v*) _cmp_a="${_cmp_a#v}" ;; *) return 1 ;; esac
+  case "$_cmp_b" in v*) _cmp_b="${_cmp_b#v}" ;; *) return 1 ;; esac
+  _cmp_a_rest="${_cmp_a#*.}"
+  _cmp_b_rest="${_cmp_b#*.}"
+  case "$_cmp_a" in *.*.*) ;; *) return 1 ;; esac
+  case "$_cmp_b" in *.*.*) ;; *) return 1 ;; esac
+  _cmp_a_maj="${_cmp_a%%.*}"
+  _cmp_a_min="${_cmp_a_rest%%.*}"
+  _cmp_a_pat="${_cmp_a_rest#*.}"
+  _cmp_b_maj="${_cmp_b%%.*}"
+  _cmp_b_min="${_cmp_b_rest%%.*}"
+  _cmp_b_pat="${_cmp_b_rest#*.}"
+  for _cmp_n in "$_cmp_a_maj" "$_cmp_a_min" "$_cmp_a_pat" "$_cmp_b_maj" "$_cmp_b_min" "$_cmp_b_pat"; do
+    case "$_cmp_n" in ''|*[!0-9]*) return 1 ;; esac
+  done
+  case "$_cmp_a_pat" in *.*) return 1 ;; esac
+  case "$_cmp_b_pat" in *.*) return 1 ;; esac
+  for _cmp_p in maj min pat; do
+    eval "_cmp_x=\$_cmp_a_$_cmp_p; _cmp_y=\$_cmp_b_$_cmp_p"
+    _cmp_x="$(_norm_num "$_cmp_x")"
+    _cmp_y="$(_norm_num "$_cmp_y")"
+    if [ "${#_cmp_x}" -gt "${#_cmp_y}" ]; then printf '1'; return 0; fi
+    if [ "${#_cmp_x}" -lt "${#_cmp_y}" ]; then printf '%s' '-1'; return 0; fi
+    if [ "$(expr "x$_cmp_x" \> "x$_cmp_y" || true)" = "1" ]; then printf '1'; return 0; fi
+    if [ "$(expr "x$_cmp_x" \< "x$_cmp_y" || true)" = "1" ]; then printf '%s' '-1'; return 0; fi
+  done
+  printf '0'
+  return 0
 }
 
 # Resolve the exact plugin_root: explicit test override bypasses lookup,
@@ -309,34 +414,112 @@ unique_backup() {
 
 # --- install/update ---
 do_install() {
+  # 1. Target ref: explicit --ref wins, otherwise resolve the newest release.
+  if [ "$REF_SET" = "0" ]; then
+    if REF="$(resolve_latest_ref)"; then
+      :
+    else
+      die "could not resolve the latest release tag (curl and git fallback failed); re-run with an explicit --ref, e.g. --ref v0.2.0" 1
+    fi
+  fi
   validate_ref "$REF"
 
-  # 2. Refuse remote replacement of a locally linked plugin before touching anything.
+  if [ "$FORCE" = "1" ]; then
+    warn "--force is deprecated and has no effect; a locally linked plugin is replaced automatically"
+  fi
+
+  # 2. Pre-install plugin state (best-effort: unknown means not current).
   _pre=""
+  _have_pre=0
   if _pre="$(plugin_list_json)"; then
-    if [ -n "$_pre" ]; then
-      _local_rc=0
-      is_local_source "$_pre" || _local_rc=$?
-      if [ "$_local_rc" = "10" ]; then
-        if [ "$FORCE" = "1" ]; then
-          info "removing locally linked plugin $PLUGIN_ID (--force; source.kind=local)"
-          "$HERDR_BIN" plugin unlink "$PLUGIN_ID" \
-            || die "herdr plugin unlink failed"
-          info "removed locally linked plugin $PLUGIN_ID (source.kind=local)"
-        else
-          die "refusing remote install: plugin $PLUGIN_ID is locally linked (source.kind=local). Unlink it first or install locally; nothing was changed." 2
-        fi
-      fi
+    if [ -n "$_pre" ]; then _have_pre=1; fi
+  fi
+  _matches=0
+  _distinct=0
+  _iroot=""
+  _ikind=""
+  _iver=""
+  if [ "$_have_pre" = "1" ]; then
+    _info="$(printf '%s' "$_pre" | plugin_info)" || _info=""
+    if [ -n "$_info" ]; then
+      while IFS= read -r _line; do
+        case "$_line" in
+          matches=*) _matches="${_line#matches=}" ;;
+          distinct=*) _distinct="${_line#distinct=}" ;;
+          root=*) _iroot="${_line#root=}" ;;
+          kind=*) _ikind="${_line#kind=}" ;;
+          version=*) _iver="${_line#version=}" ;;
+          parse_error=*) _matches=0; _distinct=0; _iroot=""; _ikind=""; _iver="" ;;
+        esac
+      done <<EOF
+$_info
+EOF
+    fi
+  fi
+  _check_root="$_iroot"
+  if [ -n "$OVERRIDE_ROOT" ]; then
+    case "$OVERRIDE_ROOT" in
+      /*) _check_root="$OVERRIDE_ROOT" ;;
+      *) die "HERDR_GENTLE_PLUGIN_ROOT must be absolute: $OVERRIDE_ROOT" 2 ;;
+    esac
+  fi
+
+  # 3. Downgrade guard: a newer installed version aborts unless allowed.
+  # A missing, empty, or non-numeric installed version never aborts.
+  _cmp=""
+  _cmp_ok=0
+  if _cmp="$(semver_cmp "$_iver" "$REF")"; then _cmp_ok=1; fi
+  if [ "$_cmp_ok" = "1" ] && [ "$_cmp" = "1" ]; then
+    if [ "$ALLOW_DOWNGRADE" = "0" ]; then
+      die "installed version $_iver is newer than target $REF; refusing downgrade (re-run with --allow-downgrade to proceed)" 1
     fi
   fi
 
-  # 3. Install + enable.
+  # 4. Current means: exactly one resolvable root, not locally linked,
+  # installed version equals the target, and the managed copy is a
+  # regular file whose sha256 equals both the ownership record and the
+  # plugin source. When current, exit 0 before any mutation; a missing
+  # or drifted managed copy repairs instead of reporting current.
+  if [ "$_cmp_ok" = "1" ] && [ "$_cmp" = "0" ] && [ "$_ikind" != "local" ]; then
+    _exact_one=0
+    if [ -n "$OVERRIDE_ROOT" ]; then
+      _exact_one=1
+    elif [ "$_distinct" = "1" ]; then
+      _exact_one=1
+    fi
+    if [ "$_exact_one" = "1" ] && [ -n "$_check_root" ]; then
+      case "$_check_root" in
+        /*)
+          _cur_src="$_check_root/$EXT_REL"
+          if [ -f "$_cur_src" ] && [ -f "$DEST" ] && [ ! -L "$DEST" ] && [ -f "$STATE_FILE" ]; then
+            _cur_dest_sum="$(sha_of "$DEST")"
+            _cur_src_sum="$(sha_of "$_cur_src")"
+            _cur_rec="$(tr -d ' \t\r\n' < "$STATE_FILE" 2>/dev/null || printf '')"
+            if [ -n "$_cur_dest_sum" ] && [ "$_cur_dest_sum" = "$_cur_src_sum" ] && [ "$_cur_dest_sum" = "$_cur_rec" ]; then
+              info "already up to date ($REF)"
+              exit 0
+            fi
+          fi
+          ;;
+      esac
+    fi
+  fi
+
+  # 5. A locally linked plugin is replaced automatically (warn loudly).
+  if [ "$_have_pre" = "1" ] && [ "$_ikind" = "local" ]; then
+    warn "replacing locally linked plugin $PLUGIN_ID (source.kind=local); to re-link a checkout run: herdr plugin link --enabled . from the checkout directory"
+    "$HERDR_BIN" plugin unlink "$PLUGIN_ID" \
+      || die "herdr plugin unlink failed"
+    info "removed locally linked plugin $PLUGIN_ID (source.kind=local)"
+  fi
+
+  # 6. Install + enable.
   "$HERDR_BIN" plugin install "$REPO" --ref "$REF" --yes \
     || die "herdr plugin install failed (ref=$REF)"
   "$HERDR_BIN" plugin enable "$PLUGIN_ID" \
     || die "herdr plugin enable failed"
 
-  # 4. Resolve the exact plugin root.
+  # 7. Resolve the exact plugin root.
   PLUGIN_ROOT="$(resolve_plugin_root)"
 
   SRC="$PLUGIN_ROOT/$EXT_REL"
@@ -344,7 +527,7 @@ do_install() {
   STATUS_BIN="$PLUGIN_ROOT/$STATUS_REL"
   [ -f "$SRC" ] || die "plugin extension source missing: $SRC"
 
-  # 5. Non-destructive native-extension exclusion: keep the managed native
+  # 8. Non-destructive native-extension exclusion: keep the managed native
   #    base file on disk but stop Pi from auto-loading it, so the managed
   #    copy above is the single publisher. Runs before the copy so a
   #    settings failure leaves the destination untouched. Never reads,
@@ -369,7 +552,7 @@ do_install() {
   fi
   trap 'rollback_exclusion' EXIT
 
-  # 6/7. Atomic copy with ownership record + conflict backup.
+  # 9. Atomic copy with ownership record + conflict backup.
   SRC_SUM="$(sha_of "$SRC")"
   [ -n "$SRC_SUM" ] || die "could not checksum $SRC"
   mkdir -p "$DEST_DIR" "$STATE_DIR" || die "could not create $DEST_DIR / $STATE_DIR"
@@ -419,7 +602,7 @@ do_install() {
   printf '%s\n' "$SRC_SUM" >"$TMP_STATE" || die "could not stage installer state"
   mv "$TMP_STATE" "$STATE_FILE" || die "could not record installer state"
 
-  # 8. Offline configure + verify, then best-effort reload + daemon ensure.
+  # 10. Offline configure + verify, then best-effort reload + daemon ensure.
   [ -f "$CONFIGURE" ] || die "plugin configure script missing: $CONFIGURE"
   node "$CONFIGURE" --apply || die "configure --apply failed"
   node "$CONFIGURE" --check || die "configure --check failed (applied but not current)"
@@ -441,7 +624,7 @@ do_install() {
     warn "daemon script unavailable ($STATUS_BIN); continuing (install and config are complete)"
   fi
 
-  # 9. Session reminder.
+  # 11. Session reminder.
   info "done (ref=$REF). Running Pi sessions need /reload or a restart to pick up the updated extension."
   warn "global exclusion $EXCLUSION_ENTRY is recorded in $PI_SETTINGS; explicit project extensions entries can re-enable the base file for that project"
 }
