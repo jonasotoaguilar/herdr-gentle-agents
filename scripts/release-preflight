@@ -51,8 +51,8 @@ TOML_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('herdr-plugi
   || fail "herdr-plugin.toml version $TOML_VERSION does not match package.json version $PKG_VERSION"
 pass "herdr-plugin.toml parses, version $TOML_VERSION"
 
-pass "running: node --test tools/"
-node --test tools/
+pass "running: node --test tools/*.test.js"
+node --test tools/*.test.js
 
 pass "running: node --check on bin/ and lib/"
 for f in bin/*.js lib/*.js; do
