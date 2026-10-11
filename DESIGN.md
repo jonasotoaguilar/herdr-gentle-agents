@@ -1,10 +1,14 @@
-# herdr-gentle-agents — DESIGN.md (Task 4)
+# herdr-gentle-agents — DESIGN.md (Task 4, as implemented)
 
 Status protocol for the Herdr sidebar: producer (Pi sidecar extension) →
 pane-metadata tokens → consumer (plugin daemon) → sidebar state + badges.
 
-Status: protocol design. No implementation. Unresolved product/policy
-decisions are listed explicitly in §10 and are not decided here.
+Scope note: despite the filename, this file is the normative *protocol*
+authority (token grammar, lifecycle, ownership), not an Impeccable visual
+DESIGN.md (no design-token frontmatter by design — sidebar colors live as
+hardcoded hex in the manifest/docs). Status: implemented; the file is the
+normative protocol record. Unresolved product/policy decisions are listed
+explicitly in §10 and are not decided here.
 
 ## 1. Context
 
@@ -44,10 +48,11 @@ decisions are listed explicitly in §10 and are not decided here.
   therefore **extends the established boundary** (new `gentle_*` token names,
   same value grammar, same report path) instead of introducing another style.
 
-### Non-goals (tasks 5–8 scope excluded)
+### Non-goals (tasks 5–8 scope excluded — all shipped since Task 4)
 
-- No `herdr-plugin.toml`, no `README.md`, no `extensions/` producer code, no
-  `bin/` consumer code, no directory scaffold.
+- Task-5+ scope (now shipped: `herdr-plugin.toml`, `README.md`,
+  `extensions/` producer, `bin/` consumer, directory scaffold) was
+  excluded from the Task-4 design pass, not from the repo.
 - No fork or modification of `herdr-pi-tree`; no edit of
   `~/.pi/agent/extensions/herdr-agent-state.ts`.
 - No toast/notification UI design beyond exactly-once ownership rules (§7).
@@ -294,6 +299,12 @@ gentle_ask_v1         = sessionHash ":" intentId ":" expiry
                     ; gentle_orchestrating_v1 — emitted on every beat while
                     ; ask is active, null (clear) when inactive; repairs a
                     ; missed edge-triggered herdr:blocked ask label
+gentle_review_v1      = sessionHash ":" reviewId ":" expiry
+                    ; durable review signal, session-bound + TTL-fresh —
+                    ; emitted on every beat while acknowledged capture/group
+                    ; execution is in flight, null (clear) otherwise; silent
+                    ; working natively, never a notification (full def:
+                    ; extensions/gentle-herdr-state.ts, lib/gentle-tokens.js)
 herdr:blocked     = "ask:" intentId / "review:" reviewId / "error:" code
 ```
 
@@ -338,9 +349,10 @@ terminal `done` states).
 - Same transport as E8: socket IPC `pane.report_metadata` /
   `workspace.report_metadata`, CLI fallback
   `herdr pane report-metadata <pane> --source gentle:v1 --token name=value`.
-- One report carries at most 16 tokens; `gentle_names_v1` chunks as
-  `gentle_names_v1#p=<i>/<m>` suffixes when labels exceed one token, with the
-  consumer reassembling by `#p=` order and dropping incomplete sets at TTL.
+- One report carries at most 16 tokens; `gentle_names_v1` never chunks:
+  excess advisory names are dropped at ~512 chars total (fail-closed).
+  The `#p=<i>/<m>` suffix form is retired and never emitted; a consumer
+  must not expect reassembly.
 - Writes are idempotent full-state snapshots per pane (all gentle tokens
   re-emitted each beat), never deltas — a lost report is repaired by the next
   beat.
@@ -532,7 +544,13 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 
 - The consumer emits `herdr notification` for `ask` only, on the `¬ask → ask`
   transition per `(sessionHash, intentId)`. Polls that remain in `ask` for the
-  same intent are silent. A new `intentId` re-arms.
+  same intent are silent. A new `intentId` re-arms. Visible copy is fixed
+  and private-safe — title `Gentle: response needed`, body `Your input is
+  needed. Return to Pi to respond.`, `--sound request`; no pane/intent
+  ids, paths, or prompt content ever enter the title/body. Sends are async
+  off the frame critical path (single flight per intent, ledger written
+  only on observed success, retry next frame) so a slow send never
+  head-of-line-blocks sibling panes.
 - `review` and `error` never emit a plugin notification: `review` attention
   stays in-flow/native; `error` is visible as sidebar state (native `blocked`
   attention on `herdr:blocked` already fires per E9 — the plugin adds no
@@ -543,7 +561,10 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 - CLI syntax and any Herdr-side dedup guarantees are unresolved (§10 U1);
   until resolved, the consumer-side transition gate above is the normative
   dedup mechanism.
-- Always-on native owner (no opt-in flag): the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq, serial latest-wins coalesced queue, bounded retries; never `done`/`finished`, never a notification method). Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus no human-wait prompt; settle-with-delegates/pending stays `working`, emitted once with no re-emit on repeat settles); `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Single publisher by design: the managed native extension file is deleted and the user controls installs (no auto-restore) — never reinstall the native publisher from Herdr for the same pane (dual publishers collide). Limits (unverified, host-owned): the host `idle`->`done`->`finished` mapping (finished text, toast/sound) and unknown-state handling are owned by Herdr.
+- Always-on native owner (no opt-in flag): the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq, serial latest-wins coalesced queue, bounded retries; never `done`/`finished`, never a notification method). Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus no human-wait prompt; settle-with-delegates/pending stays `working`, emitted once with no re-emit on repeat settles); `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Single publisher by design: the managed native extension file is excluded
+  reversibly (`-extensions/herdr-agent-state.ts` in Pi settings, bytes
+  preserved on disk, never auto-loaded next to ours) — never reinstall the
+  native publisher from Herdr for the same pane (dual publishers collide). Limits (unverified, host-owned): the host `idle`->`done`->`finished` mapping (finished text, toast/sound) and unknown-state handling are owned by Herdr.
 
 ## 8. Limits
 
@@ -552,9 +573,10 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   `gentle_roles_v1`, `gentle_names_v1`, `gentle_orchestrating_v1`,
   `gentle_ask_v1`, `gentle_changes_v2`,
   `gentle_changes_v1`) and the daemon publishes its 72-token owned family
-  chunked ≤ 16 per report (row 1 wires the 11 heading tokens with exactly
-  one nonempty cell = zero separators, row 2 wires 11 title + 3 change cells
-  = 14 — each within the per-row ceiling). Names are
+  chunked ≤ 16 per report (row 1 is the 3 native tokens
+  `state_icon`/`workspace`/`agent`; the legacy 11 `gentle_heading_*` compat
+  family stays published but wired into no visible row. Row 2 wires 11
+  title + 3 change cells = 14 — each within the per-row ceiling). Names are
   advisory; roles are authoritative for display and role words carry the
   running total in parentheses only when above one.
 - TTL: `expiry <= now + 60000` at write; readers use `now` at read.
@@ -562,11 +584,14 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 - Field bounds: `count` ≤ 16 digits; `label` ≤ 64 chars; names/roles CSV
   totals ≤ ~512 chars each; `intentId`/`reviewId`/`code` ≤ 64 chars,
   `[A-Za-z0-9_-]+`.
-- Poll cadence: unresolved — must be ≪ 60 s TTL to avoid flapping
-  (see §10 U2). No cadence is normatively set here. The daemon runs an
-  adaptive poll (10 s baseline, `GENTLE_STATUS_POLL_MS`-overridable, 2 s
-  fast cycle while recent ask activity or send/publish failures are
-  observed, recovering after N quiet frames or a TTL-bounded window).
+- Poll cadence: resolved — must be ≪ 60 s TTL to avoid flapping
+  (see §10 U2). The daemon runs an adaptive poll (10 s baseline,
+  `GENTLE_STATUS_POLL_MS`-overridable, 2 s fast cycle
+  (`GENTLE_STATUS_FAST_POLL_MS`) while recent ask activity or send/publish
+  failures are observed, recovering after N quiet frames
+  (`GENTLE_STATUS_FAST_QUIET_FRAMES`) or a TTL-bounded window
+  (`GENTLE_STATUS_FAST_WINDOW_MS`), 250 ms floor, single dynamic
+  `setTimeout` chain.
   The `pane.agent_detected`
   event (`node bin/gentle-status.js --once`) is an immediate one-frame refresh
   on agent detection, not the cadence itself; `[[startup]]` (no args)
