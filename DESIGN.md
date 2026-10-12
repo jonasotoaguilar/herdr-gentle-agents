@@ -540,25 +540,21 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   async/events guidance: never claim exactly-once without a deliberate
   mechanism; the deliberate mechanism here covers *notifications only*).
 
-## 7. Notification ownership (ask exactly-once)
+## 7. Notification ownership (native desktop, plugin phone)
 
-- The consumer emits `herdr notification` for `ask` only, on the `¬ask → ask`
-  transition per `(sessionHash, intentId)`. Polls that remain in `ask` for the
-  same intent are silent. A new `intentId` re-arms. Visible copy is fixed
-  and private-safe — title `Gentle needs response`, body `<project> needs
-  your input. Return to Pi to respond.`, `--sound request`. `<project>` is
-  the snapshot's validated workspace/group name only, sanitized and bounded
-  to 64 characters, failing closed to `Gentle`; the cwd-derived fallback the
-  sidebar uses is deliberately never used here, because a desktop toast
-  outlives the terminal (notification history, lock screen). No pane/intent
-  ids, session material, paths, or prompt content ever enter the title/body. Sends are async
-  off the frame critical path (single flight per intent, ledger written
-  only on observed success, retry next frame) so a slow send never
-  head-of-line-blocks sibling panes.
+- Desktop attention is native Herdr exclusively: `Blocked` fires the
+  `NeedsAttention` toast (`<agent> needs attention`, request sound) and a
+  background `Working|Blocked → Idle` transition fires the `Finished` toast
+  (`<agent> finished`, done sound), both with Herdr's own focus-aware
+  suppression and delay. The consumer daemon emits `herdr notification` for
+  nothing — since v0.3.1 it owns no toast path: its former ask toast fired on
+  the poll after the native one for the same question, a systematic
+  duplication. The ask token still drives the sidebar ask display; sounds,
+  suppression, and delay stay Herdr's.
 - `review` and `error` never emit a plugin notification: `review` attention
   stays in-flow/native; `error` is visible as sidebar state (native `blocked`
   attention on `herdr:blocked` already fires per E9 — the plugin adds no
-  second toast path).
+  toast path).
 - Optional Moshi replacement (off by default): `/herdr-gentle:moshi` —
   registered by the producer extension, which owns the flag file
   `gentle-moshi.json` in the plugin state root — takes `enable` / `disable` /
@@ -568,16 +564,24 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   categorized events over the Moshi daemon socket), so Chat View, Live
   Activity, the session row, the terminal context and Moshi's own approval
   routing keep working, while notifications follow this plugin's policy —
-  `approval_required` once per real ask episode (`actionId` = the same
-  `intentId` the Herdr toast uses, subtitle `Answer in terminal`) and
+  `approval_required` once per real ask episode (`actionId` = the ask
+  `intentId`, subtitle `Answer in terminal`, title `Gentle ask: <project>`,
+  message `<project> has a question and is waiting for your answer. Return
+  to Pi to respond.`) and
   `task_complete` once per real finish (the native transition into `idle`:
   settled plus zero running/queued plus zero pending plus zero live
   background jobs plus no human wait),
   never per prompt and never per turn. A `session.closed` (`session_ended`)
   envelope closes the row on shutdown, and the host-awaited handler flushes
-  in-flight sends. Copy is the same fixed private-safe text as the Herdr
-  toast: project name only, never pane/intent ids, session material, paths or
-  prompt content. Lineage child sessions (transcript header
+  in-flight sends. `task_complete` carries title `Gentle finished: <project>`
+  and names the last finished task: `<project> finished — <label>. Return to
+  Pi for what's next.`, falling back to `<project> finished and is waiting
+  for your next instruction.` with no tracked task. `<label>` is the most
+  recent completed/cancelled TaskStore label only — short work names,
+  sanitized and bounded to 80 characters, failing closed to the fallback;
+  never ids, paths, or prompt content. `<project>` here is the
+  multiplexer-session/cwd name (the extension never sees the Herdr workspace
+  group), failing closed to `Gentle`. Lineage child sessions (transcript header
   `parentSession`/`parentSessionId`) are never published. Enabling mid-session
   still opens the row: the carrier is sent on demand, once per session.
   `enable`/`disable` also add/remove the `-extensions/moshi-hooks.ts` entry
@@ -593,12 +597,11 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   unverified): the phone-side approval round-trip through Moshi's TUI bridge,
   the Live Activity lifecycle, and whether a `task_complete` renders as a
   separate banner or only updates a running Live Activity are Moshi's.
-- Lease: a notified intent is recorded with the token `expiry`; if the pane
-  stays `ask` past TTL and re-asserts the same intent with a fresh expiry,
-  the consumer treats it as continuation (silent), not a new transition.
-- CLI syntax and any Herdr-side dedup guarantees are unresolved (§10 U1);
-  until resolved, the consumer-side transition gate above is the normative
-  dedup mechanism.
+- Mid-session enable needs `/reload`: enabling the toggle activates our
+  sender immediately, but an already-running Pi session keeps the original
+  hook loaded until it reloads — both would notify in that window. The
+  enable notice warns about it; fresh sessions are single-emitter by
+  construction (exclusion record + flag).
 - Always-on native owner (no opt-in flag): the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq seeded from the clock as
 `Date.now() * 1000` exactly like Herdr's own plugin SDK, serial latest-wins
 coalesced queue, bounded retries; never `done`/`finished`, never a
@@ -677,9 +680,12 @@ report with a higher seq lands. Parity contract: `working` carries the specific 
 
 ## 10. Unresolved decisions (do not implement against guesses)
 
-- **U1. Notification CLI + dedup:** exact `herdr notification` syntax, flags,
-  and any Herdr-side dedup/suppression semantics. Normative until resolved:
-  consumer-side `¬ask → ask` transition gate (§7).
+- **U1. Notification CLI + dedup:** resolved (v0.3.1 — the consumer emits no
+  toast, so its CLI syntax is moot). Herdr-side semantics verified in source
+  (`notification_toast_for_state_change`): edge-triggered per state change,
+  `Blocked → NeedsAttention`, background `Working|Blocked → Idle` →
+  `Finished`, focus-aware suppression, global delivery switch only (no
+  per-agent mute, no plugin veto).
 - **U2. Event catalog + poll cadence:** full `[[events]]` catalog of the
   plugin host and the daemon's snapshot poll cadence (must be ≪ TTL).
   Resolved in part: `pane.agent_detected` invokes

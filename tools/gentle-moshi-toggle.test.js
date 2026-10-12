@@ -142,6 +142,7 @@ test('enable/disable write the flag file', async () => {
   await run(h, 'enable');
   assert.equal(readFlag().enabled, true);
   assert.match(h.notices.at(-1)[0], /enabled/i);
+  assert.match(h.notices.at(-1)[0], /\/reload/, 'enable warns that running sessions need /reload');
 
   await run(h, 'disable');
   assert.equal(readFlag().enabled, false);
