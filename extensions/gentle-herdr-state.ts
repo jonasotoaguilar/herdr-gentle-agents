@@ -193,9 +193,10 @@
 // or payloads (debug gate only, kinds/counts).
 //
 // Async semantics (async-and-realtime guidance): at-least-once snapshot
-// beats + TTL expiry; no end-to-end exactly-once claim. The only
-// exactly-once scope is ask *notification* dedup, which is consumer-side
-// (DESIGN §7); the producer's contribution is a stable per-episode intentId.
+// beats + TTL expiry; no end-to-end exactly-once claim. Desktop toast dedup
+// is Herdr's native edge-triggered semantics; the producer's contribution is
+// a stable per-episode intentId (ask label correlation, and the Moshi
+// approval action id when the phone channel is enabled).
 // @ts-nocheck
 
 import net from "node:net";
@@ -973,8 +974,8 @@ const NATIVE_MAX_ATTEMPTS = 2;
 // prompt and no review execution. Never infer terminal from child
 // completion, timeout, or count0 alone (settled required). Never
 // done/finished (only working|blocked|idle) and never a notification
-// method — the host owns finished text plus toast/sound, and ask
-// notification dedup stays consumer-side (DESIGN §7).
+// method — the host owns finished text plus toast/sound, and desktop ask
+// attention (including toast dedup) is host-owned (DESIGN §7).
 export function computeNativeState({
   agentActive,
   settled,
@@ -1141,8 +1142,9 @@ function aggregateChanges(entries, sessionId) {
 // Extension
 // ---------------------------------------------------------------------------
 
-// Optional Moshi notification mirror toggle (DESIGN §7). The consumer daemon
-// reads this flag file; this command is the Pi-side switch. Enabling also
+// Optional Moshi notification mirror toggle (DESIGN §7). The producer
+// extension owns this flag file; the consumer daemon never publishes to
+// Moshi (single emitter). This command is the Pi-side switch. Enabling also
 // excludes the Moshi-managed Pi hook (`extensions/moshi-hooks.ts`) so Moshi
 // stops notifying per prompt and per turn, and disabling removes that
 // exclusion again. Both settings edits happen only while that hook file

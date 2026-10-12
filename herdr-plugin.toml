@@ -1,6 +1,6 @@
 id = "herdr-gentle-agents"
 name = "Herdr Gentle Agents"
-version = "0.3.1"
+version = "0.3.2"
 min_herdr_version = "0.9.0"
 description = "Herdr sidebar states for Pi + Gentle Shell agents: oldest running role (explorer, worker, verify, judge) with total count in parentheses only when above one, ask, review, blocked, done, idle, plus exact +N/-N SessionChanges segments and ↑N behind-upstream marker."
 platforms = ["linux"]
@@ -13,8 +13,9 @@ platforms = ["linux"]
 # unresolved (DESIGN.md §10 U6).
 #
 # [[build]] and [[panes]] are intentionally absent. DESIGN.md
-# §10 U1 (notification CLI syntax) and U2 (event catalog + poll cadence) are
-# unresolved, and task 6 (extensions/ producer) owns the settings paths.
+# §10 U1 is resolved (v0.3.1: the consumer emits no toast, so notification
+# CLI syntax is moot); U2 (event catalog + poll cadence) stays unresolved,
+# and task 6 (extensions/ producer) owns the settings paths.
 # [[actions]] below holds only the verified configure/unconfigure pair.
 # Sections below are added only as their commands become verifiable.
 #
@@ -23,16 +24,18 @@ platforms = ["linux"]
 # here (DESIGN.md §3 O1, §9).
 
 # Consumer daemon (task 7): poll snapshot → reduce → publish owned gentle_*
-# tokens, ask notify exactly once per intentId, scoped orphan sweep.
+# tokens, scoped orphan sweep. Desktop attention is native Herdr (DESIGN §7):
+# this daemon emits no notification for any display.
 # No-args mode only ensures the daemon is running; --run is the loop.
-# Poll cadence is a provisional 10 s default (GENTLE_STATUS_POLL_MS
-# overrides); DESIGN §10 U2 sets no normative cadence yet, only << 60 s TTL.
+# Poll cadence is adaptive (10 s baseline, GENTLE_STATUS_POLL_MS-overridable,
+# 2 s fast cycle while recent ask activity or send/publish failures are
+# observed); DESIGN §10 U2 sets no normative cadence yet, only << 60 s TTL.
 [[startup]]
 command = ["node", "bin/gentle-status.js"]
 
 # Watchdog + immediate refresh: --once renders one frame then exits, so a
 # newly opened project name/state appears immediately instead of waiting for
-# the next 10 s poll tick. The daemon stays the polling loop (see [[startup]]
+# the next poll tick. The daemon stays the polling loop (see [[startup]]
 # above); --once is the per-event one-frame refresh, not the wake mechanism
 # for a crashed daemon (a crashed daemon still comes back via ensure-running
 # on the next agent detection — same pattern as herdr-pi-tree's agent-state

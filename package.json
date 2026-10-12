@@ -1,6 +1,6 @@
 {
   "name": "herdr-gentle-agents",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Herdr sidebar states for Pi + Gentle Shell agents: Pi extension sidecar publishing session facts as Herdr pane-metadata tokens.",
   "keywords": [
     "pi-package",

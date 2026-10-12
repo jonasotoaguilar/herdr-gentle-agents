@@ -116,18 +116,23 @@ an explicit writer-ownership decision. Rationale follows each choice.
   show names the Gentle orchestrator never assigned. Same value grammar, new
   token name, authoritative local source.
 
-### O3. `blocked` → notification ownership → CONSUMER NOTIFIES ASK ONCE; REVIEW NEVER
+### O3. `blocked` → notification ownership → NATIVE ONLY; CONSUMER NEVER (v0.3.1)
 
 - **Chosen:** producer signals via `herdr:blocked` labels (`ask:`/`review:`/
-  `error:`); native Herdr attention still fires on `blocked` (E9 unchanged).
-  The consumer sends at most one `herdr notification` per ask intent, keyed on
-  `(sessionHash, intentId)`, only on the `¬ask → ask` transition. `review`
-  transitions never produce a plugin notification (the user is already
-  engaged in the review flow; review attention stays native).
+  `error:`) plus the native `pane.report_agent` state; desktop attention is
+  native Herdr exclusively (E9 unchanged): `Blocked` fires the `NeedsAttention`
+  toast and background `Working|Blocked → Idle` fires `Finished`, both
+  Herdr-owned. The consumer emits `herdr notification` for nothing — its
+  former ask toast fired on the poll after the native one for the same
+  question, a systematic duplication, so the toast path, its copy, the
+  notification ledger and the send machinery were removed in v0.3.1. The ask
+  token still drives the sidebar ask display; sounds, suppression, and delay
+  stay Herdr's. `review` never notifies (the user is already engaged in the
+  review flow; review attention stays native).
 - **Why:** `ask` needs an out-of-band nudge (the run cannot proceed without
-  the user); `review` does not (the user is mid-ritual). Exactly-once scope is
-  per intent, not per poll — repeated polls while still `ask` are silent.
-  See §7 for dedup/lease semantics.
+  the user); `review` does not (the user is mid-ritual). Dedup is Herdr's
+  native edge-triggered toast semantics, not a plugin ledger.
+  See §7 for ownership semantics.
 
 ### O4. Badge slot (`↳` taken) → TWO-ROW PI LAYOUT, NO SLOT SHARING
 
@@ -526,19 +531,22 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   per beat, then drops the beat (next beat re-sends full state). No unbounded
   queue; no backlog replay past TTL.
 - Duplicate suppression: identical consecutive snapshots are a no-op for the
-  consumer (no sidebar rewrite, no notification re-fire).
+  consumer (no sidebar rewrite; desktop toasts are Herdr's native
+  edge-triggered semantics, never re-fired by the plugin).
 - Idempotency keys: ask intents carry `intentId` (`ask:<intentId>`); review
-  spans carry `reviewId`; notification dedup keys on `(sessionHash,
-  intentId)` with a per-intent lease (§7). Re-emitting the same intent is
-  safe; a new intent id is a new notification obligation.
+  spans carry `reviewId`. Re-emitting the same intent is safe; a new intent
+  id is a new sidebar ask episode (and a new native toast edge). The
+  `intentId` doubles as the Moshi `approval_required` action id when the
+  phone channel is enabled (§7).
 - Error containment: transport failure surfaces as `herdr:blocked`
   `error:<code>` (itself a token, subject to the same TTL), never as an
   exception path that stops the producer beat. `error` state clears only on a
   fresh non-error snapshot, not on silence.
-- No exactly-once end-to-end claim: at-least-once beats + TTL expiry +
-  per-intent notification dedup is the engineered scope (consistent with the
-  async/events guidance: never claim exactly-once without a deliberate
-  mechanism; the deliberate mechanism here covers *notifications only*).
+- No exactly-once end-to-end claim: at-least-once beats + TTL expiry is the
+  engineered scope (consistent with the async/events guidance: never claim
+  exactly-once without a deliberate mechanism). Desktop toast dedup is
+  Herdr's native edge-triggered semantics; the phone channel dedups
+  per ask episode producer-side (§7).
 
 ## 7. Notification ownership (native desktop, plugin phone)
 
