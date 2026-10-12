@@ -305,7 +305,7 @@ function cliJson(...args) {
 }
 
 // Null on failure, not an empty list: acting on nothing-as-empty would clear
-// tokens and fire (or skip) notifications over one timed-out read.
+// tokens or sweep over one timed-out read.
 async function agentsAsync() {
   const reply = await socketCall('agent.list', {});
   if (reply && !reply.error && Array.isArray(reply.result?.agents)) return reply.result.agents;

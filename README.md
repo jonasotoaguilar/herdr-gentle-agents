@@ -196,8 +196,8 @@ each its own color cell with no rules, never swapped). The review leg
 renders the user-facing word `rdd` in blue `#89b4fa` (same as
 explorer/pull; internal TaskStore role slug stays `rdd`, machine display key
 and token names stay `review` — review execution is silent, never a
-notification; only an actual waiting prompt renders `ask` with one
-intervention notification per intent); the judge delegate role renders `judge` in
+notification; only an actual waiting prompt renders `ask` (desktop attention
+is Herdr's native `blocked` toast); the judge delegate role renders `judge` in
 purple `#cba6f7` (distinct from explorer blue, verify teal, and
 orchestrating pink); the error value renders `blocked`; the orchestrating
 leg renders the user-facing word `gentle` (machine key stays
@@ -322,7 +322,8 @@ for the next poll tick. See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consu
   parentheses only when above one (`explorer (3)`, bare `worker` when single;
   ask/error/idle/done/gentle never suffix), `ask` on blocked user input,
   `rdd` during native review execution (machine key stays `review`; execution
-  is silent — one notification fires only for a waiting `ask` intent), and
+  is silent — desktop attention fires only for a waiting `ask` intent, as
+  Herdr's native toast), and
   user-facing `blocked` for errors.
 - Single-cell row-1 heading (`<icon> <project>` plus ` +N`/` -N`/` ↑N`
   inline, exactly one nonempty cell so zero `·` separators; white base with
