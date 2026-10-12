@@ -1909,7 +1909,7 @@ test('T2: default path always publishes native states (no opt-in flag)', async (
     const first = await wire.waitFor((r) => r.method === 'pane.report_agent' && r.params.state === 'working', 5000, 'native working without any flag');
     assert.equal(first.params.pane_id, 'pane-default-off');
     assert.equal(first.params.agent_session_path, sessionFile, 'native reuses the session-path binding');
-    assert.equal(first.params.seq, 1, 'first native seq is 1');
+    assert.ok(first.params.seq > 1_000_000_000_000, `first native seq is clock-seeded, got ${first.params.seq}`);
     const metas = await wire.waitFor((r) => r.method === 'pane.report_metadata', 5000, 'metadata beats alongside native states');
     assert.ok(metas, 'metadata beats still flow alongside native states');
   } finally {
@@ -1950,7 +1950,7 @@ test('T2: opt-in settle with delegates stays working with seq + path binding', a
     const first = await wire.waitFor((r) => r.method === 'pane.report_agent' && r.params.state === 'working', 5000, 'native working');
     assert.equal(first.params.pane_id, 'pane-native-working');
     assert.equal(first.params.agent_session_path, sessionFile, 'native reuses the session-path binding');
-    assert.equal(first.params.seq, 1, 'first native seq is 1');
+    assert.ok(first.params.seq > 1_000_000_000_000, `first native seq is clock-seeded, got ${first.params.seq}`);
     h.fire('agent_settled', {}, { isIdle: () => true });
     await new Promise((r) => setTimeout(r, 600));
     const states = nativeStates(wire.received);

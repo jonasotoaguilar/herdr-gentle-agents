@@ -200,7 +200,7 @@
 
 import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { generateUnifiedPatch } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import { homedir } from "node:os";
@@ -682,6 +682,12 @@ const ASK_EVENT = "gentle-pi:ask-user-choice:blocked";
 const ASK_QUESTION_EVENT = "gentle-pi:ask-user-question:blocked";
 const QUESTIONNAIRE_EVENT = "rpiv:ask-user:blocked";
 const PERMISSION_EVENT = "pi-permission-system:permission-request";
+// Gentle Shell's live background jobs (`bash_background` / `monitor`) are
+// published on the Pi event bus, session-scoped and display-only:
+// `{ sessionId, snapshot: { jobs: [{ id, label, startedAt }] } }`. A live job
+// is pending work exactly like a running delegate, so it must keep the
+// session non-terminal.
+const JOBS_SIDEBAR_EVENT = "gentle-ai:jobs-sidebar";
 // Neither `gentle-pi:review:blocked` (reserved hook: no producer exists) nor
 // `gentle-ai:review-sidebar` snapshots (entry publishes fire before the
 // forecast branch, so they prove no reviewer route) are observed: no handler
@@ -974,13 +980,14 @@ export function computeNativeState({
   settled,
   activeCount,
   pendingCount,
+  jobCount = 0,
   askActive,
   reviewActive,
   hasError,
 }) {
   if (hasError) return "blocked";
   if (askActive) return "blocked";
-  if (agentActive || activeCount > 0 || pendingCount > 0 || reviewActive) {
+  if (agentActive || activeCount > 0 || pendingCount > 0 || jobCount > 0 || reviewActive) {
     return "working";
   }
   if (
@@ -988,6 +995,7 @@ export function computeNativeState({
     !agentActive &&
     activeCount === 0 &&
     pendingCount === 0 &&
+    jobCount === 0 &&
     !askActive &&
     !reviewActive
   ) {
@@ -1133,7 +1141,418 @@ function aggregateChanges(entries, sessionId) {
 // Extension
 // ---------------------------------------------------------------------------
 
+// Optional Moshi notification mirror toggle (DESIGN §7). The consumer daemon
+// reads this flag file; this command is the Pi-side switch. Enabling also
+// excludes the Moshi-managed Pi hook (`extensions/moshi-hooks.ts`) so Moshi
+// stops notifying per prompt and per turn, and disabling removes that
+// exclusion again. Both settings edits happen only while that hook file
+// exists. The flag path mirrors the daemon's stateRoot() resolution
+// (GENTLE_STATUS_STATE_DIR / HERDR_PLUGIN_STATE_DIR / XDG_STATE_HOME /
+// ~/.local/state/herdr), so both sides agree without a shared helper — this
+// file must stay self-contained.
+const MOSHI_HOOKS_REL = "extensions/moshi-hooks.ts";
+const MOSHI_EXCLUSION_ENTRY = "-extensions/moshi-hooks.ts";
+
+function moshiFlagPath() {
+  const env = process.env;
+  const override = env.GENTLE_STATUS_STATE_DIR ?? env.HERDR_PLUGIN_STATE_DIR;
+  if (typeof override === "string" && override.length > 0) return join(override, "gentle-moshi.json");
+  const base = env.XDG_STATE_HOME
+    ? join(env.XDG_STATE_HOME, "herdr")
+    : join(homedir(), ".local", "state", "herdr");
+  return join(base, "plugins", "herdr-gentle-agents", "gentle-moshi.json");
+}
+
+function moshiFlagEnabled(path) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path, "utf8"));
+    return isRecord(raw) && raw.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+function writeMoshiFlag(path, enabled) {
+  fs.mkdirSync(dirname(path), { recursive: true });
+  fs.writeFileSync(path, `${JSON.stringify({ enabled, updatedAt: new Date().toISOString() })}\n`);
+}
+
+// Pi agent dir, resolved like resolvePresenceProfile: an explicit agent home
+// wins, then Pi's own override, then the default.
+function piAgentDir() {
+  const env = process.env;
+  const selected = env.GENTLE_PI_AGENT_HOME ?? env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  if (selected === "~") return homedir();
+  if (selected.startsWith("~/")) return join(homedir(), selected.slice(2));
+  return selected;
+}
+
+function moshiHooksPath() {
+  return join(piAgentDir(), "extensions", "moshi-hooks.ts");
+}
+
+function piSettingsPath() {
+  return join(piAgentDir(), "settings.json");
+}
+
+// Fail closed: null means "do not touch it" (unreadable, invalid JSON, a
+// non-object document, or an `extensions` value that is not a list of
+// strings). A missing file yields an empty document, exactly like Pi.
+function readSettingsDoc(path) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { doc: {}, exists: false };
+    return null;
+  }
+  let doc;
+  try {
+    doc = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
+  } catch {
+    return null;
+  }
+  if (!isRecord(doc)) return null;
+  if (doc.extensions !== undefined && !Array.isArray(doc.extensions)) return null;
+  if (Array.isArray(doc.extensions) && doc.extensions.some((entry) => typeof entry !== "string")) return null;
+  return { doc, exists: true };
+}
+
+function moshiExclusionPresent() {
+  const loaded = readSettingsDoc(piSettingsPath());
+  if (loaded === null) return null;
+  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
+  return list.includes(MOSHI_EXCLUSION_ENTRY);
+}
+
+// Atomic and mode-preserving. A symlinked settings.json keeps pointing at its
+// target because the temp file is created next to the resolved target.
+function writeSettingsDoc(path, doc) {
+  let target = path;
+  try {
+    target = fs.realpathSync(path);
+  } catch {
+    // Missing or dangling: write where the path points.
+  }
+  let mode = 0o600;
+  try {
+    mode = fs.statSync(target).mode & 0o777;
+  } catch {
+    // Fresh file.
+  }
+  const temp = join(dirname(target), `.settings.json.gentle-${randomUUID().slice(0, 8)}.tmp`);
+  try {
+    fs.writeFileSync(temp, `${JSON.stringify(doc, null, 2)}\n`, { mode });
+    fs.renameSync(temp, target);
+  } catch (error) {
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {}
+    throw error;
+  }
+}
+
+// Only ever appends or removes the exact entry, preserving every other key,
+// value, and entry. Both directions are gated on the Moshi-managed hook
+// existing: with no hook file there is nothing to exclude, so settings.json
+// is never touched.
+function setMoshiExclusion(want) {
+  if (!fs.existsSync(moshiHooksPath())) {
+    return { ok: true, note: `${MOSHI_HOOKS_REL} is not installed; settings.json untouched.` };
+  }
+  const settings = piSettingsPath();
+  const loaded = readSettingsDoc(settings);
+  if (loaded === null) {
+    return { ok: false, note: `could not update ${settings}: unreadable or invalid JSON.` };
+  }
+  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
+  const present = list.includes(MOSHI_EXCLUSION_ENTRY);
+  if (want === present) {
+    return { ok: true, note: want ? "exclusion already present." : "no exclusion to remove." };
+  }
+  const next = want
+    ? [...list, MOSHI_EXCLUSION_ENTRY]
+    : list.filter((entry) => entry !== MOSHI_EXCLUSION_ENTRY);
+  try {
+    writeSettingsDoc(settings, { ...loaded.doc, extensions: next });
+  } catch (error) {
+    return { ok: false, note: `could not write ${settings}: ${error?.message ?? error}.` };
+  }
+  return { ok: true, note: want ? `added ${MOSHI_EXCLUSION_ENTRY}.` : `removed ${MOSHI_EXCLUSION_ENTRY}.` };
+}
+
+function moshiStatusMessage() {
+  const installed = fs.existsSync(moshiHooksPath());
+  const excluded = installed ? moshiExclusionPresent() : null;
+  const hook = installed
+    ? `${MOSHI_HOOKS_REL}: installed, excluded ${excluded === null ? "unknown (settings.json unreadable)" : excluded ? "yes" : "no"}`
+    : `${MOSHI_HOOKS_REL}: not installed`;
+  return `Moshi notifications are ${moshiFlagEnabled(moshiFlagPath()) ? "on" : "off"} (${hook}). Use /herdr-gentle:moshi enable|disable|status.`;
+}
+
+// Registered before the `enabled()` guard on purpose: the switch belongs to
+// the Pi session, not to a Herdr pane, so it must exist even where this
+// extension publishes nothing. Hosts whose Pi build has no commands simply
+// skip it.
+function registerMoshiToggle(pi) {
+  if (typeof pi?.registerCommand !== "function") return;
+  pi.registerCommand("herdr-gentle:moshi", {
+    description: "Turn Moshi notifications for Gentle (ask + real finish) on or off",
+    handler: async (args, ctx) => {
+      const raw = String(args ?? "").trim().toLowerCase();
+      let verb = raw;
+      // No argument opens the selector when the host can render one; a
+      // cancelled or unavailable selector falls back to status.
+      if (verb === "") {
+        let choice;
+        try {
+          choice = await ctx?.ui?.select?.("Moshi notifications", ["Enable", "Disable", "Status"]);
+        } catch {
+          choice = undefined;
+        }
+        verb = typeof choice === "string" && choice.length > 0 ? choice.toLowerCase() : "status";
+      }
+      if (verb === "on") verb = "enable";
+      if (verb === "off") verb = "disable";
+      if (verb !== "enable" && verb !== "disable" && verb !== "status") {
+        ctx?.ui?.notify?.(`Unknown option "${raw}". Use /herdr-gentle:moshi enable|disable|status.`, "error");
+        return;
+      }
+      if (verb === "status") {
+        ctx?.ui?.notify?.(moshiStatusMessage(), "info");
+        return;
+      }
+      const enabled = verb === "enable";
+      const path = moshiFlagPath();
+      try {
+        writeMoshiFlag(path, enabled);
+      } catch (error) {
+        ctx?.ui?.notify?.(`Could not write ${path}: ${error?.message ?? error}`, "error");
+        return;
+      }
+      const exclusion = setMoshiExclusion(enabled);
+      ctx?.ui?.notify?.(
+        `Moshi notifications ${enabled ? "enabled" : "disabled"}. ${exclusion.note}`,
+        exclusion.ok ? "info" : "error",
+      );
+    },
+  });
+}
+
+/* ------------------------------------------------------------ moshi */
+
+// Optional Moshi replacement (DESIGN §7). With the toggle on, this extension
+// takes over the whole integration the Moshi-managed Pi hook used to provide
+// — the same `session.update` envelopes over the Moshi daemon socket — so
+// Chat View, Live Activity, the session row and the terminal context keep
+// working, while notifications follow OUR policy: one per real ask episode
+// and one per real finish, never per prompt or per turn. Moshi still owns
+// pairing and credentials (this code never reads a token), and every send is
+// best effort: an absent daemon is a silent no-op that never interrupts Pi.
+//
+// This file ships as plain JavaScript inside a .ts file (Pi loads it through
+// jiti; the tests load a copy as .mjs), so it carries no type annotations.
+const MOSHI_AGENT = "pi";
+const MOSHI_MAX_CHILD_HEADER = 16 * 1024;
+
+function moshiSocketPath() {
+  const override = process.env.MOSHI_SOCKET_PATH;
+  if (typeof override === "string" && override.length > 0) return override;
+  if (process.platform === "darwin") {
+    return join(homedir(), "Library", "Application Support", "Moshi", "moshi-hook.sock");
+  }
+  if (process.platform === "win32") return "\\\\.\\pipe\\moshi-hook";
+  const runtime = process.env.XDG_RUNTIME_DIR;
+  if (typeof runtime === "string" && runtime.length > 0) return join(runtime, "moshi-hook.sock");
+  return "/tmp/moshi-hook.sock";
+}
+
+const moshiInFlight = new Set();
+
+// One envelope per connection: JSON line, half-close, drain the ack — the
+// wire protocol of the Moshi daemon socket. Every failure resolves silently.
+function moshiSendEnvelope(envelope) {
+  try {
+    const sock = net.connect({ path: moshiSocketPath() });
+    const done = new Promise((resolve) => sock.once("close", () => resolve()));
+    moshiInFlight.add(done);
+    void done.then(() => moshiInFlight.delete(done));
+    sock.setNoDelay(true);
+    sock.on("error", () => {
+      try {
+        sock.destroy();
+      } catch {}
+    });
+    sock.once("connect", () => {
+      sock.write(`${JSON.stringify(envelope)}\n`);
+      sock.end();
+    });
+    sock.on("data", () => {});
+  } catch {
+    // Moshi absent is never an error for Pi.
+  }
+}
+
+// session_shutdown is awaited by the host: without draining, the process can
+// exit before the socket connects and the session never closes in Moshi.
+function moshiFlushSends(timeoutMs) {
+  if (moshiInFlight.size === 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    void Promise.all([...moshiInFlight]).then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function moshiCommandOutput(command, args, timeout) {
+  try {
+    const result = spawnSync(command, args, { encoding: "utf8", timeout, windowsHide: true });
+    return typeof result.stdout === "string" ? result.stdout : "";
+  } catch {
+    return "";
+  }
+}
+
+// Terminal identity for the envelopes (Chat View, jump-to, approval routing).
+// Resolved once, lazily: enabling Moshi is what pays for the tmux probe.
+// Herdr identity comes straight from the environment Herdr stamps into every
+// pane; labels are resolved daemon-side from these ids.
+let moshiTerminalCache;
+
+function moshiTerminal() {
+  if (moshiTerminalCache) return moshiTerminalCache;
+  const tmuxPane = process.env.TMUX_PANE ?? "";
+  const tmuxEnv = process.env.TMUX ?? "";
+  const comma = tmuxEnv.indexOf(",");
+  const tmuxSocket = comma > 0 ? tmuxEnv.slice(0, comma) : "";
+  let tmuxSession = "";
+  let tmuxWindow = "";
+  if (tmuxEnv) {
+    const args = ["display-message", "-p"];
+    if (tmuxPane) args.push("-t", tmuxPane);
+    args.push("#S\t#I");
+    const text = moshiCommandOutput("tmux", args, 200).trim();
+    if (text) {
+      const parts = text.split("\t", 2);
+      tmuxSession = parts[0] ?? "";
+      tmuxWindow = parts[1] ?? "";
+    }
+  }
+  const zellijSession = process.env.ZELLIJ_SESSION_NAME ?? "";
+  const zellijPane = process.env.ZELLIJ_PANE_ID ?? "";
+  const inHerdr = process.env.HERDR_ENV === "1";
+  const terminalKind = tmuxSession
+    ? "tmux"
+    : inHerdr
+      ? "herdr"
+      : process.env.ZELLIJ || zellijSession || zellijPane
+        ? "zellij"
+        : "";
+  moshiTerminalCache = {
+    terminalKind,
+    tmuxSession,
+    tmuxWindow,
+    tmuxPane,
+    tmuxSocket,
+    zellijSession,
+    zellijPane,
+    herdrSession: inHerdr ? (process.env.HERDR_SESSION ?? "") : "",
+    herdrPane: inHerdr ? (paneId ?? "") : "",
+    herdrWorkspaceId: inHerdr ? (process.env.HERDR_WORKSPACE_ID ?? "") : "",
+    herdrTabId: inHerdr ? (process.env.HERDR_TAB_ID ?? "") : "",
+  };
+  return moshiTerminalCache;
+}
+
+const moshiChildCache = new Map();
+
+// A Pi session created by fork/clone/newSession carries a parent in its
+// transcript header; those stay out of the Moshi inbox (the managed hook
+// applied the same rule). An unreadable or half-written header is retried on
+// the next call.
+function moshiSessionIsChild(file) {
+  if (!file) return false;
+  const cached = moshiChildCache.get(file);
+  if (cached !== undefined) return cached;
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+  } catch {
+    return false;
+  }
+  let child = false;
+  try {
+    const buffer = Buffer.alloc(MOSHI_MAX_CHILD_HEADER);
+    const read = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const text = buffer.subarray(0, read).toString("utf8");
+    const newline = text.indexOf("\n");
+    const header = JSON.parse(newline >= 0 ? text.slice(0, newline) : text);
+    const parent = header?.parentSession ?? header?.parentSessionId;
+    child = typeof parent === "string" && parent.length > 0;
+  } catch {
+    return false;
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {}
+  }
+  moshiChildCache.set(file, child);
+  return child;
+}
+
+let moshiFlagCache = { mtimeMs: -1, enabled: false };
+
+function moshiEnabled() {
+  const path = moshiFlagPath();
+  try {
+    const stat = fs.statSync(path);
+    if (stat.mtimeMs === moshiFlagCache.mtimeMs) return moshiFlagCache.enabled;
+    moshiFlagCache = { mtimeMs: stat.mtimeMs, enabled: moshiFlagEnabled(path) };
+  } catch {
+    moshiFlagCache = { mtimeMs: -1, enabled: false };
+  }
+  return moshiFlagCache.enabled;
+}
+
+function moshiFirstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return "";
+}
+
+function moshiModelLabel(model) {
+  if (!isRecord(model)) return "";
+  return moshiFirstString(model.displayName, model.display_name, model.name, model.id, model.modelId);
+}
+
+function moshiContextRemaining(ctx) {
+  let usage;
+  try {
+    const call = ctx?.getContextUsage;
+    if (typeof call !== "function") return undefined;
+    usage = call.call(ctx);
+  } catch {
+    return undefined;
+  }
+  if (typeof usage?.percent !== "number" || !Number.isFinite(usage.percent)) return undefined;
+  return Math.max(1, Math.min(100, Math.round(100 - usage.percent)));
+}
+
+// Visible project name for the notification copy: the multiplexer session
+// name when there is one, else the cwd basename, else `Gentle`. Never a full
+// path.
+function moshiProjectName(cwd, terminal) {
+  const trimmed = typeof cwd === "string" ? cwd.replace(/[\\/]+$/, "") : "";
+  const at = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  const base = at >= 0 ? trimmed.slice(at + 1) : trimmed;
+  return terminal.tmuxSession || terminal.herdrSession || terminal.zellijSession || base || "Gentle";
+}
+
 export default function (pi) {
+  registerMoshiToggle(pi);
   if (!enabled()) return;
 
   let rootSession = false;
@@ -1187,6 +1606,110 @@ export default function (pi) {
   let uiPromptActive = false;
   let askIntentId;
   let askCounter = 0;
+
+  // Moshi replacement state (DESIGN §7): the session context the envelopes
+  // carry (undefined while the toggle is off or for a lineage child), the last
+  // ctx seen (so enabling mid-session still opens the row), and the tool that
+  // opened the current ask episode.
+  let moshiContext;
+  let moshiCtxRef;
+  let lastAskToolName;
+
+  // Live background jobs (Gentle Shell `bash_background` / `monitor`), from
+  // the bus snapshot. Session-scoped: a snapshot owned by another session
+  // never counts here.
+  let jobsSnapshot;
+
+  function runningJobCount() {
+    if (!jobsSnapshot) return 0;
+    const owner = jobsSnapshot.sessionId;
+    const mine = sessionId;
+    if (
+      typeof owner === "string" &&
+      owner.length > 0 &&
+      typeof mine === "string" &&
+      mine.length > 0 &&
+      owner !== mine
+    ) {
+      return 0;
+    }
+    return jobsSnapshot.jobs.length;
+  }
+
+  // A job starting or ending is a state change: publish immediately so the
+  // sidebar and the native report follow it, and keep the beat alive while
+  // jobs run (the marker has its own TTL).
+  function onJobsSnapshot(value) {
+    if (!isRecord(value) || !isRecord(value.snapshot) || !Array.isArray(value.snapshot.jobs)) return;
+    const jobs = value.snapshot.jobs.filter(
+      (entry) => isRecord(entry) && typeof entry.id === "string" && entry.id.length > 0,
+    );
+    jobsSnapshot = {
+      sessionId: typeof value.sessionId === "string" ? value.sessionId : undefined,
+      jobs,
+    };
+    schedulePublish();
+  }
+
+  // Subscribed before the `enabled()` guard would matter: the bus event is
+  // session-scoped display data, so it is safe to observe anywhere. Hosts
+  // whose runtime has no event bus simply never see it (jobs stay at zero,
+  // which is today's behavior).
+  if (typeof pi?.events?.on === "function") pi.events.on(JOBS_SIDEBAR_EVENT, onJobsSnapshot);
+
+  function moshiCapture(ctx) {
+    const record = isRecord(ctx) ? ctx : undefined;
+    const file = typeof sessionFile === "string" ? sessionFile : "";
+    if (!file || moshiSessionIsChild(file)) {
+      moshiContext = undefined;
+      return;
+    }
+    const cwd = moshiFirstString(record?.cwd, process.cwd());
+    moshiContext = {
+      sessionId: moshiFirstString(sessionId, "pi"),
+      transcriptPath: file,
+      cwd,
+      modelName: moshiModelLabel(record?.model),
+      contextRemaining: moshiContextRemaining(record),
+      project: moshiProjectName(cwd, moshiTerminal()),
+    };
+  }
+
+  function moshiEmit(eventName, extra = {}) {
+    if (!rootSession) return;
+    if (!moshiContext && !moshiEnsureContext()) return;
+    const context = moshiContext;
+    if (!context) return;
+    const envelope = {
+      type: "session.update",
+      source: MOSHI_AGENT,
+      sessionId: context.sessionId,
+      eventName,
+      cwd: context.cwd,
+      projectName: context.project,
+      ...moshiTerminal(),
+      modelName: context.modelName,
+      transcriptPath: context.transcriptPath,
+      requestedAt: new Date().toISOString(),
+      ...extra,
+    };
+    if (typeof context.contextRemaining === "number" && context.contextRemaining > 0) {
+      envelope.contextRemaining = Math.round(context.contextRemaining);
+    }
+    moshiSendEnvelope(envelope);
+  }
+
+  // Captures on demand and sends the silent carrier once per session, so
+  // enabling Moshi mid-session still opens the Chat View row instead of
+  // waiting for the next Pi session.
+  function moshiEnsureContext() {
+    if (moshiContext) return true;
+    if (!rootSession || !moshiEnabled()) return false;
+    moshiCapture(moshiCtxRef);
+    if (!moshiContext) return false;
+    moshiEmit("SessionStart");
+    return true;
+  }
   // Review leg: bounded acknowledged-execution signal. reviewCalls tracks
   // live ACKNOWLEDGED capture/group executions by toolCallId, opened only
   // on `tool_execution_start` with `reviewerRunAcknowledged: true` (a
@@ -1223,7 +1746,14 @@ export default function (pi) {
   // serial latest-wins coalescing, deduped emit-once per state+message.
   // Seq is never reset (host ordering); pending/last reset with the
   // session.
-  let nativeSeq = 0;
+  // Seeded from the clock exactly like herdr's own plugin SDK
+  // (`let reportSeq = Date.now() * 1000`): the counter must stay monotonic
+  // ACROSS processes, because Herdr ignores a report whose seq loses to the
+  // stored one. A zero-based counter makes every report after a Pi restart or
+  // `/new` (both recreate this runtime) lose, which freezes the pane's
+  // `agent_session` binding at the old session; the consumer then rejects the
+  // fresh tokens (session-hash mismatch) and the sidebar stays on `idle`.
+  let nativeSeq = Date.now() * 1000;
   let nativeInFlight = false;
   let nativePending = null;
   let nativeLastOk = undefined;
@@ -1273,13 +1803,30 @@ export default function (pi) {
     if (askActiveNow() && !askIntentId) {
       askCounter += 1;
       askIntentId = sanitizeId(undefined, `q${askCounter.toString(36)}-`);
+      // Moshi replacement (DESIGN §7): a real ask episode is the only
+      // intervention that reaches the phone — one approval_required per
+      // intentId, exactly like the Herdr toast, and never a speculative ask.
+      if (moshiContext || moshiEnabled()) {
+        moshiEmit("PermissionRequest", {
+          category: "approval_required",
+          phase: "waitingForApproval",
+          actionId: askIntentId,
+          title: "Gentle needs response",
+          subtitle: "Answer in terminal",
+          message: `${moshiContext?.project ?? "Gentle"} needs your input. Return to Pi to respond.`,
+          ...(lastAskToolName ? { toolName: lastAskToolName } : {}),
+        });
+      }
     }
   }
 
   function updateBlocker() {
     if (!rootSession) return;
     ensureAskIntent();
-    if (!askActiveNow()) askIntentId = undefined;
+    if (!askActiveNow()) {
+      askIntentId = undefined;
+      lastAskToolName = undefined;
+    }
     if (reviewActive && !reviewId) reviewId = sanitizeId(undefined, "r-");
     if (!reviewActive) reviewId = undefined;
     const next = desiredLabel();
@@ -1512,7 +2059,7 @@ export default function (pi) {
     // `orchestrating` display only when no recognized role is active (below
     // attention, terminal `done`, and recognized roles; ahead of main
     // `working`).
-    if (rootSession && (agentActive || subs.length > 0 || pendingCalls.size > 0)) {
+    if (rootSession && (agentActive || subs.length > 0 || pendingCalls.size > 0 || runningJobCount() > 0)) {
       tokens.gentle_orchestrating_v1 = `${sessionHash}:${expiry}`;
     } else {
       tokens.gentle_orchestrating_v1 = null;
@@ -1553,6 +2100,7 @@ export default function (pi) {
       agentActive ||
       activeSubs().length > 0 ||
       pendingCalls.size > 0 ||
+      runningJobCount() > 0 ||
       askToolCalls.size > 0 ||
       uiPromptActive ||
       reviewActive ||
@@ -1593,6 +2141,7 @@ export default function (pi) {
       settled,
       activeCount: activeSubs().length,
       pendingCount: pendingCalls.size + (nativeSettledPending ? 1 : 0),
+      jobCount: runningJobCount(),
       askActive: askActiveNow(),
       reviewActive,
       hasError: !!errorCode,
@@ -1638,7 +2187,9 @@ export default function (pi) {
   // pane.report_agent state seq still starts at 1.
   const NATIVE_SOURCE = "herdr:pi";
   const NATIVE_AGENT = "pi";
-  let nativeSessionSeq = 0;
+  // Same clock-seeded rule as nativeSeq above: the session binding is the
+  // report that must win after a restart, so it can never be zero-based.
+  let nativeSessionSeq = Date.now() * 1000;
 
   async function reportSession(sessionStartSource) {
     if (!enabled()) return;
@@ -1707,7 +2258,20 @@ export default function (pi) {
             attempt === 0 ? 500 : 1500,
           );
         }
-        if (ok) nativeLastOk = next;
+        if (ok) {
+          const wasWorking = nativeLastOk?.state === "working";
+          nativeLastOk = next;
+          // Moshi replacement (DESIGN §7): the real finish is the native
+          // transition into `idle` — settled plus zero running/queued plus
+          // zero pending plus no human wait — never a settle with work left.
+          if (wasWorking && next.state === "idle") {
+            moshiEmit("AgentEnd", {
+              category: "task_complete",
+              title: "Gentle finished",
+              message: `${moshiContext?.project ?? "Gentle"} finished and is waiting for your next instruction.`,
+            });
+          }
+        }
       }
     } finally {
       nativeInFlight = false;
@@ -1919,6 +2483,7 @@ export default function (pi) {
     // `tool_call` proposal), keyed by call id so the matching end or
     // result closes them.
     if (typeof event.toolName === "string" && ASK_TOOLS.has(event.toolName)) {
+      lastAskToolName = event.toolName;
       askToolCalls.set(event.toolCallId, Date.now());
       if (askToolCalls.size > MAX_TRACKED_TASKS) {
         const oldest = askToolCalls.keys().next().value;
@@ -2206,6 +2771,8 @@ export default function (pi) {
     rootSession = true;
     sessionManager = ctx.sessionManager;
     refreshSessionRef(ctx);
+    moshiCtxRef = ctx;
+    if (moshiEnabled()) moshiEnsureContext();
     // LIVE-1: bind the session before any state beat so Herdr attributes
     // the pane from the first frame (mirrors the managed publisher: await
     // on session_start, fire-and-forget on agent_start).
@@ -2219,6 +2786,7 @@ export default function (pi) {
   pi.on("agent_start", (_event, ctx) => {
     if (!rootSession) return;
     refreshSessionRef(ctx);
+    moshiCtxRef = ctx;
     // LIVE-1: re-bind the session like the managed publisher did, so a
     // restart or re-announcement never leaves the pane binding-less while
     // metadata beats flow.
@@ -2235,6 +2803,7 @@ export default function (pi) {
 
   pi.on("agent_settled", (_event, ctx) => {
     if (!rootSession || ctx?.isIdle?.() !== true) return;
+    moshiCtxRef = ctx;
     agentActive = false;
     settled = true;
     // Retain settle-time pending evidence for native gating before the
@@ -2250,6 +2819,17 @@ export default function (pi) {
   });
 
   pi.on("session_shutdown", () => {
+    // Close the Moshi row before the session state is dropped. The host
+    // awaits this handler, so the flush keeps the process alive until the
+    // envelope lands (or the bound expires).
+    if (moshiEnsureContext()) {
+      moshiEmit("SessionEnd", {
+        type: "session.closed",
+        category: "session_ended",
+        title: "Pi session ended",
+      });
+    }
+    moshiContext = undefined;
     rootSession = false;
     if (beatTimer) {
       clearInterval(beatTimer);
@@ -2262,5 +2842,6 @@ export default function (pi) {
       } catch {}
     }
     resetSessionState();
+    return moshiFlushSends(1000);
   });
 }
