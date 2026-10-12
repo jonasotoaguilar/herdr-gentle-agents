@@ -1331,8 +1331,15 @@ function registerMoshiToggle(pi) {
         return;
       }
       const exclusion = setMoshiExclusion(enabled);
+      // A running session keeps the previously loaded hook until /reload:
+      // enabling here activates our sender immediately while the original
+      // hook stays live in that session, so both would notify. Warn once.
+      const reloadNote =
+        enabled && exclusion.ok
+          ? " Sessions already running need /reload to unload the original hook."
+          : "";
       ctx?.ui?.notify?.(
-        `Moshi notifications ${enabled ? "enabled" : "disabled"}. ${exclusion.note}`,
+        `Moshi notifications ${enabled ? "enabled" : "disabled"}. ${exclusion.note}${reloadNote}`,
         exclusion.ok ? "info" : "error",
       );
     },
@@ -1549,6 +1556,28 @@ function moshiProjectName(cwd, terminal) {
   const at = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
   const base = at >= 0 ? trimmed.slice(at + 1) : trimmed;
   return terminal.tmuxSession || terminal.herdrSession || terminal.zellijSession || base || "Gentle";
+}
+
+// Last-finished task label for the finish notification body: the most
+// recently completed/cancelled record, sanitized like advisory labels and
+// bounded so a notification (history, lock screen) never carries ids,
+// paths, or prompt content. Undefined when no terminal record exists (the
+// fallback body covers a session with no tracked tasks).
+function lastFinishedLabel(taskMap) {
+  let bestLabel;
+  let bestAt = -1;
+  if (taskMap instanceof Map) {
+    for (const task of taskMap.values()) {
+      if (task?.status !== "completed" && task?.status !== "cancelled") continue;
+      if (typeof task?.label !== "string" || task.label.length === 0) continue;
+      if (typeof task.at !== "number" || task.at < bestAt) continue;
+      bestAt = task.at;
+      bestLabel = task.label;
+    }
+  }
+  if (bestLabel === undefined) return undefined;
+  const clean = bestLabel.replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim().slice(0, 80);
+  return clean || undefined;
 }
 
 export default function (pi) {
@@ -1811,9 +1840,9 @@ export default function (pi) {
           category: "approval_required",
           phase: "waitingForApproval",
           actionId: askIntentId,
-          title: "Gentle needs response",
+          title: `Gentle ask: ${moshiContext?.project ?? "Gentle"}`,
           subtitle: "Answer in terminal",
-          message: `${moshiContext?.project ?? "Gentle"} needs your input. Return to Pi to respond.`,
+          message: `${moshiContext?.project ?? "Gentle"} has a question and is waiting for your answer. Return to Pi to respond.`,
           ...(lastAskToolName ? { toolName: lastAskToolName } : {}),
         });
       }
@@ -2265,10 +2294,15 @@ export default function (pi) {
           // transition into `idle` — settled plus zero running/queued plus
           // zero pending plus no human wait — never a settle with work left.
           if (wasWorking && next.state === "idle") {
+            const project = moshiContext?.project ?? "Gentle";
+            const lastLabel = lastFinishedLabel(tasks);
             moshiEmit("AgentEnd", {
               category: "task_complete",
-              title: "Gentle finished",
-              message: `${moshiContext?.project ?? "Gentle"} finished and is waiting for your next instruction.`,
+              title: `Gentle finished: ${project}`,
+              message:
+                lastLabel !== undefined
+                  ? `${project} finished \u2014 ${lastLabel}. Return to Pi for what\u2019s next.`
+                  : `${project} finished and is waiting for your next instruction.`,
             });
           }
         }

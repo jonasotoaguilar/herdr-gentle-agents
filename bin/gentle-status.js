@@ -5,21 +5,21 @@
 //
 // Polls `agent list`, reduces each pane with lib/gentle-tokens.js (DESIGN
 // §5.2), publishes the owned `gentle_*` family (chunked ≤ 16 per report),
-// notifies ask exactly once per intentId (DESIGN §7), and sweeps only its
-// own token names on handover/uninstall (DESIGN §3 O5).
+// and sweeps only its own token names on handover/uninstall (DESIGN §3 O5).
+// Desktop attention is native Herdr (ask + finish toasts, DESIGN §7): this
+// daemon emits no notification for any display.
 //
 // Usage:
 //   node bin/gentle-status.js          ensure the daemon is running
 //   node bin/gentle-status.js --run    BE the daemon (Herdr [[startup]])
 //   node bin/gentle-status.js --once   single frame, then exit (debugging)
 //   node bin/gentle-status.js --stop   stop the daemon (scoped sweep of live
-//   node bin/gentle-status.js --stop --purge   also clear every owned token
-//                                      plus the notification ledger)
+//   node bin/gentle-status.js --stop --purge   also clear every owned token)
 //
 // Transport mirrors herdr-pi-tree lib/ipc.js + lib/herdr.js: socket calls
 // with one CLI fallback each, so a misbehaving socket degrades to slow, not
 // broken. A failed snapshot is "no data", never "empty": nothing is
-// published, notified, or swept on a failed read.
+// published or swept on a failed read.
 
 var MIN_MAJOR = 18;
 var major = Number(String(process.versions.node).split('.')[0]);
@@ -198,7 +198,7 @@ function stateRoot() {
   try {
     fs.mkdirSync(dir, { recursive: true });
   } catch {
-    // Callers degrade rather than crash; ledger/pid writes are best-effort.
+    // Callers degrade rather than crash; pid writes are best-effort.
   }
   return dir;
 }
@@ -354,102 +354,11 @@ async function reportChunked(source, paneId, tokens) {
   return (await Promise.all(jobs)).every(Boolean);
 }
 
-// DESIGN §7 + §10 U1: the consumer-side ¬ask→ask transition gate is the
-// normative dedup mechanism (Herdr-side dedup is unconfirmed). `herdr
-// notification show` flags verified against the installed CLI; review and
-// error transitions never call this. Visible copy is the fixed title
-// `Gentle needs response` plus a body naming the project
-// (`<project> needs your input. Return to Pi to respond.`). The name comes
-// from the snapshot's validated workspace group only — never a cwd-derived
-// path segment, pane/intent ids, session material, or token values.
-//
-// P2 non-blocking send: async spawn with a bounded kill timeout, resolved
-// true only on exit 0. Callers dispatch sends in agent-list order (one
-// flight per intent key, tracked in state.pendingNotify) and run them
-// concurrently with metadata publishes; the ledger is written only in the
-// completion callback on observed success, so a slow or hanging notify
-// binary can never head-of-line block sibling panes. paneId/intentId are
-// accepted for call-site symmetry (as before); they never enter argv.
-//
-// Project name for the ask toast: the snapshot's validated workspace/group
-// name only, sanitized and bounded, failing closed to `Gentle`. The
-// cwd-derived fallback the sidebar uses is deliberately NOT used here: a
-// desktop toast outlives the terminal (notification history, lock screen),
-// so it never carries a path segment.
-function askProjectName(entry) {
-  const group = entry?.group;
-  if (typeof group === 'string') {
-    const clean = group.replace(/[\x00-\x1f\x7f-\x9f]/g, '').trim().slice(0, 64);
-    if (clean) return clean;
-  }
-  return 'Gentle';
-}
-
-// Shared notification copy (DESIGN §7). One place builds the strings so the
-// Herdr toast names the snapshot's validated workspace/group name only,
-// sanitized and bounded by askProjectName, failing closed to `Gentle`.
-function askNotifyCopy(project) {
-  const projectName = typeof project === 'string' && project.length > 0 ? project : 'Gentle';
-  return { title: 'Gentle needs response', body: `${projectName} needs your input. Return to Pi to respond.` };
-}
-
-function notifyAskAsync(paneId, intentId, project, timeoutMs = CLI_TIMEOUT_MS) {
-  const copy = askNotifyCopy(project);
-  return new Promise((resolve) => {
-    let settled = false;
-    let child = null;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try {
-        if (child) child.kill('SIGKILL');
-      } catch {
-        // Already gone.
-      }
-      resolve(false);
-    }, timeoutMs);
-    const finish = (ok) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(ok);
-    };
-    try {
-      child = spawn(
-        binary(),
-        ['notification', 'show', copy.title, '--body', copy.body, '--sound', 'request'],
-        { windowsHide: true, stdio: 'ignore' },
-      );
-    } catch {
-      finish(false);
-      return;
-    }
-    child.on('error', () => finish(false));
-    child.on('close', (code) => finish(code === 0));
-  });
-}
-
-/* ------------------------------------------------------------ ledger */
-
-function loadLedger() {
-  try {
-    const raw = fs.readFileSync(LEDGER_FILE(), 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-  } catch {
-    // Missing or corrupt: start empty (a corrupt ledger may re-fire one
-    // notification per intent; it never suppresses a new intent).
-  }
-  return {};
-}
-
-function saveLedger(ledger) {
-  try {
-    fs.writeFileSync(LEDGER_FILE(), JSON.stringify(ledger), 'utf8');
-  } catch {
-    // Best-effort: the in-memory ledger still dedups for this run.
-  }
-}
+// DESIGN §7 notification ownership: desktop attention is native Herdr —
+// this consumer emits `herdr notification` for nothing. The ask token still
+// drives the sidebar ask display; the Moshi phone path lives in the
+// producer extension. This daemon keeps no notification ledger and tracks
+// no in-flight sends.
 
 /* ------------------------------------------------------------ frame */
 
@@ -471,12 +380,7 @@ async function clearOwnedFamily(paneId) {
   return reportChunked(SOURCE, paneId, ownedClearPatch());
 }
 
-async function frame(state, opts = {}) {
-  if (!(state.pendingNotify instanceof Map)) state.pendingNotify = new Map();
-  // Daemon loop passes waitForNotify:false so the frame returns once
-  // publishes land; --once (tests/debugging) drains in-flight sends for a
-  // deterministic ledger. Either way the sends below never gate publishes.
-  const waitForNotify = opts.waitForNotify !== false;
+async function frame(state) {
   const now = Date.now();
   if (state.pollObserved) {
     state.pollObserved.askActivity = false;
@@ -485,23 +389,9 @@ async function frame(state, opts = {}) {
   const agents = await agentsAsync();
   if (agents === null) {
     debug('snapshot failed; skipping frame');
-    if (waitForNotify && state.pendingNotify.size > 0) {
-      await Promise.all([...state.pendingNotify.values()]);
-      if (state.ledgerDirty) {
-        saveLedger(state.ledger);
-        state.ledgerDirty = false;
-      }
-    }
     return;
   }
-  const askSessions = new Set();
   const live = new Set();
-  // P2 dispatch: one flight per intent key, launched in agent-list order
-  // (per-intent ordering preserved), concurrent with the publishes below.
-  // Ledger write happens only in the completion callback on observed
-  // success; a failed send leaves no ledger entry and retries next frame.
-  // Dispatch itself counts as ask activity so P1 fast-cycle timing is
-  // unchanged by send latency.
   const publishJobs = [];
   for (const entry of agents) {
     const paneId = entry?.pane_id;
@@ -515,52 +405,17 @@ async function frame(state, opts = {}) {
     // Behind-upstream marker, resolved per cwd with TTL dedupe (no storm
     // across panes sharing a worktree). Absent on any failure.
     reduced.pull = pullMarkerFor(entry);
-    if (reduced.display === 'ask' && reduced.notify) {
-      askSessions.add(reduced.notify.sessionHash);
-      const key = `${reduced.notify.sessionHash}:${reduced.notify.intentId}`;
-      if (state.ledger[key]) {
-        if (state.pollObserved) state.pollObserved.askActivity = true;
-      } else if (state.pendingNotify.has(key)) {
-        // Still asking (already notified): recent ask activity keeps the
-        // fast cycle armed without re-firing the exactly-once toast.
-        if (state.pollObserved) state.pollObserved.askActivity = true;
-      } else {
-        if (state.pollObserved) state.pollObserved.askActivity = true;
-        const expiry = reduced.notify.expiry;
-        const send = notifyAskAsync(paneId, reduced.notify.intentId, askProjectName(entry)).then(
-          (ok) => {
-            state.pendingNotify.delete(key);
-            if (ok) {
-              state.ledger[key] = { expiry };
-              state.ledgerDirty = true;
-              saveLedger(state.ledger);
-              state.ledgerDirty = false;
-              if (state.pollObserved) state.pollObserved.askActivity = true;
-              debug(`notified ask ${key} on ${paneId}`);
-            } else {
-              if (state.pollObserved) state.pollObserved.failure = true;
-              debug(`notify failed for ask ${key}; will retry next frame`);
-            }
-            return ok;
-          },
-          () => {
-            state.pendingNotify.delete(key);
-            if (state.pollObserved) state.pollObserved.failure = true;
-            debug(`notify failed for ask ${key}; will retry next frame`);
-            return false;
-          },
-        );
-        state.pendingNotify.set(key, send);
-        debug(`dispatching ask notify ${key} on ${paneId}`);
-      }
+    // Ask activity keeps the P1 fast cycle armed while a question waits.
+    // Desktop attention itself is native (DESIGN §7): no toast here.
+    if (reduced.display === 'ask' && reduced.notify && state.pollObserved) {
+      state.pollObserved.askActivity = true;
     }
     const patch = contract.displayTokens(reduced);
     const signature = JSON.stringify(patch);
     if (lastSent.get(paneId) === signature) continue;
     publishJobs.push({ paneId, patch, signature });
   }
-  // Publishes race the in-flight sends above: sibling panes and metadata
-  // are never head-of-line blocked behind a slow notify binary.
+  // Publishes land every frame; with no notification path nothing gates them.
   const publishResults = await Promise.all(
     publishJobs.map(async (job) => ({ job, ok: await reportChunked(SOURCE, job.paneId, job.patch) })),
   );
@@ -571,31 +426,7 @@ async function frame(state, opts = {}) {
       debug(`publish failed for pane ${job.paneId}; will retry next frame`);
     }
   }
-  // An intent re-arms only via a NEW intentId: ledger entries persist past
-  // token TTL and are forgotten when their session is no longer asking (or
-  // vanishes), so a re-asserted same intent is continuation (silent).
-  let pruned = false;
-  for (const key of Object.keys(state.ledger)) {
-    const sessionHash = key.slice(0, key.indexOf(':'));
-    if (!askSessions.has(sessionHash)) {
-      delete state.ledger[key];
-      pruned = true;
-    }
-  }
-  if (pruned) state.ledgerDirty = true;
-  if (state.ledgerDirty) {
-    saveLedger(state.ledger);
-    state.ledgerDirty = false;
-  }
-  if (waitForNotify && state.pendingNotify.size > 0) {
-    // --once determinism: the daemon loop never waits here (its sends
-    // reconcile the ledger from the completion callback instead).
-    await Promise.all([...state.pendingNotify.values()]);
-    if (state.ledgerDirty) {
-      saveLedger(state.ledger);
-      state.ledgerDirty = false;
-    }
-  }
+
   // Live-set-change orphan sweep (R3-orphan + R4-live-loop): panes that
   // dropped out of the live agent set keep presence-encoded owned tokens;
   // clear the owned family under our own source (never foreign tokens).
@@ -674,7 +505,7 @@ async function run() {
     console.error(`gentle-status: cannot write pidfile: ${error.message}`);
     process.exit(1);
   }
-  const state = { ledger: loadLedger(), ledgerDirty: false, live: new Set(), pollObserved: createPollStateObserved(), pendingNotify: new Map() };
+  const state = { live: new Set(), pollObserved: createPollStateObserved() };
   const pollConfig = resolvePollConfig();
   const pollState = createPollState();
   let stopped = false;
@@ -705,10 +536,7 @@ async function run() {
   for (;;) {
     if (stopped) break;
     try {
-      // waitForNotify:false: dispatched sends complete in the background
-      // and reconcile the ledger via callback; the next poll delay is
-      // computed without waiting on the notify binary.
-      await frame(state, { waitForNotify: false });
+      await frame(state);
     } catch (error) {
       logError(error);
     }
@@ -728,9 +556,8 @@ async function main() {
     return;
   }
   if (mode === '--once') {
-    const state = { ledger: loadLedger(), ledgerDirty: false, live: new Set(), pollObserved: createPollStateObserved(), pendingNotify: new Map() };
+    const state = { live: new Set(), pollObserved: createPollStateObserved() };
     await frame(state);
-    if (state.ledgerDirty) saveLedger(state.ledger);
     return;
   }
   if (mode === '--stop') {
@@ -792,8 +619,6 @@ if (require.main === module) {
   module.exports = {
     POLL_MS,
     POLL_MIN_MS,
-    CLI_TIMEOUT_MS,
-    notifyAskAsync,
     resolvePollConfig,
     createPollState,
     createPollStateObserved,

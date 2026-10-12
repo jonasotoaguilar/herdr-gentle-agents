@@ -216,8 +216,8 @@ test('enabled: approval_required fires once per ask episode', async () => {
   const first = await waitFor((f) => f.category === 'approval_required');
   assert.ok(first, 'expected an approval_required envelope');
   assert.equal(first.phase, 'waitingForApproval');
-  assert.equal(first.title, 'Gentle needs response');
-  assert.match(first.message, /myproj/);
+  assert.equal(first.title, 'Gentle ask: myproj');
+  assert.match(first.message, /myproj has a question/);
   assert.equal(first.toolName, 'ask_user_question');
   assert.equal(typeof first.actionId, 'string');
 
@@ -255,12 +255,41 @@ test('enabled: task_complete fires only on the real finish', async () => {
   h.fire('agent_settled', {}, ctx({ idle: true }));
   const finish = await waitFor((f) => f.category === 'task_complete');
   assert.ok(finish, 'expected a task_complete envelope on the real finish');
-  assert.equal(finish.title, 'Gentle finished');
-  assert.match(finish.message, /myproj/);
+  assert.equal(finish.title, 'Gentle finished: myproj');
+  assert.match(finish.message, /myproj finished/);
 
   h.fire('agent_settled', {}, ctx({ idle: true }));
   await settle(400);
   assert.equal(moshiOf('task_complete').length, 1, 'a settled session never re-notifies');
+});
+
+test('enabled: task_complete names the last finished task', async () => {
+  await listening;
+  enableMoshi();
+  const factory = await loadRuntime();
+  const h = harness();
+  factory(h.pi);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+  // Scope to this test's own frames: moshiFrames is shared across tests,
+  // so an unscoped waitFor would match a previous test's task_complete.
+  const before = moshiFrames.length;
+  h.fire('tool_call', { toolName: 'subagent_run', toolCallId: 't1', input: { agent: 'worker', label: 'fix login bug' } });
+  h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 't1', details: { gentleAgents: { taskId: 'task-1', status: 'completed' } } });
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(300);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  let finish;
+  for (let i = 0; i < 40 && !finish; i++) {
+    await settle(100);
+    finish = moshiFrames.slice(before).find((f) => f.category === 'task_complete');
+  }
+  assert.ok(finish, 'expected a task_complete envelope on the real finish');
+  assert.match(finish.message, /fix login bug/);
+
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(400);
+  assert.equal(moshiFrames.slice(before).filter((f) => f.category === 'task_complete').length, 1, 'a settled session never re-notifies');
 });
 
 test('enabled: a lineage child session stays out of Moshi', async () => {

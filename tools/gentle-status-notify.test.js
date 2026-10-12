@@ -20,9 +20,11 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const DAEMON = path.join(REPO_ROOT, 'bin', 'gentle-status.js');
 const contract = require('../lib/gentle-tokens.js');
 
-const EXPECTED_TITLE = 'Gentle needs response';
+// No daemon toast copy remains: the daemon emits no desktop notification
+// for any display (native Herdr attention owns ask + finish); the tests
+// below pin that silence. Moshi copy lives in the extension and is pinned
+// by tools/gentle-moshi-integration.test.js.
 const PROJECT_NAME = 'myproj';
-const EXPECTED_BODY = `${PROJECT_NAME} needs your input. Return to Pi to respond.`;
 
 const FAKE_HERDR = `#!/bin/sh
 # Fake herdr for notify-copy tests: replays canned agent/pane JSON, logs
@@ -160,92 +162,32 @@ afterEach(() => {
 });
 
 describe('clear intervention copy', () => {
-  it('ask emits the exact private-safe title/body with request sound', () => {
+  it('ask never emits a daemon toast (native owns desktop attention)', () => {
     writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'a'))]);
     runOnce(sandbox);
-    const calls = notificationCalls(sandbox);
-    assert.equal(calls.length, 1);
-    const c = calls[0];
-    assert.equal(c[0], 'notification');
-    assert.equal(c[1], 'show');
-    assert.equal(c[2], EXPECTED_TITLE);
-    assert.equal(c[3], '--body');
-    assert.equal(c[4], EXPECTED_BODY);
-    assert.equal(c[5], '--sound');
-    assert.equal(c[6], 'request');
-    assert.equal(Object.keys(c).length, 7);
-  });
-
-  it('ask body names the project from the workspace group', () => {
-    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'd'), { group: 'raguard' })]);
     runOnce(sandbox);
-    const calls = notificationCalls(sandbox);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0][2], EXPECTED_TITLE);
-    assert.equal(calls[0][4], 'raguard needs your input. Return to Pi to respond.');
+    assert.equal(notificationCalls(sandbox).length, 0);
   });
 
-  it('ask falls back to Gentle when no project name is available', () => {
-    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'e'), { group: null, cwd: null })]);
+  it('ask stays silent for any project name, including hostile input', () => {
+    writeAgents(sandbox, [
+      askEntry(sandbox, sessionPath(sandbox, 'd'), { group: 'raguard' }),
+      askEntry(sandbox, sessionPath(sandbox, 'e'), { group: null, cwd: null }),
+      askEntry(sandbox, sessionPath(sandbox, 'f'), { group: 'bad\nname\tx$(id)' }),
+    ]);
     runOnce(sandbox);
-    const calls = notificationCalls(sandbox);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0][2], EXPECTED_TITLE);
-    assert.equal(calls[0][4], 'Gentle needs your input. Return to Pi to respond.');
-  });
-
-  it('a hostile project name cannot inject argv or control characters', () => {
-    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'f'), { group: 'bad\nname\tx$(id)' })]);
     runOnce(sandbox);
-    const calls = notificationCalls(sandbox);
-    assert.equal(calls.length, 1);
-    assert.equal(Object.keys(calls[0]).length, 7);
-    const body = calls[0][4];
-    assert.ok(!/[\x00-\x1f\x7f]/.test(body), `body carries control characters: ${body}`);
-    assert.ok(body.startsWith('badnamex$(id) needs your input.'), body);
+    assert.equal(notificationCalls(sandbox).length, 0);
   });
 
-  it('visible copy carries no ids, paths, or question data', () => {
-    const session = sessionPath(sandbox, 'secret-workspace');
-    const paneId = 'pane-42-secret';
-    const intentId = 'question-99-secret';
-    writeAgents(sandbox, [askEntry(sandbox, session, { paneId, intentId })]);
-    runOnce(sandbox);
-    const calls = notificationCalls(sandbox);
-    assert.equal(calls.length, 1);
-    const visible = `${calls[0][2]}\n${calls[0][4]}`;
-    assert.equal(visible, `${EXPECTED_TITLE}\n${EXPECTED_BODY}`);
-    for (const secret of [paneId, intentId, session, 'secret', 'question-99']) {
-      assert.ok(!visible.includes(secret), `visible copy leaks ${secret}`);
-    }
-    const hash = contract.expectedSessionHash({ agent_session: { agent: 'pi', kind: 'path', value: session } });
-    assert.ok(!visible.includes(hash));
-  });
-
-  it('one notification per intent across frames; new intent re-arms', () => {
+  it('ask stays silent across frames and intents (no re-arm toast)', () => {
     const session = sessionPath(sandbox, 'b');
     writeAgents(sandbox, [askEntry(sandbox, session, { intentId: 'q1' })]);
     runOnce(sandbox);
     runOnce(sandbox);
-    assert.equal(notificationCalls(sandbox).length, 1);
     writeAgents(sandbox, [askEntry(sandbox, session, { intentId: 'q2' })]);
     runOnce(sandbox);
-    const calls = notificationCalls(sandbox);
-    assert.equal(calls.length, 2);
-    assert.equal(calls[1][2], EXPECTED_TITLE);
-    assert.equal(calls[1][4], EXPECTED_BODY);
-  });
-
-  it('failed send retries on the next frame', () => {
-    const session = sessionPath(sandbox, 'c');
-    writeAgents(sandbox, [askEntry(sandbox, session, { intentId: 'q1' })]);
-    fs.writeFileSync(sandbox.failFile, '1\n');
-    runOnce(sandbox, { FAIL_ONCE: '1' });
-    assert.equal(notificationCalls(sandbox).length, 1);
-    runOnce(sandbox, { FAIL_ONCE: '1' });
-    assert.equal(notificationCalls(sandbox).length, 2);
-    runOnce(sandbox, { FAIL_ONCE: '1' });
-    assert.equal(notificationCalls(sandbox).length, 2);
+    assert.equal(notificationCalls(sandbox).length, 0);
   });
 
   it('review and error never emit a daemon toast', () => {
@@ -366,134 +308,4 @@ describe('adaptive poll (P1)', () => {
   });
 });
 
-describe('non-blocking notify (P2)', () => {
-  // Slow-fake: notification send sleeps SLOW_S seconds while metadata
-  // publishes return immediately. Timestamped events prove publishes land
-  // while a send is still in flight (no head-of-line blocking).
-  const FAKE_SLOW = `#!/bin/sh
-if [ "$1" = "notification" ] && [ "$2" = "show" ]; then
-  printf 'NOTIFY_START %s\\n' "$(date +%s%N)" >>"$NOTIFY_LOG"
-  sleep "\${SLOW_S:-2}"
-  printf -- '---CALL---\\n' >>"$NOTIFY_LOG"
-  i=0
-  for a in "$@"; do printf 'arg%s=<%s>\\n' "$i" "$a" >>"$NOTIFY_LOG"; i=$((i+1)); done
-  if [ -n "$FAIL_FILE" ] && [ -f "$FAIL_FILE" ]; then
-    remaining=$(cat "$FAIL_FILE")
-    if [ "$remaining" -gt 0 ]; then
-      printf '%s\\n' "$((remaining - 1))" >"$FAIL_FILE"
-      printf 'NOTIFY_END %s\\n' "$(date +%s%N)" >>"$NOTIFY_LOG"
-      exit 1
-    fi
-  fi
-  printf 'NOTIFY_END %s\\n' "$(date +%s%N)" >>"$NOTIFY_LOG"
-  exit 0
-fi
-if [ "$1" = "agent" ] && [ "$2" = "list" ]; then
-  cat "$AGENTS_FILE"
-  exit 0
-fi
-if [ "$1" = "pane" ] && [ "$2" = "list" ]; then
-  printf '{"result":{"panes":[]}}\\n'
-  exit 0
-fi
-if [ "$1" = "pane" ] && [ "$2" = "report-metadata" ]; then
-  printf 'META %s %s\\n' "$(date +%s%N)" "$3" >>"$NOTIFY_LOG"
-  printf '{"ok":true}\\n'
-  exit 0
-fi
-echo "fake-herdr: unknown command $*" >&2
-exit 1
-`;
-  function useSlowFake(sb) {
-    fs.writeFileSync(sb.fake, FAKE_SLOW, { mode: 0o755 });
-  }
-  function readTimeline(sb) {
-    const raw = fs.readFileSync(sb.notifyLog, 'utf8');
-    const starts = [];
-    const ends = [];
-    const metas = [];
-    for (const line of raw.split('\n')) {
-      let m = /^NOTIFY_START (\d+)$/.exec(line);
-      if (m) { starts.push(BigInt(m[1])); continue; }
-      m = /^NOTIFY_END (\d+)$/.exec(line);
-      if (m) { ends.push(BigInt(m[1])); continue; }
-      m = /^META (\d+) (\S+)$/.exec(line);
-      if (m) metas.push({ at: BigInt(m[1]), pane: m[2] });
-    }
-    return { starts, ends, metas };
-  }
-  function readLedger(sb) {
-    return JSON.parse(fs.readFileSync(path.join(sb.stateDir, 'gentle-status-notified.json'), 'utf8'));
-  }
-  function idleEntry(sb, session, paneId) {
-    const entry = {
-      pane_id: paneId,
-      agent_session: { agent: 'pi', kind: 'path', value: session },
-      agent_status: 'idle',
-      group: 'myproj',
-      cwd: sb.workDir,
-      foreground_cwd: sb.workDir,
-      tokens: {},
-    };
-    const hash = contract.expectedSessionHash(entry);
-    entry.tokens.gentle_work_v1 = `${hash}:0:${Date.now() + 30000}`;
-    return entry;
-  }
-  it('slow send never head-of-line blocks sibling pane metadata', () => {
-    useSlowFake(sandbox);
-    const s1 = sessionPath(sandbox, 'p2-a');
-    const s2 = sessionPath(sandbox, 'p2-b');
-    writeAgents(sandbox, [
-      askEntry(sandbox, s1, { paneId: 'pane-1', intentId: 'q1' }),
-      askEntry(sandbox, s2, { paneId: 'pane-2', intentId: 'q1' }),
-    ]);
-    runOnce(sandbox, { SLOW_S: '2' });
-    assert.equal(notificationCalls(sandbox).length, 2);
-    const tl = readTimeline(sandbox);
-    assert.equal(tl.ends.length, 2);
-    assert.ok(tl.metas.length >= 2, `expected sibling METAs, got ${tl.metas.length}`);
-    const firstEnd = tl.ends[0] < tl.ends[1] ? tl.ends[0] : tl.ends[1];
-    for (const meta of tl.metas) {
-      assert.ok(meta.at < firstEnd, `pane ${meta.pane} metadata published only after slow send finished`);
-    }
-    assert.equal(Object.keys(readLedger(sandbox)).length, 2);
-  });
-  it('two intents in one slow frame each notify once; next frame silent', () => {
-    useSlowFake(sandbox);
-    const s1 = sessionPath(sandbox, 'p2-c');
-    const s2 = sessionPath(sandbox, 'p2-d');
-    writeAgents(sandbox, [
-      askEntry(sandbox, s1, { paneId: 'pane-1', intentId: 'q1' }),
-      askEntry(sandbox, s2, { paneId: 'pane-2', intentId: 'q9' }),
-    ]);
-    runOnce(sandbox, { SLOW_S: '1' });
-    assert.equal(notificationCalls(sandbox).length, 2);
-    assert.equal(Object.keys(readLedger(sandbox)).length, 2);
-    runOnce(sandbox, { SLOW_S: '1' });
-    assert.equal(notificationCalls(sandbox).length, 2);
-  });
-  it('slow failed send still publishes siblings and retries next frame', () => {
-    useSlowFake(sandbox);
-    const sAsk = sessionPath(sandbox, 'p2-e');
-    const sIdle = sessionPath(sandbox, 'p2-f');
-    writeAgents(sandbox, [
-      askEntry(sandbox, sAsk, { paneId: 'pane-ask', intentId: 'q1' }),
-      idleEntry(sandbox, sIdle, 'pane-idle'),
-    ]);
-    fs.writeFileSync(sandbox.failFile, '1\n');
-    runOnce(sandbox, { SLOW_S: '2', FAIL_ONCE: '1' });
-    assert.equal(notificationCalls(sandbox).length, 1);
-    const first = readTimeline(sandbox);
-    assert.equal(first.ends.length, 1);
-    assert.ok(first.metas.length >= 1, 'sibling metadata missing on failed-send frame');
-    for (const meta of first.metas) {
-      assert.ok(meta.at < first.ends[0], 'sibling metadata blocked behind failed slow send');
-    }
-    assert.ok(!fs.existsSync(path.join(sandbox.stateDir, 'gentle-status-notified.json')));
-    runOnce(sandbox, { SLOW_S: '1', FAIL_ONCE: '1' });
-    assert.equal(notificationCalls(sandbox).length, 2);
-    assert.equal(Object.keys(readLedger(sandbox)).length, 1);
-    runOnce(sandbox, { SLOW_S: '1', FAIL_ONCE: '1' });
-    assert.equal(notificationCalls(sandbox).length, 2);
-  });
-});
+
