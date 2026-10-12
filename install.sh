@@ -28,8 +28,11 @@
 #      agent dir and records a SHA-256 ownership record.
 #   7. Backs up a conflicting/modified destination before replacing it.
 #   8. Runs configure --apply/--check offline, best-effort server reload,
-#      best-effort daemon ensure. Warns without rolling back on best-effort
-#      failures.
+#      then restarts the daemon (--stop handover sweep + ensure) so the new
+#      bin takes effect. The daemon loads its code once at spawn: an
+#      already-running process keeps serving the previous release after an
+#      update (stale ask/review toasts beside native attention). Warns
+#      without rolling back on best-effort failures.
 #
 # Environment overrides (for isolated tests / local use):
 #   HERDR_BIN_PATH            herdr binary (default: herdr from PATH)
@@ -602,7 +605,7 @@ EOF
   printf '%s\n' "$SRC_SUM" >"$TMP_STATE" || die "could not stage installer state"
   mv "$TMP_STATE" "$STATE_FILE" || die "could not record installer state"
 
-  # 10. Offline configure + verify, then best-effort reload + daemon ensure.
+  # 10. Offline configure + verify, then best-effort reload + daemon restart.
   [ -f "$CONFIGURE" ] || die "plugin configure script missing: $CONFIGURE"
   node "$CONFIGURE" --apply || die "configure --apply failed"
   node "$CONFIGURE" --check || die "configure --check failed (applied but not current)"
@@ -615,8 +618,20 @@ EOF
   fi
 
   if [ -f "$STATUS_BIN" ]; then
+    # Restart, not just ensure: the daemon loads its code once at spawn, so
+    # an already-running process would keep serving the previous release
+    # after this update (stale ask/review toasts beside native attention).
+    # --stop is a scoped handover sweep (owned tokens only, live panes keep
+    # their last frame until the successor republishes); ensure then spawns
+    # the current bin detached. Both best-effort: a missing daemon or a
+    # failed sweep must not fail the install.
+    if node "$STATUS_BIN" --stop >/dev/null 2>&1; then
+      info "stopped previous daemon"
+    else
+      warn "daemon --stop failed or no daemon was running; continuing with ensure"
+    fi
     if node "$STATUS_BIN" >/dev/null 2>&1; then
-      info "daemon ensured"
+      info "daemon restarted"
     else
       warn "daemon ensure via gentle-status.js failed; continuing (install and config are complete)"
     fi

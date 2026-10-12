@@ -331,9 +331,22 @@ describe('install.sh isolated behavior', () => {
     const order = readLog(fx.orderLog);
     assert.ok(order.indexOf('configure --apply') !== -1 && order.indexOf('configure --check') !== -1);
     assert.ok(order.indexOf('configure --apply') < order.indexOf('configure --check'));
-    assert.match(readLog(fx.statusLog), /^$/m, 'daemon ensure is invoked with no args');
+    const statusLines = readLog(fx.statusLog).split('\n');
+    assert.equal(statusLines[0], '--stop', 'daemon restart begins with --stop, so a stale process never survives an update');
+    assert.equal(statusLines[1], '', 'daemon ensure follows with no args');
+    assert.match(r.stdout, /daemon restarted/);
     assert.match(r.stdout, /\/reload/);
     assert.equal(backupsBeside(fx.dest).length, 0, 'fresh install creates no backup');
+  });
+
+  it('daemon restart tolerates a failed --stop and still ensures', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_STATUS_FAIL: '1' } });
+    const r = run([], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    const statusLines = readLog(fx.statusLog).split('\n');
+    assert.equal(statusLines[0], '--stop');
+    assert.equal(statusLines[1], '');
+    assert.match(r.stderr, /daemon/);
   });
 
   it('custom --ref is passed through to plugin install', (t) => {
