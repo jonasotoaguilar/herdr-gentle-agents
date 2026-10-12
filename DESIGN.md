@@ -559,13 +559,56 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   stays in-flow/native; `error` is visible as sidebar state (native `blocked`
   attention on `herdr:blocked` already fires per E9 — the plugin adds no
   second toast path).
+- Optional Moshi replacement (off by default): `/herdr-gentle:moshi` —
+  registered by the producer extension, which owns the flag file
+  `gentle-moshi.json` in the plugin state root — takes `enable` / `disable` /
+  `status` (no argument opens a selector with those three options). With it
+  on, the producer extension replaces the Moshi-managed Pi hook entirely: it
+  speaks the same wire protocol (category-less `session.update` carriers plus
+  categorized events over the Moshi daemon socket), so Chat View, Live
+  Activity, the session row, the terminal context and Moshi's own approval
+  routing keep working, while notifications follow this plugin's policy —
+  `approval_required` once per real ask episode (`actionId` = the same
+  `intentId` the Herdr toast uses, subtitle `Answer in terminal`) and
+  `task_complete` once per real finish (the native transition into `idle`:
+  settled plus zero running/queued plus zero pending plus zero live
+  background jobs plus no human wait),
+  never per prompt and never per turn. A `session.closed` (`session_ended`)
+  envelope closes the row on shutdown, and the host-awaited handler flushes
+  in-flight sends. Copy is the same fixed private-safe text as the Herdr
+  toast: project name only, never pane/intent ids, session material, paths or
+  prompt content. Lineage child sessions (transcript header
+  `parentSession`/`parentSessionId`) are never published. Enabling mid-session
+  still opens the row: the carrier is sent on demand, once per session.
+  `enable`/`disable` also add/remove the `-extensions/moshi-hooks.ts` entry
+  in the Pi `settings.json` `extensions` list so the original hook cannot
+  notify in parallel (and is restored on disable); both settings edits happen
+  only while `extensions/moshi-hooks.ts` exists, preserve every other key and
+  entry, write atomically, and fail closed on an unreadable or invalid
+  settings file (reported, never rewritten). The consumer daemon never
+  publishes to Moshi (single emitter). Moshi owns pairing and credentials
+  (host secret in its own store); the plugin never reads or stores a token,
+  and an absent daemon or unpaired host is a silent no-op that never
+  interrupts Pi. `review` and `error` never notify. Limits (host-owned,
+  unverified): the phone-side approval round-trip through Moshi's TUI bridge,
+  the Live Activity lifecycle, and whether a `task_complete` renders as a
+  separate banner or only updates a running Live Activity are Moshi's.
 - Lease: a notified intent is recorded with the token `expiry`; if the pane
   stays `ask` past TTL and re-asserts the same intent with a fresh expiry,
   the consumer treats it as continuation (silent), not a new transition.
 - CLI syntax and any Herdr-side dedup guarantees are unresolved (§10 U1);
   until resolved, the consumer-side transition gate above is the normative
   dedup mechanism.
-- Always-on native owner (no opt-in flag): the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq, serial latest-wins coalesced queue, bounded retries; never `done`/`finished`, never a notification method). Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus no human-wait prompt; settle-with-delegates/pending stays `working`, emitted once with no re-emit on repeat settles); `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Single publisher by design: the managed native extension file is excluded
+- Always-on native owner (no opt-in flag): the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq seeded from the clock as
+`Date.now() * 1000` exactly like Herdr's own plugin SDK, serial latest-wins
+coalesced queue, bounded retries; never `done`/`finished`, never a
+notification method). The clock seed is load-bearing: Herdr ignores a report
+whose `seq` loses to the stored one, so a zero-based counter makes every
+report after a Pi restart or `/new` (both recreate the extension runtime)
+lose, freezing the pane's `agent_session` binding at the old session while
+the producer keeps beating for the new one — the consumer then rejects those
+fresh tokens as a session-hash mismatch and the pane stays on `idle` until a
+report with a higher seq lands. Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once with no re-emit on repeat settles). Live background jobs come from Gentle Shell's own bus event `gentle-ai:jobs-sidebar` (`bash_background` / `monitor`), session-scoped; an absent Gentle Shell simply reports none (today's behavior). `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Single publisher by design: the managed native extension file is excluded
   reversibly (`-extensions/herdr-agent-state.ts` in Pi settings, bytes
   preserved on disk, never auto-loaded next to ours) — never reinstall the
   native publisher from Herdr for the same pane (dual publishers collide). Limits (unverified, host-owned): the host `idle`->`done`->`finished` mapping (finished text, toast/sound) and unknown-state handling are owned by Herdr.

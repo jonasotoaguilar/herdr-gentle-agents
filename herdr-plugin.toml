@@ -1,6 +1,6 @@
 id = "herdr-gentle-agents"
 name = "Herdr Gentle Agents"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.9.0"
 description = "Herdr sidebar states for Pi + Gentle Shell agents: oldest running role (explorer, worker, verify, judge) with total count in parentheses only when above one, ask, review, blocked, done, idle, plus exact +N/-N SessionChanges segments and ↑N behind-upstream marker."
 platforms = ["linux"]

@@ -385,9 +385,16 @@ function askProjectName(entry) {
   return 'Gentle';
 }
 
-function notifyAskAsync(paneId, intentId, project, timeoutMs = CLI_TIMEOUT_MS) {
+// Shared notification copy (DESIGN §7). One place builds the strings so the
+// Herdr toast names the snapshot's validated workspace/group name only,
+// sanitized and bounded by askProjectName, failing closed to `Gentle`.
+function askNotifyCopy(project) {
   const projectName = typeof project === 'string' && project.length > 0 ? project : 'Gentle';
-  const body = `${projectName} needs your input. Return to Pi to respond.`;
+  return { title: 'Gentle needs response', body: `${projectName} needs your input. Return to Pi to respond.` };
+}
+
+function notifyAskAsync(paneId, intentId, project, timeoutMs = CLI_TIMEOUT_MS) {
+  const copy = askNotifyCopy(project);
   return new Promise((resolve) => {
     let settled = false;
     let child = null;
@@ -410,7 +417,7 @@ function notifyAskAsync(paneId, intentId, project, timeoutMs = CLI_TIMEOUT_MS) {
     try {
       child = spawn(
         binary(),
-        ['notification', 'show', 'Gentle needs response', '--body', body, '--sound', 'request'],
+        ['notification', 'show', copy.title, '--body', copy.body, '--sound', 'request'],
         { windowsHide: true, stdio: 'ignore' },
       );
     } catch {
