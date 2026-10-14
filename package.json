@@ -23,7 +23,8 @@
   ],
   "pi": {
     "extensions": [
-      "./extensions/gentle-herdr-state.ts"
+      "./extensions/gentle-herdr-state.ts",
+      "./extensions/gentle-worktree-tools.ts"
     ]
   }
 }
