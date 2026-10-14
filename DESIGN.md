@@ -50,8 +50,9 @@ explicitly in §10 and are not decided here.
 
 ### Non-goals (tasks 5–8 scope excluded — all shipped since Task 4)
 
-- Task-5+ scope (now shipped: `herdr-plugin.toml`, `README.md`,
-  `extensions/` producer, `bin/` consumer, directory scaffold) was
+- Task-5+ scope (now shipped: `herdr-plugin/herdr-plugin.toml`, `README.md`,
+  the `extensions/` producer, the `herdr-plugin/bin/` + `herdr-plugin/lib/`
+  consumer, directory scaffold) was
   excluded from the Task-4 design pass, not from the repo.
 - No fork or modification of `herdr-pi-tree`; no edit of
   `~/.pi/agent/extensions/herdr-agent-state.ts`.
@@ -309,7 +310,7 @@ gentle_review_v1      = sessionHash ":" reviewId ":" expiry
                     ; emitted on every beat while acknowledged capture/group
                     ; execution is in flight, null (clear) otherwise; silent
                     ; working natively, never a notification (full def:
-                    ; extensions/gentle-herdr-state.ts, lib/gentle-tokens.js)
+                    ; extensions/gentle-herdr-state.ts, herdr-plugin/lib/gentle-tokens.js)
 herdr:blocked     = "ask:" intentId / "review:" reviewId / "error:" code
 ```
 
@@ -691,6 +692,22 @@ report with a higher seq lands. Parity contract: `working` carries the specific 
   require a new token version suffix (`_v2`) with a dual-emit period; old
   names are removed only after observed zero-read evidence. Token-name
   versioning (not sidebar-config versioning) is the compatibility mechanism.
+- Packaging (two-package split): the repository ships two independently
+  versioned packages — the Pi package at the repository root (published to
+  npm as `@jonasotoaguilar/herdr-gentle-agents`, installed with
+  `pi install`, updated with `pi update --extensions`) and the Herdr plugin
+  in `herdr-plugin/` (installed with `herdr plugin install
+  jonasotoaguilar/herdr-gentle-agents/herdr-plugin`, updated with
+  `herdr plugin update herdr-gentle-agents`). Releases run on two tag
+  series, `pi-vX.Y.Z` and `herdr-vX.Y.Z`; the Herdr side is not bumped when
+  it carries no change. The old managed-copy install (the installer copying
+  `extensions/gentle-herdr-state.ts` into the Pi agent dir) is retired: the
+  installer installs both packages and migrates an owned legacy copy aside.
+  Ownership split: the Pi package owns the Pi-side helpers (the extension,
+  the exclusion helper, the sidebar bridge); the Herdr plugin owns the
+  runtime Herdr consumes (manifest, daemon, configure, diagnostics, token
+  contract). Cross-package calls resolve the installed plugin root through
+  `herdr plugin list --json`, never through a repo-relative path.
 
 ## 10. Unresolved decisions (do not implement against guesses)
 

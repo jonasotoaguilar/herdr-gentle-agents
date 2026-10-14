@@ -39,15 +39,26 @@ and compact `+N` / `-N` change segments in one row per pane.
 
 ## Quick Start
 
-Prerequisites: Linux, Node >= 18, Herdr meeting `min_herdr_version` in `herdr-plugin.toml`, and
+Prerequisites: Linux, Node >= 18, Herdr meeting `min_herdr_version` in
+`herdr-plugin/herdr-plugin.toml`, and
 `herdr-pi-tree` installed (it stays installed but disabled for gentle-owned
 panes).
 
-One script installs both halves: the Herdr plugin
-plus a managed copy of `extensions/gentle-herdr-state.ts` at
-`~/.pi/agent/extensions/gentle-herdr-state.ts`.
+One script installs two packages: the Herdr plugin (`herdr-plugin/`,
+installed with `herdr plugin install
+jonasotoaguilar/herdr-gentle-agents/herdr-plugin`) and the Pi package (the
+repository root, published to npm as `@jonasotoaguilar/herdr-gentle-agents`
+with the `pi-package` keyword, installed with `pi install`). The two
+packages version independently and release from two tag series —
+`pi-vX.Y.Z` (npm publish) and `herdr-vX.Y.Z` (GitHub Release with the
+`install.sh` and `install.sh.sha256` assets) — so either side may lag the
+other; the Herdr side is not bumped when it carries no change.
 
-The stable entrypoint always resolves to the newest release, while each
+Installer usage:
+`install.sh [--ref REF] [--pi-source auto|npm|git] [--allow-downgrade] [--uninstall] [--help]`
+
+The stable entrypoint always resolves to the newest `herdr-vX.Y.Z` release,
+while each
 release freezes its uploaded asset bytes — the URL moves forward, the bytes
 it served for a given release never change.
 
@@ -61,25 +72,33 @@ handles credentials.
 curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh
 ```
 
-With no `--ref` the installer resolves the newest release tag automatically.
+With no `--ref` the installer resolves the newest `herdr-vX.Y.Z` release tag automatically.
 
 ### Pinned install (explicit tag)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/v0.2.0/install.sh | sh -s -- --ref v0.2.0
+curl -fsSL https://raw.githubusercontent.com/jonasotoaguilar/herdr-gentle-agents/herdr-v0.4.0/install.sh | sh -s -- --ref herdr-v0.4.0
 ```
 
-Pass `--ref <tag>` to pin an older release instead of following latest.
+Pass `--ref <tag>` to pin an older `herdr-vX.Y.Z` release instead of following latest.
 
 What the installer does:
 
-- Installs and enables the Herdr plugin at the resolved `--ref` (the newest
-  release when `--ref` is omitted).
-- Atomically copies `extensions/gentle-herdr-state.ts` from the Herdr-managed
-  checkout into `~/.pi/agent/extensions/gentle-herdr-state.ts` (temp file plus
-  rename) with a SHA-256 ownership record. A conflicting destination — including
-  a locally modified managed copy, symlink, directory, or special file — is moved
-  aside to a timestamped backup, never silently destroyed.
+- Installs and enables the Herdr plugin from the `herdr-plugin/`
+  subdirectory at the resolved `--ref` (the newest `herdr-vX.Y.Z` release
+  when `--ref` is omitted).
+- Installs the Pi package with `pi install`. `--pi-source` selects the
+  source: `npm` installs `npm:@jonasotoaguilar/herdr-gentle-agents`, `git`
+  installs `git:github.com/jonasotoaguilar/herdr-gentle-agents`, and `auto`
+  (the default) uses npm when the package resolves on the registry and
+  otherwise falls back to git with a warning — so an install before the
+  first published npm version still converges through the git source.
+- Migrates an owned legacy managed copy away instead of refreshing it in
+  place: a previous install's `~/.pi/agent/extensions/gentle-herdr-state.ts`
+  is moved aside to a timestamped backup, never silently destroyed. The
+  managed-copy layout is retired; a conflicting destination — including a
+  locally modified copy, symlink, directory, or special file — is likewise
+  moved aside, never deleted.
 - Records the non-destructive force-exclusion `-extensions/herdr-agent-state.ts`
   in the global Pi settings (`~/.pi/agent/settings.json`, or `$PI_AGENT_DIR`
   when overridden) so the managed native base file stays on disk but is never
@@ -89,8 +108,8 @@ What the installer does:
   file). Ownership is a bound record (exact entry plus canonical settings
   path): if the record cannot be written, the settings change is rolled back
   byte-identical, and if a later install step fails the exclusion is rolled
-  back best-effort so the base is not left disabled with no replacement (a
-  managed copy already written stays in place — re-run install to converge).
+  back best-effort so the base is not left disabled with no replacement (an
+  already-installed Pi package stays in place — re-run install to converge).
   Symlinked settings are updated atomically through the link with the link and
   mode preserved; fresh files are created 0600. Four limits: running Pi
   sessions still need `/reload` (or a restart) for the exclusion to take
@@ -98,59 +117,80 @@ What the installer does:
   file for that project; a rollback that itself fails says so instead of
   claiming success; two agent dirs sharing one state dir fail closed on the
   second install — separate `XDG_STATE_HOME` or remove the stale record.
-- Runs the managed Herdr sidebar `configure --apply` plus `--check`, then best-effort
-  `herdr server reload-config` and best-effort daemon ensure via `bin/gentle-status.js`.
+- Runs the installed plugin's Herdr sidebar `configure --apply` plus `--check`, then best-effort
+  `herdr server reload-config` and best-effort daemon ensure via the installed
+  plugin's `bin/gentle-status.js`.
   Best-effort reload/daemon failures warn without rolling back the completed install
   and config. The `configure` action itself only writes the managed Herdr sidebar
   block described below.
 - Running Pi sessions still need `/reload` (or a restart) to pick up the updated extension.
 
+Environment overrides: `HERDR_BIN_PATH`, `PI_BIN_PATH`, `NPM_BIN_PATH`,
+`PI_AGENT_DIR`, `XDG_STATE_HOME`, `HERDR_GENTLE_PLUGIN_ROOT`,
+`HERDR_GENTLE_PI_SOURCE` (same values as `--pi-source`), and
+`HERDR_GENTLE_LATEST_URL` (release lookup for newest-tag resolution).
+
+### Migration from a managed copy (pre-split installs)
+
+The pre-split installer refreshed a managed copy of
+`extensions/gentle-herdr-state.ts` inside the Pi agent dir; that layout is
+retired. The first two-package install migrates it: an owned legacy copy is
+moved aside to a timestamped backup (a locally modified copy is preserved
+with a warning, never deleted), the Pi package takes over the extension,
+and the ownership-bound exclusion entry is kept. Nothing needs doing by
+hand — re-run the installer to converge.
+
 ### Local development
 
-Point Herdr at this checkout (from this directory). `herdr plugin link`
-only registers this directory; it runs no build.
+Point Herdr at this checkout's plugin subdirectory (from this directory).
+`herdr plugin link` only registers the directory; it runs no build.
 
 ```sh
-herdr plugin link --enabled .
+herdr plugin link --enabled ./herdr-plugin
 herdr plugin action invoke configure --plugin herdr-gentle-agents
 ```
 
-Then run `/reload` in Pi to pick up the local package.
+The repository root is the Pi package (`@jonasotoaguilar/herdr-gentle-agents`)
+and `herdr-plugin/` is the Herdr plugin. Then run `/reload` in Pi to pick up
+the local package.
 
 For isolated/local use the installer honors a `PI_AGENT_DIR` override (default
 `$HOME/.pi/agent`) without touching the live Pi dir, e.g.
-`PI_AGENT_DIR=/tmp/pi-agent-test sh install.sh --ref v0.2.0`. Do not use
-`pi install` as the production path for this installer — the managed copy at
-`~/.pi/agent/extensions/gentle-herdr-state.ts` is the supported Pi half.
+`PI_AGENT_DIR=/tmp/pi-agent-test sh install.sh --ref herdr-v0.4.0`.
 
 ### Update
 
-Re-run the same command — no tag lookup needed:
+The two packages update independently. The Pi package updates with:
 
 ```sh
-curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh
+pi update --extensions
 ```
 
-The installer compares the installed plugin version with the resolved target:
-an older install updates, an already-current install is a no-op, and a newer
-installed version aborts naming both versions unless `--allow-downgrade` is
-given:
+and the Herdr plugin updates with:
 
 ```sh
-curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh -s -- --allow-downgrade
+herdr plugin update herdr-gentle-agents
 ```
 
-A modified managed Pi copy is backed up before replacement, same as on install.
+To move the Herdr side to an explicitly older `herdr-vX.Y.Z` release, pass
+`--ref` with `--allow-downgrade`:
+
+```sh
+curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh -s -- --ref herdr-vX.Y.Z --allow-downgrade
+```
+
+Without `--allow-downgrade`, installing an older Herdr version than the
+installed one aborts naming both versions.
 
 If the installed plugin is locally linked, the remote install replaces it
 automatically and warns naming the plugin id; to restore a checkout afterwards
 re-link it:
 
 ```sh
-herdr plugin link --enabled .
+herdr plugin link --enabled ./herdr-plugin
 ```
 
-`--force` is deprecated and a no-op kept only so commands documented in v0.1.1
+`--force` is deprecated and a no-op kept only so older documented commands
 keep working; use `--allow-downgrade` for downgrades instead.
 
 ### Removal
@@ -159,14 +199,23 @@ keep working; use `--allow-downgrade` for downgrades instead.
 curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh -s -- --uninstall
 ```
 
-Uninstall runs `configure --uninstall`, best-effort daemon `--stop --purge` and
-`herdr server reload-config`, then removes the Herdr plugin. The managed Pi copy
+Uninstall runs the installed plugin's `configure --uninstall`, best-effort daemon `--stop --purge` and
+`herdr server reload-config`, then removes both packages (the Herdr plugin and
+the Pi package), the owned native-extension exclusion entry, and the installer
+state. A legacy managed Pi copy
 is ownership-checked: a locally modified `~/.pi/agent/extensions/gentle-herdr-state.ts`
 is preserved with a warning, never deleted. The settings exclusion is likewise
 ownership-checked: only the entry this installer added is removed, while a
 pre-existing identical entry and unrelated settings are preserved. A foreign,
 invalid, or misbound ownership record fails closed: uninstall warns, preserves
 the entry, and still removes the plugin.
+
+Path convention used below: `node bin/...` runs from the installed plugin
+root, while `herdr-plugin/bin/...` is a repository location in this checkout.
+`bin/configure.js` lives in the Herdr plugin and is no longer shipped by the
+Pi package: `lib/gentle-sidebar.js` and the extension resolve the installed
+Herdr plugin root through `herdr plugin list --json` (override
+`GENTLE_HERDR_PLUGIN_ROOT` for isolated runs) and run that install's copy.
 
 The `configure` action runs `node bin/configure.js --apply --reload`: it
 appends one marked pi-only `[ui.sidebar.agents.rows_by_agent]` override for
@@ -267,18 +316,18 @@ Errors render as user-facing `blocked`.
 Other agents are unaffected. `--apply` refuses (exit 2, no write) when an
 unmanaged `rows_by_agent` override already exists; remove or rename it, then
 re-run. Writes are atomic (temp file plus rename) with a backup at
-`<config>.herdr-gentle-agents.bak`. The config path resolves exactly like
+`<config>.herdr-gentle-agents.bak`. The config path resolves exactly like the installed plugin's
 `bin/gentle-status.js` (`HERDR_CONFIG_PATH`, then `XDG_CONFIG_HOME`, then
 the platform default).
 
 ### Verification
 
 ```sh
-node --check bin/configure.js
-node --check bin/gentle-status.js
-HERDR_CONFIG_PATH=/tmp/herdr-fixture.toml node bin/configure.js --apply
-HERDR_CONFIG_PATH=/tmp/herdr-fixture.toml node bin/configure.js --check
-HERDR_CONFIG_PATH=/tmp/herdr-fixture.toml node bin/configure.js --uninstall
+node --check herdr-plugin/bin/configure.js
+node --check herdr-plugin/bin/gentle-status.js
+HERDR_CONFIG_PATH=/tmp/herdr-fixture.toml node herdr-plugin/bin/configure.js --apply
+HERDR_CONFIG_PATH=/tmp/herdr-fixture.toml node herdr-plugin/bin/configure.js --check
+HERDR_CONFIG_PATH=/tmp/herdr-fixture.toml node herdr-plugin/bin/configure.js --uninstall
 herdr plugin action invoke configure --plugin herdr-gentle-agents
 herdr server reload-config
 ```
@@ -389,8 +438,8 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
 ## Next Steps
 
 - Ship the Pi producer extension (`extensions/`) and the Herdr consumer daemon
-  (`bin/`); the daemon ships, the sidebar override installs via the
-  `configure` plugin action above.
+  (`herdr-plugin/bin/` plus `herdr-plugin/lib/`); the daemon ships, the sidebar
+  override installs via the `configure` plugin action above.
 - Resolve the open decisions in [DESIGN.md](DESIGN.md) §10 before implementing
   against them.
 - Live sidebar eyeball with subagents/`ask` remains the final acceptance check

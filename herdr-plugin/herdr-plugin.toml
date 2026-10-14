@@ -71,12 +71,14 @@ command = ["node", "bin/gentle-status.js", "--refresh"]
 # platforms/title, observed via `herdr plugin action list`); platforms stays
 # linux-only to match this manifest. No [[build]] hook is wired: the plugin
 # ships no build step, so the supported entrypoint is the combined remote
-# installer `install.sh`, which installs + enables this plugin, atomically copies
-# extensions/gentle-herdr-state.ts into the Pi agent dir, and runs the
+# installer `install.sh`, which installs + enables this plugin, installs the
+# Pi package with `pi install`, migrates an owned legacy managed copy of
+# extensions/gentle-herdr-state.ts aside, and runs the
 # configure action below (public stable example:
 # `curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh`).
-# Local development uses `herdr plugin link --enabled .` followed by the
-# configure action below; the Pi side stays a managed copy, never `pi install`.
+# Local development uses `herdr plugin link --enabled ./herdr-plugin`
+# followed by the configure action below; the Pi side installs with
+# `pi install` (repository root), never as a managed copy.
 [[actions]]
 id = "configure"
 command = ["node", "bin/configure.js", "--apply", "--reload"]

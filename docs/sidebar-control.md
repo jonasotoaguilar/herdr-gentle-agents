@@ -57,7 +57,7 @@ installs keep working with no file). A malformed file is reported, never
 silently treated as enabled, and the disabled producer publishes nothing:
 no gentle tokens, no native `report_agent`/`report_agent_session`
 claims, no `herdr:blocked` labels. The daemon gate and clear live with
-the lifecycle owner (`bin/gentle-status.js`); the producer just stops.
+the lifecycle owner (`herdr-plugin/bin/gentle-status.js`); the producer just stops.
 
 ## Recovery
 
@@ -76,4 +76,4 @@ manually (delete the record or the entry) — the command never adopts it.
 
 `node bin/gentle-sidebar.js (enable|disable|status|toggle)` implements
 the same contract outside Pi via `lib/gentle-sidebar.js` (authoritative
-exclusion helper + `bin/configure.js`, same rollback discipline).
+exclusion helper + the installed plugin's `bin/configure.js`, same rollback discipline).
