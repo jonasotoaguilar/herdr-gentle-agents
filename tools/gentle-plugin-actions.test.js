@@ -142,13 +142,16 @@ afterEach(() => {
   fs.rmSync(sandbox, { recursive: true, force: true });
 });
 
-describe('manifest compatibility floor (S5: min 0.9.4, no release bump)', () => {
+describe('manifest compatibility floor (S5: min 0.9.4)', () => {
   it('requires Herdr >= 0.9.4', () => {
     assert.equal(readManifest().top.min_herdr_version, '0.9.4');
   });
 
-  it('keeps the current plugin version (release not authorized)', () => {
-    assert.equal(readManifest().top.version, '0.3.3');
+  // Release-preflight enforces this lockstep, so pinning a literal version
+  // here would break every release instead of protecting the invariant.
+  it('keeps the manifest version in lockstep with package.json', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'));
+    assert.equal(readManifest().top.version, pkg.version);
   });
 
   it('stays linux-only', () => {
