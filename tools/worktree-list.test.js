@@ -155,9 +155,10 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      // The listing exposes only the real checkout.
-      assert.equal(text, `worktree list: ${live} feat/live thread=thread-1 issues=35`);
-      assert.deepEqual(result.details.worktrees.map((item) => item.path), [live]);
+      // The listing exposes only the real checkout, after the principal line.
+      const branch = git(root, ['branch', '--show-current']);
+      assert.equal(text, `worktree list: ${root} ${branch} principal\nworktree list: ${live} feat/live thread=thread-1 issues=35`);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [root, live]);
       // The pruned path travels in details and in the warning text.
       assert.deepEqual(result.details.pruned, [dead]);
       assert.ok(
@@ -178,7 +179,7 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
     }
   });
 
-  test('all rows dead lists none and empties the registry', async () => {
+  test('all rows dead lists only the principal and empties the agent registry', async () => {
     const root = makeRepo('prune-all');
     setEnv(stdEnv());
     try {
@@ -190,9 +191,12 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       const tools = await loadExtension();
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       assert.equal(result.isError, undefined);
-      assert.equal(resultText(result), 'worktree list: none');
-      assert.deepEqual(result.details.worktrees, []);
-      assert.equal(result.details.count, 0);
+      // S19 retires `worktree list: none`: with no agent worktrees left,
+      // the output is exactly the principal line.
+      const branch = git(root, ['branch', '--show-current']);
+      assert.equal(resultText(result), `worktree list: ${root} ${branch} principal`);
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal']);
+      assert.equal(result.details.count, 1);
       assert.deepEqual([...result.details.pruned].sort(), [first, second].sort());
       const registryLib = require('../lib/worktree-registry.js');
       assert.deepEqual(registryLib.readRegistry(root).worktrees, []);
@@ -249,7 +253,8 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       }
       const text = resultText(result);
       assert.equal(result.isError, undefined, `the listing still succeeds, got: ${text}`);
-      assert.equal(text, `worktree list: ${live} feat/live thread=thread-1 issues=35`);
+      const branch = git(root, ['branch', '--show-current']);
+      assert.equal(text, `worktree list: ${root} ${branch} principal\nworktree list: ${live} feat/live thread=thread-1 issues=35`);
       assert.deepEqual(result.details.pruned, [], 'nothing was pruned');
       assert.ok(result.details.pruneError, 'the write failure travels in details');
       assert.ok(
@@ -282,7 +287,8 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.equal(text, `worktree list: ${realPlain} feat/plain thread=thread-1 issues=35 missing`);
+      const branch = git(root, ['branch', '--show-current']);
+      assert.equal(text, `worktree list: ${root} ${branch} principal\nworktree list: ${realPlain} feat/plain thread=thread-1 issues=35 missing`);
       assert.deepEqual(result.details.pruned, [], 'an existing path is never pruned');
       assert.deepEqual(fs.readFileSync(registryLib.registryPath(root)), beforeBytes, 'registry untouched');
     } finally {
@@ -301,9 +307,11 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       const tools = await loadExtension();
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       assert.equal(result.isError, undefined);
+      const branch = git(root, ['branch', '--show-current']);
       assert.equal(
         resultText(result),
-        `worktree list: ${first} feat/one thread=thread-1 issues=35\n`
+        `worktree list: ${root} ${branch} principal\n`
+        + `worktree list: ${first} feat/one thread=thread-1 issues=35\n`
         + `worktree list: ${second} feat/two thread=thread-2 issues=35,7`,
       );
       assert.deepEqual(result.details.pruned, []);
@@ -466,6 +474,220 @@ describe('H2: one liveness predicate everywhere in the list', { concurrency: fal
       assert.ok(aliasItem, 'the alias row is in details');
       assert.equal(aliasItem.status, 'live');
       assert.deepEqual(result.details.pruned, [], 'nothing is pruned');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S19: principal checkout distinguished, session checkout first', { concurrency: false }, () => {
+  function principalBranch(root) {
+    return git(root, ['branch', '--show-current']);
+  }
+
+  function principalLine(root) {
+    return `worktree list: ${root} ${principalBranch(root)} principal`;
+  }
+
+  function addUnregisteredWorktree(root, branch) {
+    const slug = branch.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'worktree';
+    const target = path.join(path.dirname(root), `${path.basename(root)}-wt-${slug}`);
+    track(target);
+    git(root, ['worktree', 'add', '-b', branch, target, 'HEAD']);
+    return fs.realpathSync(target);
+  }
+
+  test('session in the principal with no agent worktrees: exactly the principal line', async () => {
+    const root = makeRepo('s19-principal-only');
+    setEnv(stdEnv());
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      // The retired `worktree list: none` never appears: the principal line stands alone.
+      assert.equal(text, principalLine(root));
+      assert.deepEqual(result.details.worktrees, [
+        { path: root, branch: principalBranch(root), thread: null, issues: [], status: 'live', kind: 'principal' },
+      ]);
+      assert.equal(result.details.count, 1);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('session in the principal with agent worktrees: principal first, then registry order', async () => {
+    const root = makeRepo('s19-principal-agents');
+    setEnv(stdEnv());
+    try {
+      const first = addRegistered(root, 'feat/one', { thread: 'thread-1', issues: [35] });
+      const second = addRegistered(root, 'feat/two', { thread: 'thread-2', issues: [35, 7] });
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(
+        text,
+        `${principalLine(root)}\n`
+        + `worktree list: ${first} feat/one thread=thread-1 issues=35\n`
+        + `worktree list: ${second} feat/two thread=thread-2 issues=35,7`,
+      );
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal', 'agent', 'agent']);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [root, first, second]);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('session inside a registered worktree: that worktree first, then principal, then the rest', async () => {
+    const root = makeRepo('s19-session-worktree');
+    setEnv(stdEnv());
+    try {
+      const first = addRegistered(root, 'feat/one', { thread: 'thread-1', issues: [35] });
+      const second = addRegistered(root, 'feat/two', { thread: 'thread-2', issues: [35, 7] });
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(second));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(
+        text,
+        `worktree list: ${second} feat/two thread=thread-2 issues=35,7\n`
+        + `${principalLine(root)}\n`
+        + `worktree list: ${first} feat/one thread=thread-1 issues=35`,
+      );
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['agent', 'principal', 'agent']);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [second, root, first]);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('session in an unregistered checkout with all:true: principal first, checkout still unregistered', async () => {
+    const root = makeRepo('s19-session-ghost');
+    setEnv(stdEnv());
+    try {
+      const known = addRegistered(root, 'feat/known', { thread: 'thread-1', issues: [35] });
+      const ghost = addUnregisteredWorktree(root, 'feat/ghost');
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', { all: true }, undefined, undefined, makeCtx(ghost));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(
+        text,
+        `${principalLine(root)}\n`
+        + `worktree list: ${known} feat/known thread=thread-1 issues=35\n`
+        + `worktree list: ${ghost} feat/ghost unregistered`,
+      );
+      const ghostItem = result.details.worktrees.find((item) => item.path === ghost);
+      assert.ok(ghostItem, 'the session checkout is still reported');
+      assert.equal(ghostItem.status, 'unregistered');
+      assert.equal(ghostItem.kind, 'unregistered');
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal', 'agent', 'unregistered']);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('session outside every checkout: the principal is first', async () => {
+    const root = makeRepo('s19-session-outside');
+    setEnv(stdEnv());
+    const gitLib = require('../lib/worktree-git.js');
+    const origIdentity = gitLib.repoIdentity;
+    // The tool context runs outside every checkout while the repository
+    // identity still resolves to the fixture (as it would for a session
+    // whose cwd is not inside any checkout of the repo).
+    gitLib.repoIdentity = () => origIdentity(root);
+    try {
+      const live = addRegistered(root, 'feat/live', { thread: 'thread-1', issues: [35] });
+      const outside = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-list-outside-')));
+
+      const tools = await loadExtension();
+      const ctx = { ...makeCtx(root), cwd: outside };
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(
+        text,
+        `${principalLine(root)}\nworktree list: ${live} feat/live thread=thread-1 issues=35`,
+      );
+    } finally {
+      gitLib.repoIdentity = origIdentity;
+      restoreEnv();
+    }
+  });
+
+  test('the principal is never pruned and never unregistered', async () => {
+    const root = makeRepo('s19-principal-kept');
+    setEnv(stdEnv());
+    try {
+      const live = addRegistered(root, 'feat/live', { thread: 'thread-1', issues: [35] });
+      const dead = addRegistered(root, 'feat/dead', { thread: 'thread-2', issues: [7] });
+      git(root, ['worktree', 'remove', '--force', dead]);
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', { all: true }, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.deepEqual(result.details.pruned, [dead]);
+      assert.ok(!result.details.pruned.includes(root), 'the principal is never pruned');
+      const principalItem = result.details.worktrees.find((item) => item.kind === 'principal');
+      assert.ok(principalItem, 'a principal entry is present');
+      assert.equal(principalItem.path, root);
+      assert.equal(principalItem.status, 'live');
+      assert.ok(!text.split('\n').some((line) => line.startsWith(`worktree list: ${root} `) && line.endsWith(' unregistered')), 'the principal is never unregistered');
+      for (const item of result.details.worktrees) {
+        if (item.path === root) assert.equal(item.kind, 'principal');
+        else if (item.path === live) assert.equal(item.kind, 'agent');
+        else assert.equal(item.kind, 'unregistered', `unexpected kind for ${item.path}`);
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a stale row pruned in the same call leaves the principal line and ordering intact', async () => {
+    const root = makeRepo('s19-prune-order');
+    setEnv(stdEnv());
+    try {
+      const live = addRegistered(root, 'feat/live', { thread: 'thread-1', issues: [35] });
+      const dead = addRegistered(root, 'feat/dead', { thread: 'thread-2', issues: [7] });
+      git(root, ['worktree', 'remove', '--force', dead]);
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(
+        text,
+        `${principalLine(root)}\nworktree list: ${live} feat/live thread=thread-1 issues=35`,
+      );
+      assert.deepEqual(result.details.pruned, [dead]);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('ordering is deterministic: two agent rows keep a stable order across calls', async () => {
+    const root = makeRepo('s19-stable-order');
+    setEnv(stdEnv());
+    try {
+      addRegistered(root, 'feat/one', { thread: 'thread-1', issues: [35] });
+      addRegistered(root, 'feat/two', { thread: 'thread-2', issues: [7] });
+
+      const tools = await loadExtension();
+      const first = await tools.get('worktree_list').execute('c1', {}, undefined, undefined, makeCtx(root));
+      const second = await tools.get('worktree_list').execute('c2', {}, undefined, undefined, makeCtx(root));
+      assert.equal(first.isError, undefined);
+      assert.equal(second.isError, undefined);
+      assert.equal(resultText(first), resultText(second));
+      assert.deepEqual(
+        resultText(first).split('\n'),
+        [principalLine(root), ...resultText(first).split('\n').slice(1)],
+      );
+      assert.equal(resultText(first).split('\n').length, 3);
     } finally {
       restoreEnv();
     }

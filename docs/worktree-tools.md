@@ -23,14 +23,18 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 | Tool | Parameters | Approval | Success text |
 | --- | --- | --- | --- |
 | `worktree_create` | `branch: string` (required), `issues: number[]` (required, at least one) | Prompts via `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`); non-interactive sessions proceed without it, and a refusal mutates nothing | `worktree create: <path>` |
-| `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | One `worktree list: …` line per entry, or `worktree list: none` |
+| `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | The principal line first, then one `worktree list: …` line per agent entry (the session's own checkout first) |
 | `worktree_close` | `path?: string`, `branch?: string` (at least one required), `force?: boolean` | Same `ctx.ui.confirm` gate as create; a refusal keeps checkout and entry | `worktree close: <path>` |
 
 Structured `details` on success:
 
-- create: `{path, branch, issues, created, hooks, warnings, pruned, replacedRows}` — `created`
+- create: `{path, branch, issues, created, branchCreated, hooks, warnings, pruned, replacedRows}` — `created`
   is `false` when the call returned the thread's existing checkout (see
-  per-thread ownership); `pruned` lists the stale git records a
+  per-thread ownership); `branchCreated` is `false` when the worktree
+  adopted an existing branch and `true` when the branch was created with
+  the checkout (see branch adoption); on the adopt path `herdrAssociated`
+  reports whether the best-effort `herdr worktree open` association
+  happened (`true`/`false`, absent on the create path); `pruned` lists the stale git records a
   `git worktree prune` recovery dropped (empty when nothing was stale);
   `replacedRows` lists the stale registry rows dropped by the one-owner-per-path
   rule below (`[{branch, path}]`, empty when nothing shared the target path);
@@ -42,12 +46,15 @@ Structured `details` on success:
   backup could be written, the failure travels as `registryBackupError`
   (best-effort, never fatal). `warnings` carries the hook warnings plus,
   when a same-branch row pointing at a different live checkout was kept,
-  the conflict line naming that checkout.
-- list: `{worktrees: [{path, branch, thread, issues, status}], count,
+  the conflict line naming that checkout; on the adopt path, the adoption
+  line naming the adopted branch (plus the Herdr-association outcome when
+  it failed).
+- list: `{worktrees: [{path, branch, thread, issues, status, kind}], count,
   all, pruned, warnings, pruneError}` — `status` is `live`, `missing`
   (registered and still on disk but no live checkout, or a non-absolute
   path that can never name one), or `unregistered` (only with `all:
-  true`). `pruned` lists the registry paths dropped by the self-heal
+  true`); `kind` is `principal` for the principal checkout, `agent` for a
+  registry row, or `unregistered` (only with `all: true`). `pruned` lists the registry paths dropped by the self-heal
   below (empty when nothing was dead, or when the prune write failed —
   then `pruneError` carries the cause); `warnings` carries the one line
   naming them (see below) and is empty otherwise.
@@ -57,11 +64,31 @@ Structured `details` on success:
 List line format (pinned by the tool tests):
 
 ```text
+worktree list: <principal-path> <branch> principal
 worktree list: <path> <branch> thread=<thread> issues=<n,n[,n...]>
 worktree list: <path> <branch> thread=<thread> issues=<n,n> missing
 worktree list: <path> <branch> unregistered        # only with all: true
-worktree list: none                                 # nothing registered
 ```
+
+The principal checkout (S19) is the main worktree of git's listing — the
+entry whose resolved path equals the main root recovered from the shared
+common dir (`<principal>/.git` is the common dir for a normal
+repository). It is always listed when git's listing names it, printed
+distinguished as `principal` (never with `thread=`/`issues=`), never
+pruned (the registry holds agent rows only), and never reported as
+`unregistered`. When git's listing names no such entry, no principal line
+is invented. `worktree list: none` is retired: with no agent worktrees the
+output is exactly the principal line.
+
+The session's own checkout is the FIRST line, whether that is the
+principal or a registered worktree: the checkout containing or equal to
+the tool context's working directory, deepest match winning, the principal
+as a candidate. A session inside a registered worktree sees that worktree
+(with its `thread=`/`issues=`) first, then the principal, then the
+remaining agent rows in registry order; a session in the principal, in an
+unregistered checkout, or outside every checkout sees the principal first
+(an unregistered session checkout is still reported as `unregistered` with
+`all: true`). The agent-row text is unchanged.
 
 `all: true` appends live checkouts the registry does not know about,
 sorted by path; the caller's own checkout is never listed as
@@ -242,9 +269,22 @@ listing paths) resolve against the repository root.
 The target path flattens the branch into one component
 (`feat/foo-bar` → `feat-foo-bar`) at
 `<repo-parent>/<repo-name>-worktrees/<slug>` (`slugifyBranch` /
-`worktreePath` in `lib/worktree-git.js`). Creation is herdr-first (`herdr
+`worktreePath` in `lib/worktree-git.js`). Branch adoption (S20) is
+resolved BEFORE creating: when `refs/heads/<branch>` already exists (and
+the branch is not checked out at a live checkout — already refused), the
+worktree checks out that EXISTING branch with `git worktree add <path>
+<branch>` — no `-b`, no base, the ref never created, rewritten or deleted
+— and the result reports `branchCreated: false` plus a warning naming the
+adopted branch. Because `herdr worktree create` cannot adopt an existing
+branch, the adopt case goes through git and then associates the Herdr
+workspace best-effort with `herdr worktree open --path <path> --cwd
+<root>` (values as separate elements, like every other backend call);
+whether that association happened travels in `details.herdrAssociated`,
+and the checkout succeeding never depends on herdr. When the ref does not
+exist, creation is herdr-first (`herdr
 worktree create` with fixed argv, values as separate elements because
-herdr rejects `--flag=value`) with a `git worktree add -b` fallback; when
+herdr rejects `--flag=value`) with a `git worktree add -b` fallback and
+reports `branchCreated: true`; when
 the branch ref already exists (the same-branch recovery above) the fallback
 checks the existing branch out at the fresh path instead of failing on
 `-b`. The
@@ -256,12 +296,16 @@ from Herdr JSON. Every external process uses a fixed argv array — no
 shell string is ever built. Issues are verified to exist through `gh
 issue view <n> --json number,title,state` (see limitations).
 
-A non-directory occupant (a file, a FIFO, a dangling symlink) at the target
-path is refused before any backend runs: `target path <path> is occupied by
-a <file|symlink|FIFO|non-directory> (not a directory): remove it by hand and
-retry; the registry was left untouched`. Git's raw `fatal: '<path>' already
-exists` never surfaces, and no registry row is written, so removing the
-occupant lets the next create at the same path succeed.
+A pre-existing entry of ANY kind at the target path — an empty or
+non-empty directory, a file, a FIFO, a symlink, a dangling symlink — is
+refused before any backend runs: `target path <path> is occupied by a
+<kind>: remove it by hand or pick another branch; the registry was left
+untouched`. Git's raw `fatal: '<path>' already exists` never surfaces
+(and the empty directory is refused precisely because git would silently
+adopt it), and no registry row is written, so removing the occupant lets
+the next create at the same path succeed. The single exception is the
+thread's own registered checkout, which the idempotency contract returns
+as `created: false`.
 
 The remaining path decisions share the one predicate (exists AND is a
 directory, realpath identity where identity is the question):
@@ -303,6 +347,18 @@ warning and never aborts the remaining steps.
   layout survives a move.
 - **`codegraph init`** when the CLI is on `PATH` (`skipped` with a reason
   when absent). The tools do not index for you beyond this.
+
+Creation creates NO symlinks (S21, superseding the S8 link requirement):
+no `odd/`, `.agents/`, `.claude/` or any other link is created, and `odd/`
+is no longer created in the principal checkout either — that directory
+existed only to be linked. What remains is unchanged: untracked env
+copies, stack-detected dependency installs, and `codegraph init` when
+available. Two consequences are recorded rather than hidden: the odd
+capture below stays, but a worktree no longer has a reachable `odd/`, so
+it can only associate documents a session reaches by their absolute path
+in the principal; and closing a tool-created checkout still needs `force`
+wherever env copies or a `codegraph init` leave untracked files (a
+checkout with neither closes without `force`).
 
 The principal checkout is recovered from the shared common dir (for a
 normal repository, `<principal>/.git` is the common dir), not assumed
@@ -386,9 +442,12 @@ each call it resolves the touched `.md` path against the principal
 checkout's `odd/` directory and associates it with the worktree of the
 **agent's context** — the invoking context's working directory matched to
 the longest enclosing registry entry — never from the file path itself.
-The indirection is load-bearing: `odd/` is a symlink into the principal
-checkout, so one real path is shared by every worktree and file identity
-cannot tell them apart. A call running in the principal checkout itself
+Since S21 removed the creation symlinks, a worktree no longer has a
+reachable `odd/` of its own: the per-call leg associates `.md` documents
+the session reaches by their absolute path in the principal checkout
+(which still resolves against the shared `odd/` root); the re-scan leg
+below only converges documents when the worktree has an `odd/` directory
+at all (for example recreated by hand). A call running in the principal checkout itself
 associates nothing; associations are idempotent (`addOddDoc` records each
 `odd/<rel>` once, same relative name from every worktree).
 
@@ -406,9 +465,10 @@ attempt.
 - **Closing normally needs `force: true`.** `git worktree remove`
   refuses a checkout containing untracked files or modifications unless
   `--force`, and the creation hooks deliberately create untracked files
-  (env copies, symlinks) without ever deleting them silently — so a
+  (env copies, and the `.codegraph/` index when the CLI is present)
+  without ever deleting them silently — so a
   normally-created worktree is "dirty" from git's point of view from day
-  one. Pass `force: true` (forwarded as `--force` to herdr or git, only
+  one whenever those steps land anything. Pass `force: true` (forwarded as `--force` to herdr or git, only
   when asked) to close it. Without `force`, the backend's own refusal is
   the whole error and nothing is mutated: checkout, branch, and registry
   entry are left untouched.

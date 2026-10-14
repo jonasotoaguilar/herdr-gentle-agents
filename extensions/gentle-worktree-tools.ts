@@ -378,41 +378,57 @@ async function executeWorktreeCreate(params, ctx) {
       { branch, issues: issueNumbers, path: target, pruned: prunedStale },
     );
   }
-  // (e2) Non-directory occupant (I3): a file, FIFO, or dangling symlink at
-  // the target path would otherwise surface git's raw
-  // `fatal: '<path>' already exists` and leave the caller with no action.
-  // Judge through the one predicate (exists AND is-a-directory): when
-  // something is present via lstat but it is not a directory via stat
-  // (stat follows symlinks, so a dangling link counts as an occupant),
-  // refuse with an actionable message and no registry mutation, so removing
-  // the occupant lets the next create succeed.
+  // (e2) Occupant (S22, widening I3): ANY pre-existing entry at the target
+  // path — an empty or non-empty directory, a file, a FIFO, a symlink, a
+  // dangling symlink — is refused before any backend runs, with an
+  // actionable message naming what is there and what to do (remove it by
+  // hand or pick another branch), never git's raw
+  // `fatal: '<path>' already exists`. The empty directory is included
+  // precisely because git would silently adopt it. No registry row is
+  // written, so removing the occupant lets the next create at the same
+  // path succeed. The single exception is the thread's own registered
+  // checkout, already returned as `created: false` by the idempotency
+  // contract above — everything reaching this point is someone else's
+  // entry or no checkout at all.
   try {
-    let occupant = null;
+    let occupantKind = null;
     try {
-      fs.lstatSync(resolvedTarget);
-      occupant = true;
-    } catch {
-      occupant = null;
-    }
-    if (occupant) {
-      const st = checkoutState(resolvedTarget, repo.root);
-      if (!(st.exists && st.isDirectory)) {
-        let kind = "non-directory";
+      const lst = fs.lstatSync(resolvedTarget);
+      if (lst.isSymbolicLink()) {
+        let stat = null;
         try {
-          const lst = fs.lstatSync(resolvedTarget);
-          if (lst.isSymbolicLink()) kind = "symlink";
-          else if (lst.isFile()) kind = "file";
-          else if (lst.isFIFO()) kind = "FIFO";
-          else if (lst.isDirectory()) kind = "non-directory";
-          else kind = "non-directory";
+          stat = fs.statSync(resolvedTarget);
         } catch {
-          kind = "non-directory";
+          stat = null;
         }
-        return errorResult(
-          `target path ${target} is occupied by a ${kind} (not a directory): remove it by hand and retry; the registry was left untouched`,
-          { branch, issues: issueNumbers, path: target, pruned: prunedStale },
-        );
+        if (!stat) occupantKind = "dangling symlink";
+        else if (stat.isDirectory()) occupantKind = "symlink to a directory";
+        else occupantKind = "symlink";
+      } else if (lst.isFile()) {
+        occupantKind = "file";
+      } else if (lst.isFIFO()) {
+        occupantKind = "FIFO";
+      } else if (lst.isDirectory()) {
+        let empty = false;
+        try {
+          empty = fs.readdirSync(resolvedTarget).length === 0;
+        } catch {
+          empty = false;
+        }
+        occupantKind = empty ? "empty directory" : "non-empty directory";
+      } else if (lst.isSocket()) {
+        occupantKind = "socket";
+      } else {
+        occupantKind = "non-directory";
       }
+    } catch {
+      occupantKind = null;
+    }
+    if (occupantKind !== null) {
+      return errorResult(
+        `target path ${target} is occupied by a ${occupantKind}: remove it by hand or pick another branch; the registry was left untouched`,
+        { branch, issues: issueNumbers, path: target, pruned: prunedStale },
+      );
     }
   } catch {
     // A failed probe never blocks: the backends report their own error.
@@ -441,10 +457,22 @@ async function executeWorktreeCreate(params, ctx) {
     }
   }
 
-  // (g) Create: herdr first, git fallback. Fixed argv only, values as
-  // separate elements (herdr rejects --flag=value). Never --focus, never
-  // --trust-repository: trusting a repository is a human decision these
-  // tools never take. The base ref is the repository's current HEAD.
+  // (g) Create. S20 branch adoption is resolved BEFORE creating: when
+  // `refs/heads/<branch>` already exists (and is not checked out at a
+  // live checkout — already refused above), the worktree checks out that
+  // EXISTING branch with `git worktree add <target> <branch>` — no `-b`,
+  // no base, the ref never created, rewritten or deleted — and the result
+  // reports `branchCreated: false` plus a warning naming the adopted
+  // branch. Herdr's `worktree create` cannot adopt an existing branch, so
+  // the adopt case goes through git and then associates the Herdr
+  // workspace BEST-EFFORT via `herdr worktree open --path <path>
+  // --cwd <root>`; the checkout succeeding never depends on herdr.
+  // When the ref does not exist, creation keeps the herdr-first path
+  // with a `git worktree add -b` fallback and reports `branchCreated:
+  // true`. Fixed argv only, values as separate elements (herdr rejects
+  // --flag=value). Never --focus, never --trust-repository: trusting a
+  // repository is a human decision these tools never take. The base ref
+  // is the repository's current HEAD.
   let base = null;
   try {
     const head = git.runArgv("git", ["rev-parse", "HEAD"], { cwd: repo.root });
@@ -452,32 +480,80 @@ async function executeWorktreeCreate(params, ctx) {
   } catch {
     base = null;
   }
-  const createParams = { cwd: repo.root, branch, path: target };
-  if (base) createParams.base = base;
+  let branchExists = false;
+  try {
+    const ref = git.runArgv("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repo.root });
+    branchExists = ref.status === 0;
+  } catch {
+    branchExists = false;
+  }
   let createdBy = null;
   let createError = null;
+  let branchCreated = null;
+  let herdrAssociated = null;
+  const adoptWarnings = [];
+  if (branchExists) {
+    // Adopt: check out the existing branch at the fresh path. No `-b`
+    // (the ref already exists), no base (checking out the branch IS the
+    // base) — the ref is never created, rewritten or deleted.
+    const adopted = git.runArgv("git", ["worktree", "add", target, branch], { cwd: repo.root, timeoutMs: 120000 });
+    if (adopted.status === 0) {
+      createdBy = "git";
+      branchCreated = false;
+      adoptWarnings.push(
+        `adopted existing branch '${branch}' at ${target}: the worktree checks out that branch as-is, the branch ref was left untouched`,
+      );
+      // Best-effort Herdr workspace association: reported, never fatal.
+      try {
+        const opened = git.runArgv(herdrBinary(), git.herdrArgv("open", { cwd: repo.root, path: target }), {
+          cwd: repo.root,
+          timeoutMs: 60000,
+        });
+        herdrAssociated = opened.status === 0;
+      } catch (err) {
+        herdrAssociated = false;
+      }
+      if (herdrAssociated !== true) {
+        adoptWarnings.push(
+          `herdr workspace association failed for ${target} ('herdr worktree open' did not succeed): the checkout itself is fine, associate it by hand when needed`,
+        );
+      }
+    } else {
+      createError = ((adopted.stderr || adopted.error || "unknown error") + "").trim();
+    }
+  } else {
+  const createParams = { cwd: repo.root, branch, path: target };
+  if (base) createParams.base = base;
   const herdrRes = git.runArgv(herdrBinary(), git.herdrArgv("create", createParams), {
     cwd: repo.root,
     timeoutMs: 120000,
   });
   if (herdrRes.status === 0) {
     createdBy = "herdr";
+    branchCreated = true;
   } else {
     const fallbackArgv = ["worktree", "add", "-b", branch, target];
     if (base) fallbackArgv.push(base);
     const fallback = git.runArgv("git", fallbackArgv, { cwd: repo.root, timeoutMs: 120000 });
     if (fallback.status === 0) {
       createdBy = "git";
+      branchCreated = true;
     } else {
-      // Same-branch recovery (H1): the branch ref survives the
-      // hand-deleted checkout, so `-b` fails with "already exists".
+      // Same-branch recovery (H1): the branch ref appeared between the
+      // pre-creation resolution above and the fallback (or survives a
+      // hand-deleted checkout), so `-b` fails with "already exists".
       // Checking out the existing branch at the fresh path is the
-      // recovery; anything else keeps the backend's own error.
+      // recovery — the same adoption semantics, reported the same way;
+      // anything else keeps the backend's own error.
       const ref = git.runArgv("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repo.root });
       if (ref.status === 0) {
         const retry = git.runArgv("git", ["worktree", "add", target, branch], { cwd: repo.root, timeoutMs: 120000 });
         if (retry.status === 0) {
           createdBy = "git";
+          branchCreated = false;
+          adoptWarnings.push(
+            `adopted existing branch '${branch}' at ${target}: the worktree checks out that branch as-is, the branch ref was left untouched`,
+          );
         } else {
           createError = ((retry.stderr || retry.error || "unknown error") + "").trim();
         }
@@ -485,6 +561,7 @@ async function executeWorktreeCreate(params, ctx) {
         createError = ((fallback.stderr || fallback.error || "unknown error") + "").trim();
       }
     }
+  }
   }
   if (!createdBy) {
     return errorResult(
@@ -630,9 +707,9 @@ async function executeWorktreeCreate(params, ctx) {
     );
   }
 
-  // (i2) Creation hooks (S8, P2-S3): copy unversioned files, install by
-  // detected stack, symlinks (odd/ always, .agents/.claude when present,
-  // never .codegraph/), codegraph init when available. Hooks never turn a
+  // (i2) Creation hooks (S8 as narrowed by S21, P2-S3): copy unversioned
+  // files, install by detected stack, codegraph init when available.
+  // S21 creates no symlinks of any kind. Hooks never turn a
   // successful creation into an error: every outcome, including a thrown
   // hook, is reported inside `details.hooks`, and the exact success text
   // stays unchanged. A failed step stays visible via steps + warnings.
@@ -676,10 +753,15 @@ async function executeWorktreeCreate(params, ctx) {
   const replacedWarnings = replacedRows.length > 0
     ? [`replaced ${replacedRows.length} stale registry row(s) at the same path ${target}: ${replacedRows.map((r) => `branch '${r.branch}' at ${r.path}`).join(", ")}; one path has one owner, so the row just created is the only registration`]
     : [];
-  const warnings = [...((hooks && hooks.warnings) || []), ...conflictWarnings, ...pruneWarnings, ...replacedWarnings];
+  const warnings = [...((hooks && hooks.warnings) || []), ...conflictWarnings, ...pruneWarnings, ...replacedWarnings, ...adoptWarnings];
+  // S20 adoption reporting: whether the branch was created or adopted,
+  // and (adopt case only) whether the best-effort Herdr workspace
+  // association happened. The checkout succeeding never depends on herdr.
+  const adoptionDetails = { branchCreated };
+  if (herdrAssociated !== null) adoptionDetails.herdrAssociated = herdrAssociated;
   return textResult(
     successText(target),
-    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings, pruned: prunedStale, replacedRows: replacedRows.map((r) => ({ branch: r.branch, path: r.path })), ...backupDetails },
+    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings, pruned: prunedStale, replacedRows: replacedRows.map((r) => ({ branch: r.branch, path: r.path })), ...adoptionDetails, ...backupDetails },
     false,
   );
 }
@@ -697,16 +779,19 @@ const worktreeCreateTool = defineTool({
   },
 });
 
-// `worktree_list` output contract (S6, S9) — terse, one line per
-// worktree, pinned in tools/worktree-close.test.js:
+// `worktree_list` output contract (S6, S9, S19) — terse, one line per
+// checkout, pinned in tools/worktree-list.test.js:
+//   worktree list: <path> <branch> principal
 //   worktree list: <path> <branch> thread=<thread> issues=<n,n[,n...]>
 // A registered entry whose path is not a live checkout gains ` missing`:
 //   worktree list: <path> <branch> thread=<thread> issues=<n,n> missing
 // With `all: true`, a live checkout the registry does not know about
-// appends (the caller's own checkout is never listed as unregistered):
+// appends (the principal checkout is never listed as unregistered):
 //   worktree list: <path> <branch> unregistered
-// Nothing registered (and nothing unregistered with all) is a single:
-//   worktree list: none
+// The principal checkout (S19) is always listed when git's listing names
+// it, and the session's own checkout is the FIRST line; `worktree list:
+// none` is retired and only survives as the degenerate fallback when the
+// principal cannot be determined and nothing else is listed.
 // S16 self-heal: an ABSOLUTE registry path that no longer exists on disk
 // (the user deleted the checkout by hand) is removed from the listing AND
 // pruned from the registry in one atomic write, so the tool always
@@ -776,8 +861,44 @@ async function executeWorktreeList(params, ctx) {
   // the same predicate, so a relative listing path resolves against the
   // repository root, never the process cwd.
   const liveIds = liveIdentities(live, repo.root);
-  const lines = [];
-  const items = [];
+  // S19: the principal checkout is the main worktree of git's listing.
+  // repo.root is the toplevel of the CALLER's checkout (a linked worktree
+  // when the session runs inside one), so the main root is recovered from
+  // the shared common dir instead — for a normal repository
+  // <principal>/.git is the common dir, the same recovery runCreationHooks
+  // uses for its sources. The principal is the listing entry whose
+  // resolved path equals that main root. It is printed distinguished
+  // (`principal`, never thread=/issues=), is never pruned (the registry
+  // holds agent rows only) and is never reported as unregistered. When no
+  // listing entry matches, no principal line is invented.
+  let principalEntry = null;
+  let principalPath = null;
+  if (typeof repo.commonDir === "string" && path.basename(repo.commonDir) === ".git") {
+    try {
+      principalPath = path.resolve(path.dirname(repo.commonDir));
+    } catch {
+      principalPath = null;
+    }
+  }
+  if (principalPath !== null) {
+    for (const entry of live) {
+      if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
+      const st = checkoutState(entry.path, repo.root);
+      if (st.absolute !== null && st.absolute === principalPath) {
+        principalEntry = entry;
+        break;
+      }
+    }
+    if (!principalEntry) principalPath = null;
+  }
+  let principalLine = null;
+  let principalItem = null;
+  if (principalEntry && principalPath !== null) {
+    const principalBranch = principalEntry.branch || "(detached)";
+    principalLine = `worktree list: ${principalPath} ${principalBranch} principal`;
+    principalItem = { path: principalPath, branch: principalBranch, thread: null, issues: [], status: "live", kind: "principal" };
+  }
+  const agentRows = [];
   const deadPaths = [];
   for (const entry of read.worktrees) {
     const isAbsoluteRow = typeof entry.path === "string" && path.isAbsolute(entry.path);
@@ -803,11 +924,11 @@ async function executeWorktreeList(params, ctx) {
       ? entry.thread
       : "unknown";
     const status = liveHit ? "live" : "missing";
-    lines.push(
-      `worktree list: ${entry.path} ${entry.branch} thread=${thread} issues=${issues.join(",")}`
-      + (liveHit ? "" : " missing"),
-    );
-    items.push({ path: entry.path, branch: entry.branch, thread, issues, status });
+    agentRows.push({
+      line: `worktree list: ${entry.path} ${entry.branch} thread=${thread} issues=${issues.join(",")}`
+        + (liveHit ? "" : " missing"),
+      item: { path: entry.path, branch: entry.branch, thread, issues, status, kind: "agent" },
+    });
   }
   // Prune exactly the dead rows in one atomic registry write, best
   // effort: when the write fails the listing below still excludes them
@@ -824,6 +945,58 @@ async function executeWorktreeList(params, ctx) {
       }
     } catch (err) {
       pruneError = (err && err.message) || String(err);
+    }
+  }
+  // S19: the session's own checkout is the FIRST line, whether that is
+  // the principal or a registered worktree — the checkout containing or
+  // equal to the tool context's cwd, deepest match winning, the
+  // principal as a candidate. A session outside every checkout (or inside
+  // an unregistered one) gets the principal first. Then the principal
+  // (when the first line was a worktree), then the remaining agent rows
+  // in registry order. The agent-row text contract is unchanged.
+  const sessionCwd = path.resolve(cwd);
+  const containsOrEquals = (base, target) => target === base || target.startsWith(base + path.sep);
+  let sessionAgent = -1;
+  let bestLen = -1;
+  if (principalItem !== null && containsOrEquals(principalItem.path, sessionCwd)) {
+    bestLen = principalItem.path.length;
+  }
+  agentRows.forEach((row, index) => {
+    if (typeof row.item.path !== "string" || !path.isAbsolute(row.item.path)) return;
+    let base;
+    try {
+      base = path.resolve(row.item.path);
+    } catch {
+      return;
+    }
+    if (containsOrEquals(base, sessionCwd) && base.length > bestLen) {
+      sessionAgent = index;
+      bestLen = base.length;
+    }
+  });
+  const lines = [];
+  const items = [];
+  if (sessionAgent >= 0) {
+    lines.push(agentRows[sessionAgent].line);
+    items.push(agentRows[sessionAgent].item);
+    if (principalLine !== null) {
+      lines.push(principalLine);
+      items.push(principalItem);
+    }
+    agentRows.forEach((row, index) => {
+      if (index !== sessionAgent) {
+        lines.push(row.line);
+        items.push(row.item);
+      }
+    });
+  } else {
+    if (principalLine !== null) {
+      lines.push(principalLine);
+      items.push(principalItem);
+    }
+    for (const row of agentRows) {
+      lines.push(row.line);
+      items.push(row.item);
     }
   }
   const warnings = [];
@@ -874,7 +1047,13 @@ async function executeWorktreeList(params, ctx) {
         }
       }
     }
-    const self = path.resolve(repo.root);
+    // The principal checkout is never an extra: it already has its
+    // distinguished line. Any other live checkout the registry does not
+    // know about — including the session's own checkout when it is
+    // unregistered — is reported. When no principal could be determined,
+    // the caller's checkout keeps the old exclusion so the degenerate
+    // listing stays exactly `worktree list: none`.
+    const self = principalPath !== null ? principalPath : path.resolve(repo.root);
     const extra = live
       .filter((entry) => {
         if (!entry || typeof entry.path !== "string" || entry.path.length === 0) return false;
@@ -894,9 +1073,13 @@ async function executeWorktreeList(params, ctx) {
       // carries a relative spelling or a path that does not exist.
       const shown = checkoutState(entry.path, repo.root).absolute || entry.path;
       lines.push(`worktree list: ${shown} ${branch} unregistered`);
-      items.push({ path: shown, branch, thread: null, issues: [], status: "unregistered" });
+      items.push({ path: shown, branch, thread: null, issues: [], status: "unregistered", kind: "unregistered" });
     }
   }
+  // S19 retires `worktree list: none`: with the principal line always
+  // present there is always something to list. This fallback survives
+  // only for the degenerate case where the principal cannot be determined
+  // from git's listing and nothing else is listed either.
   if (lines.length === 0) {
     return textResult("worktree list: none", { worktrees: [], count: 0, all, pruned, warnings, pruneError }, false);
   }
@@ -1352,7 +1535,7 @@ async function executeWorktreeClose(params, ctx) {
 const worktreeListTool = defineTool({
   name: "worktree_list",
   label: "Worktree List",
-  description: "List agent worktrees registered for this repository, cross-checked against live checkouts with their owning thread. Pass all:true to also show live checkouts the registry does not know about. Rows whose paths no longer exist are excluded and pruned from the registry.",
+  description: "List the principal checkout plus the agent worktrees registered for this repository, cross-checked against live checkouts with their owning thread. The session's own checkout is listed first. Pass all:true to also show live checkouts the registry does not know about. Rows whose paths no longer exist are excluded and pruned from the registry.",
   parameters: Type.Object({
     all: opt(Type.Boolean({ description: "Include live checkouts the registry does not know about" })),
   }),

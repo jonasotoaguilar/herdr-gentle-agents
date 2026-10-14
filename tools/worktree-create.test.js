@@ -1390,3 +1390,401 @@ describe('H3: relative git listing paths never resolve against the process cwd',
     }
   });
 });
+
+describe('S20: an existing branch is adopted, never created', { concurrency: false }, () => {
+  // Stub `herdr` with `worktree open` support: logs every argv line, then
+  // emulates `worktree create` with `git worktree add -b` and answers
+  // `worktree open` with `openExit` (0 = associated, non-zero = refused).
+  function makeHerdrStubWithOpen(openExit) {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-herdr-open-')));
+    const bin = path.join(dir, 'herdr');
+    fs.writeFileSync(
+      bin,
+      [
+        '#!/bin/sh',
+        'printf \'%s\\n\' "$*" >> "$HERDR_SHIM_LOG"',
+        'if [ "$1" = "worktree" ] && [ "$2" = "create" ]; then',
+        '  shift 2',
+        '  branch=""; base=""; wtpath=""; cwd=""',
+        '  while [ $# -gt 0 ]; do',
+        '    case "$1" in',
+        '      --branch) branch="$2"; shift 2;;',
+        '      --base) base="$2"; shift 2;;',
+        '      --path) wtpath="$2"; shift 2;;',
+        '      --cwd) cwd="$2"; shift 2;;',
+        '      *) shift;;',
+        '    esac',
+        '  done',
+        '  [ -n "$branch" ] && [ -n "$wtpath" ] && [ -n "$cwd" ] || { echo "missing args" >&2; exit 1; }',
+        '  exec git -C "$cwd" worktree add -b "$branch" "$wtpath" "$base"',
+        'fi',
+        'if [ "$1" = "worktree" ] && [ "$2" = "open" ]; then',
+        '  shift 2',
+        '  wtpath=""; cwd=""',
+        '  while [ $# -gt 0 ]; do',
+        '    case "$1" in',
+        '      --path) wtpath="$2"; shift 2;;',
+        '      --cwd) cwd="$2"; shift 2;;',
+        '      *) shift;;',
+        '    esac',
+        '  done',
+        `  [ -n "$wtpath" ] && [ -n "$cwd" ] || { echo "open: missing args" >&2; exit 1; }`,
+        `  [ -d "$wtpath" ] || { echo "open: no checkout" >&2; exit 1; }`,
+        `  exit ${openExit}`,
+        'fi',
+        'echo "herdr stub: unexpected argv $*" >&2; exit 1',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    return { bin, log: path.join(dir, 'herdr-argv.log') };
+  }
+
+  function stdAdoptEnv(herdr, gh, modeEnv) {
+    return {
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_SHIM_EXIT: undefined,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    };
+  }
+
+  // Record every (bin, argv) the extension layer invokes, delegating to
+  // the real runner so behavior is unchanged.
+  function recordArgv() {
+    const gitLib = require('../lib/worktree-git.js');
+    const orig = gitLib.runArgv;
+    const seen = [];
+    gitLib.runArgv = (bin, args, opts) => {
+      seen.push({ bin: String(bin), args: args.slice() });
+      return orig(bin, args, opts);
+    };
+    return { gitLib, orig, seen };
+  }
+
+  test('a branch created by hand is adopted: no -b, ref untouched, branchCreated:false + warning', async () => {
+    const root = makeRepo('adopt');
+    git(root, ['branch', 'feat/adopted', 'HEAD']);
+    const refBefore = git(root, ['rev-parse', 'refs/heads/feat/adopted']);
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdAdoptEnv(herdr, gh, modeEnv));
+    const rec = recordArgv();
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-adopt' });
+      const target = expectedTarget(root, 'feat-adopted');
+      const result = await callCreate(tools, { branch: 'feat/adopted', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected adoption success, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      assert.equal(result.details.created, true);
+      assert.equal(result.details.branchCreated, false, 'adoption reports branchCreated:false');
+      assert.ok(
+        (result.details.warnings || []).join('\n').includes('feat/adopted'),
+        `a warning names the adopted branch: ${JSON.stringify(result.details.warnings)}`,
+      );
+      // The checkout is on that branch and the ref commit is unchanged.
+      assert.equal(git(target, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat/adopted');
+      assert.equal(git(root, ['rev-parse', 'refs/heads/feat/adopted']), refBefore, 'the branch ref is never rewritten');
+      assert.ok(listWorktreePaths(root).includes(target), 'checkout listed by git');
+      // No `-b` in ANY git argv: the branch was never created.
+      const gitArgs = rec.seen.filter((call) => call.bin === 'git').flatMap((call) => call.args);
+      assert.ok(!gitArgs.includes('-b'), `no -b in any git argv: ${JSON.stringify(gitArgs)}`);
+      // Herdr's create (which cannot adopt) never ran.
+      assert.ok(
+        !shimArgv(herdr.log).some((line) => line.includes('worktree create')),
+        `herdr worktree create never ran: ${JSON.stringify(shimArgv(herdr.log))}`,
+      );
+    } finally {
+      rec.gitLib.runArgv = rec.orig;
+      restoreEnv();
+    }
+  });
+
+  test('a fresh branch keeps the herdr-first -b path and reports branchCreated:true', async () => {
+    const root = makeRepo('adopt-fresh');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdAdoptEnv(herdr, gh, modeEnv));
+    const rec = recordArgv();
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-fresh' });
+      const target = expectedTarget(root, 'feat-fresh');
+      const result = await callCreate(tools, { branch: 'feat/fresh', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      assert.equal(result.details.branchCreated, true, 'a created branch reports branchCreated:true');
+      assert.ok(
+        shimArgv(herdr.log).some((line) => line.includes('worktree create')),
+        `herdr ran first: ${JSON.stringify(shimArgv(herdr.log))}`,
+      );
+      const createLine = shimArgv(herdr.log).find((line) => line.includes('worktree create'));
+      assert.ok(createLine.includes('--branch feat/fresh'), `herdr create names the branch: ${createLine}`);
+      // Herdr succeeded, so the git fallback never ran: no `worktree add`
+      // in any git argv the tool itself invoked.
+      const gitArgs = rec.seen.filter((call) => call.bin === 'git').flatMap((call) => call.args);
+      assert.ok(!gitArgs.includes('worktree'), `no git worktree argv when herdr wins: ${JSON.stringify(gitArgs)}`);
+    } finally {
+      rec.gitLib.runArgv = rec.orig;
+      restoreEnv();
+    }
+  });
+
+  test('adopt associates the Herdr workspace through worktree open when it works', async () => {
+    const root = makeRepo('adopt-open-ok');
+    git(root, ['branch', 'feat/open-ok', 'HEAD']);
+    const herdr = makeHerdrStubWithOpen(0);
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdAdoptEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-open' });
+      const target = expectedTarget(root, 'feat-open-ok');
+      const result = await callCreate(tools, { branch: 'feat/open-ok', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      assert.equal(result.details.branchCreated, false);
+      assert.equal(result.details.herdrAssociated, true, 'the open association is reported');
+      const opens = shimArgv(herdr.log).filter((line) => line.includes('worktree open'));
+      assert.equal(opens.length, 1, `exactly one herdr worktree open: ${JSON.stringify(shimArgv(herdr.log))}`);
+      assert.ok(opens[0].includes(`--path ${target}`), `open names the path: ${opens[0]}`);
+      assert.ok(opens[0].includes(`--cwd ${root}`), `open names the root: ${opens[0]}`);
+      assert.ok(!opens[0].includes('='), `never --flag=value: ${opens[0]}`);
+      assert.ok(fs.existsSync(target), 'the checkout exists either way');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('adopt still succeeds when herdr open fails, reporting the outcome', async () => {
+    const root = makeRepo('adopt-open-fail');
+    git(root, ['branch', 'feat/open-fail', 'HEAD']);
+    const refBefore = git(root, ['rev-parse', 'refs/heads/feat/open-fail']);
+    const herdr = makeHerdrStubWithOpen(1);
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdAdoptEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-open-fail' });
+      const target = expectedTarget(root, 'feat-open-fail');
+      const result = await callCreate(tools, { branch: 'feat/open-fail', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `the checkout never depends on herdr, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      assert.equal(result.details.branchCreated, false);
+      assert.equal(result.details.herdrAssociated, false, 'the failed association is reported');
+      assert.ok(
+        (result.details.warnings || []).join('\n').match(/herdr/i),
+        `a warning reports the herdr outcome: ${JSON.stringify(result.details.warnings)}`,
+      );
+      assert.equal(git(target, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat/open-fail');
+      assert.equal(git(root, ['rev-parse', 'refs/heads/feat/open-fail']), refBefore);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S22: any pre-existing entry at the target is refused before any backend', { concurrency: false }, () => {
+  function stdExistEnv(herdr, gh, modeEnv) {
+    return {
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_SHIM_EXIT: undefined,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    };
+  }
+
+  // An occupant refusal names the path, names what is there, and tells
+  // the caller what to do — never git's raw fatal.
+  function assertOccupantRefusal(result, target, kindPattern) {
+    assert.equal(result.isError, true);
+    const text = resultText(result);
+    assert.ok(text.includes(target), `names the occupant path: ${text}`);
+    assert.match(text, kindPattern, `names what is there: ${text}`);
+    assert.match(text, /remove it by hand or pick another branch/i, `actionable: ${text}`);
+    assert.ok(!/fatal.*already exists/i.test(text), `never git raw fatal: ${text}`);
+    return text;
+  }
+
+  function assertNoBackendNoRegistry(root, herdr, params) {
+    assert.deepEqual(shimArgv(herdr.log), [], `no backend ran for ${params.branch}`);
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.deepEqual(registryLib.readRegistry(root).worktrees, [], 'no registry row is written');
+  }
+
+  test('an EMPTY directory at the target is refused (git would silently adopt it)', async () => {
+    const root = makeRepo('exist-empty');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdExistEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-empty' });
+      const target = expectedTarget(root, 'feat-occupied');
+      track(target);
+      fs.mkdirSync(target, { recursive: true });
+      const before = listWorktreePaths(root);
+      const refused = await callCreate(tools, { branch: 'feat/occupied', issues: [35] }, ctx);
+      assertOccupantRefusal(refused, target, /empty directory/i);
+      assert.deepEqual(listWorktreePaths(root), before, 'no checkout is added');
+      assert.ok(fs.existsSync(target), 'the occupant is left for the caller to remove');
+      assertNoBackendNoRegistry(root, herdr, { branch: 'feat/occupied' });
+      // Removing the occupant lets the next create succeed at the same path.
+      fs.rmdirSync(target);
+      const retry = await callCreate(tools, { branch: 'feat/occupied', issues: [35] }, ctx);
+      assert.equal(retry.isError, undefined, `retry succeeds, got: ${resultText(retry)}`);
+      assert.equal(resultText(retry), `worktree create: ${target}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a NON-empty directory at the target is refused, never git raw fatal', async () => {
+    const root = makeRepo('exist-full');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdExistEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-full' });
+      const target = expectedTarget(root, 'feat-full');
+      track(target);
+      fs.mkdirSync(target, { recursive: true });
+      fs.writeFileSync(path.join(target, 'hand-made.txt'), 'mine\n');
+      const before = listWorktreePaths(root);
+      const refused = await callCreate(tools, { branch: 'feat/full', issues: [35] }, ctx);
+      assertOccupantRefusal(refused, target, /non-empty directory/i);
+      assert.deepEqual(listWorktreePaths(root), before, 'no checkout is added');
+      assertNoBackendNoRegistry(root, herdr, { branch: 'feat/full' });
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a file at the target is refused with the same actionable message', async () => {
+    const root = makeRepo('exist-file');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdExistEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-file' });
+      const target = expectedTarget(root, 'feat-f');
+      track(target);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, 'occupant\n');
+      const refused = await callCreate(tools, { branch: 'feat/f', issues: [35] }, ctx);
+      assertOccupantRefusal(refused, target, /file/i);
+      assertNoBackendNoRegistry(root, herdr, { branch: 'feat/f' });
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a FIFO at the target is refused with the same actionable message', async () => {
+    const root = makeRepo('exist-fifo');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdExistEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-fifo' });
+      const target = expectedTarget(root, 'feat-fifo');
+      track(target);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      const mk = spawnSync('mkfifo', [target], { encoding: 'utf8' });
+      assert.equal(mk.status, 0, `mkfifo failed: ${mk.stderr}`);
+      const refused = await callCreate(tools, { branch: 'feat/fifo', issues: [35] }, ctx);
+      assertOccupantRefusal(refused, target, /fifo/i);
+      assertNoBackendNoRegistry(root, herdr, { branch: 'feat/fifo' });
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a dangling symlink at the target is refused with the same actionable message', async () => {
+    const root = makeRepo('exist-dangle');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdExistEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-dangle' });
+      const target = expectedTarget(root, 'feat-dangle');
+      track(target);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(path.join(path.dirname(target), 'nowhere-gone'), target);
+      const refused = await callCreate(tools, { branch: 'feat/dangle', issues: [35] }, ctx);
+      assertOccupantRefusal(refused, target, /dangling symlink/i);
+      assertNoBackendNoRegistry(root, herdr, { branch: 'feat/dangle' });
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a symlink to a directory at the target is refused with the same actionable message', async () => {
+    const root = makeRepo('exist-linkdir');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdExistEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-linkdir' });
+      const target = expectedTarget(root, 'feat-linkdir');
+      track(target);
+      const elsewhere = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-elsewhere-')));
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(elsewhere, target);
+      const before = listWorktreePaths(root);
+      const refused = await callCreate(tools, { branch: 'feat/linkdir', issues: [35] }, ctx);
+      assertOccupantRefusal(refused, target, /symlink/i);
+      assert.deepEqual(listWorktreePaths(root), before, 'no checkout is added');
+      assertNoBackendNoRegistry(root, herdr, { branch: 'feat/linkdir' });
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the thread own registered checkout stays the single idempotent exception', async () => {
+    const root = makeRepo('exist-own');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdExistEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-own' });
+      const first = await callCreate(tools, { branch: 'feat/own', issues: [35] }, ctx);
+      assert.equal(first.isError, undefined, `setup create failed: ${resultText(first)}`);
+      const target = first.details.path;
+      assert.ok(fs.statSync(target).isDirectory(), 'the target exists on disk');
+      const second = await callCreate(tools, { branch: 'feat/own', issues: [35] }, ctx);
+      assert.equal(second.isError, undefined);
+      assert.equal(resultText(second), `worktree create: ${target}`);
+      assert.equal(second.details.created, false, 'the own checkout returns created:false, never a refusal');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
