@@ -1,9 +1,11 @@
 // @ts-nocheck
-// gentle-worktree-tools.ts — agent worktree tools (Pi extension, P2-S2).
+// gentle-worktree-tools.ts — agent worktree tools (Pi extension, P2-S4).
 //
-// Registers exactly one tool in this slice: `worktree_create`. Creation
-// hooks (env copy, dependency install, symlinks, codegraph init) are the
-// next slice, so this file creates the checkout and nothing else.
+// Registers three tools: `worktree_create` (validate + herdr-first
+// creation with hooks), `worktree_list` (read-only, no approval prompt),
+// and `worktree_close` (remove the checkout, keep the branch). Create and
+// close prompt for approval when the host offers dialog UI; list never
+// mutates anything.
 //
 // The file is plain JavaScript with a .ts extension (// @ts-nocheck, no
 // type annotations), exactly like extensions/gentle-herdr-state.ts, so the
@@ -38,6 +40,15 @@ function herdrBinary() {
 function toolCwd(ctx) {
   if (ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0) return ctx.cwd;
   return process.cwd();
+}
+
+// Marks a TypeBox property optional. Production `Type` is the full TypeBox
+// export, but older test doubles stub only the constructors `worktree_create`
+// needed; falling back to the bare schema keeps the module loadable there
+// while production still gets true optionals.
+function opt(schema) {
+  if (Type && typeof Type.Optional === "function") return Type.Optional(schema);
+  return schema;
 }
 
 // Thread identity source precedence (which source won is returned in
@@ -356,8 +367,409 @@ const worktreeCreateTool = defineTool({
   },
 });
 
-export default function (pi) {
-  pi.registerTool(worktreeCreateTool);
+// `worktree_list` output contract (S6, S9) — terse, one line per
+// worktree, pinned in tools/worktree-close.test.js:
+//   worktree list: <path> <branch> thread=<thread> issues=<n,n[,n...]>
+// A registered entry whose path is not a live checkout gains ` missing`:
+//   worktree list: <path> <branch> thread=<thread> issues=<n,n> missing
+// With `all: true`, a live checkout the registry does not know about
+// appends (the caller's own checkout is never listed as unregistered):
+//   worktree list: <path> <branch> unregistered
+// Nothing registered (and nothing unregistered with all) is a single:
+//   worktree list: none
+// The registry is only read, never written, by this tool.
+async function executeWorktreeList(params, ctx) {
+  const git = libRequire("worktree-git.js");
+  const registry = libRequire("worktree-registry.js");
+  const mode = libRequire("worktree-mode.js");
+  const cwd = toolCwd(ctx);
+
+  // Mode gate, exactly like `worktree_create`: missing means enabled,
+  // malformed never enables, disabled names the toggle.
+  let modeState;
+  try {
+    modeState = mode.readMode();
+  } catch {
+    modeState = { state: "malformed", enabled: false };
+  }
+  if (!modeState || modeState.enabled !== true) {
+    return errorResult(
+      "worktree tools are disabled; run /herdr-gentle:worktree enabled to enable them",
+      { state: modeState ? modeState.state : "unknown", tool: "worktree_list" },
+    );
+  }
+
+  let repo;
+  try {
+    repo = git.repoIdentity(cwd);
+  } catch (err) {
+    return errorResult(`not a git repository: ${cwd}`, { tool: "worktree_list" });
+  }
+  const all = !!params && params.all === true;
+  const read = registry.readRegistry(repo.root);
+  if (!read.ok) {
+    return errorResult(
+      `cannot read worktree registry: ${read.error}`,
+      { tool: "worktree_list" },
+    );
+  }
+  let live;
+  try {
+    live = git.listWorktrees(repo.root);
+  } catch (err) {
+    return errorResult(
+      `cannot list worktrees: ${(err && err.message) || err}`,
+      { tool: "worktree_list" },
+    );
+  }
+
+  // Cross-check the registry against git: a checkout deleted out of band
+  // is reported as `missing`, never as live. Nothing is written back.
+  const liveByPath = new Map(live.map((entry) => [path.resolve(entry.path), entry]));
+  const lines = [];
+  const items = [];
+  for (const entry of read.worktrees) {
+    const liveHit = liveByPath.get(path.resolve(entry.path));
+    const issues = Array.isArray(entry.issues) ? entry.issues.slice() : [];
+    const thread = typeof entry.thread === "string" && entry.thread.length > 0
+      ? entry.thread
+      : "unknown";
+    const status = liveHit ? "live" : "missing";
+    lines.push(
+      `worktree list: ${entry.path} ${entry.branch} thread=${thread} issues=${issues.join(",")}`
+      + (liveHit ? "" : " missing"),
+    );
+    items.push({ path: entry.path, branch: entry.branch, thread, issues, status });
+  }
+  if (all) {
+    const registered = new Set(read.worktrees.map((entry) => path.resolve(entry.path)));
+    const self = path.resolve(repo.root);
+    const extra = live
+      .filter((entry) => {
+        const resolved = path.resolve(entry.path);
+        return !registered.has(resolved) && resolved !== self;
+      })
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    for (const entry of extra) {
+      const branch = entry.branch || "(detached)";
+      lines.push(`worktree list: ${entry.path} ${branch} unregistered`);
+      items.push({ path: entry.path, branch, thread: null, issues: [], status: "unregistered" });
+    }
+  }
+  if (lines.length === 0) {
+    return textResult("worktree list: none", { worktrees: [], count: 0, all }, false);
+  }
+  return textResult(lines.join("\n"), { worktrees: items, count: items.length, all }, false);
 }
 
-export { executeWorktreeCreate, resolveThread };
+// Rank registry entries by common-prefix score against the query so an
+// unregistered close target can name the closest registered candidates.
+function rankCandidates(query, entries) {
+  const q = String(query);
+  return entries
+    .map((entry) => {
+      const name = String(entry.branch || "");
+      const shared = Math.min(q.length, name.length);
+      let score = 0;
+      while (score < shared && q[score] === name[score]) score += 1;
+      let pathBonus = 0;
+      try {
+        if (typeof entry.path === "string" && entry.path.includes(q)) {
+          pathBonus = Math.min(3, Math.floor(q.length / 4));
+        }
+      } catch {
+        pathBonus = 0;
+      }
+      return { entry, score: score + pathBonus };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map((ranked) => ranked.entry);
+}
+
+// Resolve the Herdr workspace id for a checkout path from `herdr worktree
+// list` JSON (`{result: {worktrees: [{path, open_workspace_id, ...}]}}`,
+// with tolerant fallbacks). Returns null when herdr is unusable or the
+// checkout has no workspace id — the caller then falls back to git.
+function herdrWorkspaceId(stdout, resolvedTarget) {
+  let list = null;
+  try {
+    const doc = JSON.parse(stdout);
+    if (doc && doc.result && Array.isArray(doc.result.worktrees)) {
+      list = doc.result.worktrees;
+    } else if (doc && Array.isArray(doc.worktrees)) {
+      list = doc.worktrees;
+    } else if (doc && Array.isArray(doc.result)) {
+      list = doc.result;
+    }
+  } catch {
+    return null;
+  }
+  if (!list) return null;
+  for (const item of list) {
+    if (!item || typeof item.path !== "string") continue;
+    let resolved;
+    try {
+      resolved = path.resolve(item.path);
+    } catch {
+      continue;
+    }
+    if (resolved !== resolvedTarget) continue;
+    for (const key of ["open_workspace_id", "workspace_id", "workspace", "id"]) {
+      if (typeof item[key] === "string" && item[key].length > 0) return item[key];
+    }
+    return null;
+  }
+  return null;
+}
+
+// Core of `worktree_close` (S7, D6): remove the checkout and its Herdr
+// workspace, keep the branch, drop the registry entry. Exported for unit
+// tests; the registered tool calls it with the live Pi context.
+//
+// The S7 rule is that the BRANCH IS KEPT: this function never deletes a
+// branch, never passes `--trust-repository`, and passes `--force` only
+// when the caller asked for it. Removal is herdr-first (workspace id
+// resolved from `herdr worktree list`) with a `git worktree remove` fixed
+// argv fallback when herdr is unavailable; a dirty checkout without
+// `force` fails with the backend's own reason and nothing is mutated. The
+// registry entry is dropped only after `listWorktrees` confirms the path
+// is gone.
+async function executeWorktreeClose(params, ctx) {
+  const git = libRequire("worktree-git.js");
+  const registry = libRequire("worktree-registry.js");
+  const mode = libRequire("worktree-mode.js");
+  const cwd = toolCwd(ctx);
+
+  // Mode gate, exactly like `worktree_create`.
+  let modeState;
+  try {
+    modeState = mode.readMode();
+  } catch {
+    modeState = { state: "malformed", enabled: false };
+  }
+  if (!modeState || modeState.enabled !== true) {
+    return errorResult(
+      "worktree tools are disabled; run /herdr-gentle:worktree enabled to enable them",
+      { state: modeState ? modeState.state : "unknown", tool: "worktree_close" },
+    );
+  }
+
+  const rawPath = params ? params.path : undefined;
+  const rawBranch = params ? params.branch : undefined;
+  const force = !!params && params.force === true;
+  const hasPath = typeof rawPath === "string" && rawPath.length > 0;
+  const hasBranch = typeof rawBranch === "string" && rawBranch.length > 0;
+  if (!hasPath && !hasBranch) {
+    return errorResult(
+      "worktree_close requires a path or a branch: pass the worktree path or branch name to close",
+      { force },
+    );
+  }
+
+  let repo;
+  try {
+    repo = git.repoIdentity(cwd);
+  } catch (err) {
+    return errorResult(`not a git repository: ${cwd}`, { force });
+  }
+  const read = registry.readRegistry(repo.root);
+  if (!read.ok) {
+    return errorResult(`cannot read worktree registry: ${read.error}`, { force });
+  }
+  const byPath = hasPath ? registry.findByPath(repo.root, rawPath) : null;
+  const byBranch = hasBranch ? registry.findByBranch(repo.root, rawBranch) : null;
+  if (hasPath && hasBranch && byPath && byBranch && byPath.branch !== byBranch.branch) {
+    return errorResult(
+      `worktree_close path and branch disagree: path resolves to branch '${byPath.branch}' but branch '${rawBranch}' is registered elsewhere; pass only one`,
+      { path: rawPath, branch: rawBranch, force },
+    );
+  }
+  const entry = byPath || byBranch || null;
+  if (!entry) {
+    // Never remove an unknown checkout: refuse and name the closest
+    // registered candidates instead.
+    const query = hasPath ? rawPath : rawBranch;
+    if (read.worktrees.length === 0) {
+      return errorResult(
+        `no registered worktree for ${JSON.stringify(query)}: no worktrees are registered`,
+        { query, force },
+      );
+    }
+    const candidates = rankCandidates(query, read.worktrees);
+    const named = candidates.map((item) => `'${item.branch}' at ${item.path}`).join(", ");
+    return errorResult(
+      `no registered worktree for ${JSON.stringify(query)}: closest registered worktrees: ${named}`,
+      { query, candidates: candidates.map((item) => ({ branch: item.branch, path: item.path })), force },
+    );
+  }
+  const target = entry.path;
+  const branch = entry.branch;
+  // L7: the checkout belongs to a thread. Closing another thread's
+  // checkout is legitimate (a delivered thread is often closed from a later
+  // session), so this reports the owner instead of refusing: the human sees
+  // whose checkout the approval would remove.
+  const owner = typeof entry.thread === "string" && entry.thread.length > 0 ? entry.thread : null;
+  const resolvedTarget = path.resolve(target);
+
+  let live;
+  try {
+    live = git.listWorktrees(repo.root);
+  } catch (err) {
+    return errorResult(
+      `cannot list worktrees: ${(err && err.message) || err}`,
+      { branch, path: target, force },
+    );
+  }
+  if (!live.some((item) => path.resolve(item.path) === resolvedTarget)) {
+    return errorResult(
+      `worktree at ${target} is not a live checkout (stale registry entry for branch '${branch}'): the entry was kept`,
+      { branch, path: target, force },
+    );
+  }
+
+  // Approval when the host offers dialog UI; non-interactive modes
+  // proceed without it. A refusal mutates nothing and keeps the entry.
+  if (ctx && ctx.hasUI) {
+    const canAsk = ctx.ui && typeof ctx.ui.confirm === "function";
+    let approved = false;
+    if (canAsk) {
+      try {
+        approved = await ctx.ui.confirm(
+          `Close worktree '${branch}'?`,
+          `Remove the worktree checkout at ${target} for branch '${branch}'? The branch '${branch}' will be kept.`
+            + (owner
+              ? ` This checkout is owned by thread '${owner}'.`
+              : " This checkout has no recorded owning thread."),
+        );
+      } catch {
+        approved = false;
+      }
+    }
+    if (!approved) {
+      return errorResult(
+        `worktree close cancelled: approval declined for branch '${branch}'`,
+        { cancelled: true, branch, path: target, force },
+      );
+    }
+  }
+
+  // Remove herdr-first: resolve the workspace id from `herdr worktree
+  // list`, then `herdr worktree remove`. Fixed argv only, values as
+  // separate elements (herdr rejects --flag=value). Never
+  // --trust-repository: trusting a repository is a human decision these
+  // tools never take. `--force` only when the caller asked for it.
+  let removedBy = null;
+  let removeError = null;
+  let workspace = null;
+  const listed = git.runArgv(herdrBinary(), git.herdrArgv("list", { cwd: repo.root }), {
+    cwd: repo.root,
+    timeoutMs: 60000,
+  });
+  if (listed.status === 0) {
+    workspace = herdrWorkspaceId(listed.stdout, resolvedTarget);
+  }
+  if (workspace) {
+    const removeParams = { workspace };
+    if (force) removeParams.force = true;
+    const removed = git.runArgv(herdrBinary(), git.herdrArgv("remove", removeParams), {
+      cwd: repo.root,
+      timeoutMs: 120000,
+    });
+    if (removed.status === 0) {
+      removedBy = "herdr";
+    } else {
+      removeError = ((removed.stderr || removed.error || "") + "").trim()
+        || "herdr worktree remove failed";
+    }
+  } else {
+    // Herdr is unavailable (missing binary, failed list, unparseable
+    // output) or the checkout has no workspace id: `git worktree remove`
+    // with fixed argv. It never deletes the branch either.
+    const argv = ["worktree", "remove"];
+    if (force) argv.push("--force");
+    argv.push(target);
+    const fallen = git.runArgv("git", argv, { cwd: repo.root, timeoutMs: 120000 });
+    if (fallen.status === 0) {
+      removedBy = "git";
+    } else {
+      removeError = ((fallen.stderr || fallen.error || "") + "").trim()
+        || "git worktree remove failed";
+    }
+  }
+  if (!removedBy) {
+    // The backend's own reason (e.g. git's dirty-checkout refusal) is the
+    // whole message; checkout and registry entry are left untouched.
+    return errorResult(removeError || "failed to remove worktree", {
+      branch, path: target, force, removed: false,
+    });
+  }
+
+  // Verify against git before dropping the entry: the path must be gone.
+  let after;
+  try {
+    after = git.listWorktrees(repo.root);
+  } catch (err) {
+    return errorResult(
+      `worktree removal could not be verified at ${target}: ${(err && err.message) || err}`,
+      { branch, path: target, force, removedBy },
+    );
+  }
+  if (after.some((item) => path.resolve(item.path) === resolvedTarget)) {
+    return errorResult(
+      `worktree removal could not be verified at ${target}: the checkout is still listed`,
+      { branch, path: target, force, removedBy },
+    );
+  }
+  let dropped;
+  try {
+    dropped = registry.removeWorktree(repo.root, branch);
+  } catch (err) {
+    dropped = { ok: false, error: (err && err.message) || String(err) };
+  }
+  if (!dropped.ok) {
+    return errorResult(
+      `worktree removed at ${target} but the registry entry could not be dropped: ${dropped.error}`,
+      { branch, path: target, force, removed: true, branchKept: true },
+    );
+  }
+  return textResult(
+    `worktree close: ${target}`,
+    { path: target, branch, removed: true, branchKept: true, thread: owner },
+    false,
+  );
+}
+
+const worktreeListTool = defineTool({
+  name: "worktree_list",
+  label: "Worktree List",
+  description: "List agent worktrees registered for this repository, cross-checked against live checkouts with their owning thread. Pass all:true to also show live checkouts the registry does not know about. Read-only: never mutates the registry.",
+  parameters: Type.Object({
+    all: opt(Type.Boolean({ description: "Include live checkouts the registry does not know about" })),
+  }),
+  async execute(toolCallId, params, signal, onUpdate, ctx) {
+    return executeWorktreeList(params, ctx);
+  },
+});
+
+const worktreeCloseTool = defineTool({
+  name: "worktree_close",
+  label: "Worktree Close",
+  description: "Remove a registered agent worktree checkout and its Herdr workspace while keeping the branch. Pass the worktree path or branch, plus force:true to close a dirty checkout.",
+  parameters: Type.Object({
+    path: opt(Type.String({ description: "Path of the registered worktree to close" })),
+    branch: opt(Type.String({ description: "Branch of the registered worktree to close" })),
+    force: opt(Type.Boolean({ description: "Close even when the checkout is dirty" })),
+  }),
+  async execute(toolCallId, params, signal, onUpdate, ctx) {
+    return executeWorktreeClose(params, ctx);
+  },
+});
+
+export default function (pi) {
+  pi.registerTool(worktreeCreateTool);
+  pi.registerTool(worktreeListTool);
+  pi.registerTool(worktreeCloseTool);
+}
+
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread };
