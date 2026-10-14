@@ -302,10 +302,43 @@ async function executeWorktreeCreate(params, ctx) {
     );
   }
 
+  // (i2) Creation hooks (S8, P2-S3): copy unversioned files, install by
+  // detected stack, symlinks (odd/ always, .agents/.claude when present,
+  // never .codegraph/), codegraph init when available. Hooks never turn a
+  // successful creation into an error: every outcome, including a thrown
+  // hook, is reported inside `details.hooks`, and the exact success text
+  // stays unchanged. A failed step stays visible via steps + warnings.
+  let hooks = { ok: true, steps: [], warnings: [] };
+  try {
+    const hooksLib = libRequire("worktree-hooks.js");
+    // The principal checkout owns the shared sources. repo.root is the
+    // toplevel of the caller (which may itself be a linked worktree), so
+    // the principal is recovered from the shared common dir: for a normal
+    // repository <principal>/.git is the common dir.
+    const principalRoot = path.basename(repo.commonDir) === ".git"
+      ? path.dirname(repo.commonDir)
+      : repo.root;
+    hooks = hooksLib.runCreationHooks({
+      principalRoot,
+      worktreePath: target,
+      root: repo.root,
+      env: process.env,
+    });
+  } catch (err) {
+    const message = `creation hooks failed: ${(err && err.message) || err}`;
+    hooks = {
+      ok: false,
+      steps: [{ name: "hooks", status: "failed", detail: message }],
+      warnings: [message],
+    };
+  }
+
   // (j) Terse success text (S9), whichever backend performed the creation.
+  // Hook steps and warnings travel inside details; a failed step is
+  // visible there and never becomes an error result.
   return textResult(
     successText(target),
-    { path: target, branch, issues: issueNumbers, created: true },
+    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings: (hooks && hooks.warnings) || [] },
     false,
   );
 }

@@ -262,9 +262,17 @@ describe('worktree_create', { concurrency: false }, () => {
 
       assert.equal(result.isError, undefined);
       assert.equal(resultText(result), `worktree create: ${target}`);
-      assert.deepEqual(result.details, {
-        path: target, branch: 'feat/create-ok', issues: [35], created: true,
-      });
+      assert.deepEqual(
+        {
+          path: result.details.path, branch: result.details.branch,
+          issues: result.details.issues, created: result.details.created,
+        },
+        { path: target, branch: 'feat/create-ok', issues: [35], created: true },
+      );
+      // Creation hooks (S8) report their steps beside the creation facts.
+      assert.equal(result.details.hooks.ok, true);
+      assert.ok(Array.isArray(result.details.hooks.steps) && result.details.hooks.steps.length > 0);
+      assert.ok(Array.isArray(result.details.warnings));
       // The path exists and is a real checkout.
       assert.equal(git(target, ['rev-parse', '--show-toplevel']), target);
       assert.ok(listWorktreePaths(root).includes(target));
@@ -651,9 +659,14 @@ describe('worktree_create', { concurrency: false }, () => {
       const result = await callCreate(tools, { branch: 'feat/fallback', issues: [12] }, ctx);
       assert.equal(result.isError, undefined);
       assert.equal(resultText(result), `worktree create: ${target}`);
-      assert.deepEqual(result.details, {
-        path: target, branch: 'feat/fallback', issues: [12], created: true,
-      });
+      assert.deepEqual(
+        {
+          path: result.details.path, branch: result.details.branch,
+          issues: result.details.issues, created: result.details.created,
+        },
+        { path: target, branch: 'feat/fallback', issues: [12], created: true },
+      );
+      assert.equal(result.details.hooks.ok, true);
       // herdr was attempted first with fixed argv, then git did the work.
       const calls = shimArgv(herdr.log);
       assert.equal(calls.length, 1);
