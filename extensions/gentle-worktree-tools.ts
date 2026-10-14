@@ -188,11 +188,14 @@ async function executeWorktreeCreate(params, ctx) {
       );
     }
     // Stale entry (checkout gone): drop it best-effort and create fresh.
-    // Drop by this entry's own path when it is absolute: with a hand-edited
-    // registry holding two entries that share a branch, dropping by branch
-    // could delete the live entry instead of the stale one.
+    // Drop by row identity — the (branch, path) pair of the entry this
+    // thread owns — never by branch alone and never by a path-key lookup
+    // that can match a different row. With a hand-edited registry holding
+    // a live entry sharing the branch, either shortcut could delete the
+    // live entry instead of the stale one.
     try {
-      if (ownedAbsolute !== null) registry.removeWorktreeByPath(repo.root, ownedAbsolute);
+      if (typeof registry.removeWorktreeExact === "function") registry.removeWorktreeExact(repo.root, owned.branch, owned.path);
+      else if (ownedAbsolute !== null) registry.removeWorktreeByPath(repo.root, ownedAbsolute);
       else registry.removeWorktree(repo.root, owned.branch);
     } catch {
       // Creation below still produces a correct checkout + entry.
@@ -538,6 +541,15 @@ function herdrWorkspaceId(stdout, resolvedTarget, repoRoot) {
   }
   if (!list) return null;
   const base = typeof repoRoot === "string" && repoRoot.length > 0 ? repoRoot : null;
+  // R4-1: more than one entry resolving to the target with DIFFERENT
+  // workspace ids is ambiguity — a first-match win could name a workspace
+  // that maps to another checkout, removing the wrong one. Collect every
+  // match: one entry, or several carrying the SAME id, still resolves;
+  // anything else (conflicting ids, or a match without an id) is null so
+  // the caller skips herdr entirely and uses the git path.
+  const matchedIds = new Set();
+  let matched = 0;
+  let missing = false;
   for (const item of list) {
     if (!item || typeof item.path !== "string" || item.path.length === 0) continue;
     let resolved;
@@ -549,12 +561,16 @@ function herdrWorkspaceId(stdout, resolvedTarget, repoRoot) {
       continue;
     }
     if (resolved !== resolvedTarget) continue;
+    matched += 1;
+    let id = null;
     for (const key of ["open_workspace_id", "workspace_id", "workspace", "id"]) {
-      if (typeof item[key] === "string" && item[key].length > 0) return item[key];
+      if (typeof item[key] === "string" && item[key].length > 0) { id = item[key]; break; }
     }
-    return null;
+    if (id === null) missing = true;
+    else matchedIds.add(id);
   }
-  return null;
+  if (matched === 0 || missing || matchedIds.size !== 1) return null;
+  return [...matchedIds][0];
 }
 
 // Core of `worktree_close` (S7, D6): remove the checkout and its Herdr
@@ -765,6 +781,26 @@ async function executeWorktreeClose(params, ctx) {
       `worktree removal could not be verified at ${target}: ${(err && err.message) || err}`,
       { branch, path: target, force, removedBy },
     );
+  }
+  // R4-2: the backend must not have removed anything but the target. A
+  // hostile or confused remover that deleted another checkout fails
+  // loudly here: the vanished path is named, the close is not treated as
+  // successful, and the registry entry is left in place. Covers both the
+  // herdr and the git removal paths; a legitimate single-checkout removal
+  // (only the target gone) never trips it.
+  try {
+    const afterSet = new Set(after.map((item) => path.resolve(item.path)));
+    const vanished = live
+      .map((item) => path.resolve(item.path))
+      .filter((p) => p !== resolvedTarget && !afterSet.has(p));
+    if (vanished.length > 0) {
+      return errorResult(
+        `worktree removal removed an unexpected checkout at ${vanished[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
+        { branch, path: target, force, removedBy, vanished },
+      );
+    }
+  } catch {
+    // Path comparison must never mask the verification below.
   }
   if (after.some((item) => path.resolve(item.path) === resolvedTarget)) {
     return errorResult(

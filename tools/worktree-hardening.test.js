@@ -359,3 +359,373 @@ describe('CE5: corrupt-registry backup must not follow a predictable symlink', {
     }
   });
 });
+
+// R4-1: a herdr list that reports the same path twice with different ids
+// is ambiguity — the close must skip herdr entirely and use the git path.
+const HERDR_DUP_R4_SRC = `#!/usr/bin/env node
+'use strict';
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const EOL = String.fromCharCode(10);
+const argv = process.argv.slice(2);
+fs.appendFileSync(process.env.HERDR_SHIM_LOG, argv.join(' ') + EOL);
+function fail(m){ console.error(m); process.exit(1); }
+const op = argv[1]; const rest = argv.slice(2);
+function flag(n){ const i=rest.indexOf(n); if(i<0||i+1>=rest.length) return null; return rest[i+1]; }
+if (argv[0]!=='worktree') fail('stub scope');
+if (op==='list'){
+  const mode = process.env.HERDR_DUP_MODE || 'ambiguous';
+  const target = process.env.HERDR_DUP_TARGET;
+  const victim = process.env.HERDR_DUP_VICTIM;
+  let worktrees;
+  if (mode === 'same') {
+    worktrees = [{ path: target, branch: 'feat-target', open_workspace_id: 'ws-0' }, { path: target, branch: 'feat-target', open_workspace_id: 'ws-0' }];
+    fs.writeFileSync(process.env.HERDR_SHIM_STATE, JSON.stringify({ 'ws-0': target }));
+  } else {
+    worktrees = [{ path: target, branch: 'feat-target', open_workspace_id: 'ws-v' }, { path: target, branch: 'feat-target', open_workspace_id: 'ws-t' }];
+    const map = {}; map['ws-v'] = victim; map['ws-t'] = target;
+    fs.writeFileSync(process.env.HERDR_SHIM_STATE, JSON.stringify(map));
+  }
+  console.log(JSON.stringify({ result: { worktrees } }));
+  process.exit(0);
+}
+if (op==='remove'){
+  const ws = flag('--workspace'); if(!ws) fail('remove missing --workspace');
+  let map=null; try{ map=JSON.parse(fs.readFileSync(process.env.HERDR_SHIM_STATE,'utf8')); }catch(e){ map=null; }
+  if(!map) fail('no state');
+  const t=map[ws]; if(!t) fail('unknown ws '+ws);
+  const l=spawnSync('git',['worktree','list','--porcelain'],{cwd:t,encoding:'utf8'});
+  let main=null;
+  if(l.status===0){ for(const line of l.stdout.split(EOL)){ if(line.indexOf('worktree ')===0){ main=line.slice(9); break; } } }
+  if(!main) fail('cannot locate main');
+  const args=['worktree','remove'];
+  if(rest.indexOf('--force')>=0) args.push('--force');
+  args.push(t);
+  const r=spawnSync('git',args,{cwd:main,encoding:'utf8'});
+  if(r.stdout) process.stdout.write(r.stdout);
+  if(r.stderr) process.stderr.write(r.stderr);
+  process.exit(r.status==null?1:r.status);
+}
+fail('unexpected '+argv.join(' '));
+`;
+function makeHerdrDupStubR4() {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-r4-dup-')));
+  const bin = path.join(dir, 'herdr');
+  fs.writeFileSync(bin, HERDR_DUP_R4_SRC, { mode: 0o755 });
+  return { bin, log: path.join(dir, 'argv.log'), state: path.join(dir, 'state.json') };
+}
+
+describe('R4-1: duplicate herdr list paths with different ids fall back to git', { concurrency: false }, () => {
+  test('ambiguous duplicate ids use the git path; victim survives, target removed', async () => {
+    const root = makeRepo('r41');
+    const dirV = path.join(path.dirname(root), `${path.basename(root)}-victim`);
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-victim', dirV, 'HEAD']);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realV = fs.realpathSync(dirV); track(realV);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const reg = require('../lib/worktree-registry.js');
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-victim', path: realV, thread: 't-v', issues: [1], odd: [] }).ok, true);
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const beforeBytes = fs.readFileSync(reg.registryPath(root));
+    const herdr = makeHerdrDupStubR4();
+    fs.writeFileSync(herdr.log, '');
+    const modeEnv = scratchModeEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR, HERDR_BIN_PATH: herdr.bin, HERDR_SHIM_LOG: herdr.log, HERDR_SHIM_STATE: herdr.state, HERDR_DUP_MODE: 'ambiguous', HERDR_DUP_TARGET: realT, HERDR_DUP_VICTIM: realV, GENTLE_WORKTREE_THREAD: undefined });
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success via git fallback, got: ${text}`);
+      assert.equal(text, `worktree close: ${realT}`);
+      assert.ok(fs.existsSync(realV), 'victim directory survives on disk');
+      assert.ok(livePaths(root).includes(realV), 'victim still listed by git');
+      assert.equal(fs.existsSync(realT), false, 'target removed from disk');
+      assert.ok(!livePaths(root).includes(realT), 'target gone from git list');
+      const lines = fs.readFileSync(herdr.log, 'utf8').split('\n').filter((l) => l.length > 0);
+      const removes = lines.filter((l) => l.startsWith('worktree remove '));
+      assert.deepEqual(removes, [], `no removal argv may name a workspace: ${JSON.stringify(lines)}`);
+      const after = reg.readRegistry(root);
+      assert.equal(after.ok, true);
+      assert.ok(after.worktrees.some((e) => path.resolve(e.path) === realV), 'victim entry kept');
+      assert.ok(!after.worktrees.some((e) => path.resolve(e.path) === realT), 'target entry dropped');
+      assert.notDeepEqual(fs.readFileSync(reg.registryPath(root)), beforeBytes, 'registry bytes changed');
+    } finally { restoreEnvCwd(); }
+  });
+  test('duplicate entries carrying the SAME id still resolve through herdr', async () => {
+    const root = makeRepo('r41-same');
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const reg = require('../lib/worktree-registry.js');
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const herdr = makeHerdrDupStubR4();
+    fs.writeFileSync(herdr.log, '');
+    const modeEnv = scratchModeEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR, HERDR_BIN_PATH: herdr.bin, HERDR_SHIM_LOG: herdr.log, HERDR_SHIM_STATE: herdr.state, HERDR_DUP_MODE: 'same', HERDR_DUP_TARGET: realT, HERDR_DUP_VICTIM: realT, GENTLE_WORKTREE_THREAD: undefined });
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
+      assert.equal(fs.existsSync(realT), false, 'target removed');
+      const lines = fs.readFileSync(herdr.log, 'utf8').split('\n').filter((l) => l.length > 0);
+      const removes = lines.filter((l) => l.startsWith('worktree remove '));
+      assert.equal(removes.length, 1, `same-id duplicates still use herdr: ${JSON.stringify(lines)}`);
+      assert.ok(removes[0].includes('--workspace ws-0'), `names the shared id: ${removes[0]}`);
+    } finally { restoreEnvCwd(); }
+  });
+});
+
+// R4-2: a removal that removes something else must fail naming the vanished path.
+const HERDR_HOSTILE_R4_SRC = `#!/usr/bin/env node
+'use strict';
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const EOL = String.fromCharCode(10);
+const argv = process.argv.slice(2);
+fs.appendFileSync(process.env.HERDR_SHIM_LOG, argv.join(' ') + EOL);
+function fail(m){ console.error(m); process.exit(1); }
+const op = argv[1]; const rest = argv.slice(2);
+if (argv[0]!=='worktree') fail('stub scope');
+if (op==='list'){
+  const target = process.env.HERDR_R42_TARGET;
+  const map = { 'ws-0': target };
+  fs.writeFileSync(process.env.HERDR_SHIM_STATE, JSON.stringify(map));
+  console.log(JSON.stringify({ result: { worktrees: [{ path: target, branch: 'feat-target', open_workspace_id: 'ws-0' }] } }));
+  process.exit(0);
+}
+if (op==='remove'){
+  const victim = process.env.HERDR_R42_VICTIM;
+  const l=spawnSync('git',['worktree','list','--porcelain'],{cwd:victim,encoding:'utf8'});
+  let main=null;
+  if(l.status===0){ for(const line of l.stdout.split(EOL)){ if(line.indexOf('worktree ')===0){ main=line.slice(9); break; } } }
+  if(!main) fail('cannot locate main');
+  const r=spawnSync('git',['worktree','remove','--force', victim],{cwd:main,encoding:'utf8'});
+  if(r.stdout) process.stdout.write(r.stdout);
+  if(r.stderr) process.stderr.write(r.stderr);
+  process.exit(0);
+}
+fail('unexpected '+argv.join(' '));
+`;
+function makeHerdrHostileR4() {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-r4-hostile-')));
+  const bin = path.join(dir, 'herdr');
+  fs.writeFileSync(bin, HERDR_HOSTILE_R4_SRC, { mode: 0o755 });
+  return { bin, log: path.join(dir, 'argv.log'), state: path.join(dir, 'state.json') };
+}
+
+describe('R4-2: removal of another checkout fails naming the vanished path', { concurrency: false }, () => {
+  test('herdr path: vanished checkout is named, registry entry kept', async () => {
+    const root = makeRepo('r42-herdr');
+    const dirV = path.join(path.dirname(root), `${path.basename(root)}-victim`);
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-victim', dirV, 'HEAD']);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realV = fs.realpathSync(dirV); track(realV);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const reg = require('../lib/worktree-registry.js');
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-victim', path: realV, thread: 't-v', issues: [1], odd: [] }).ok, true);
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const beforeBytes = fs.readFileSync(reg.registryPath(root));
+    const herdr = makeHerdrHostileR4();
+    fs.writeFileSync(herdr.log, '');
+    const modeEnv = scratchModeEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR, HERDR_BIN_PATH: herdr.bin, HERDR_SHIM_LOG: herdr.log, HERDR_SHIM_STATE: herdr.state, HERDR_R42_TARGET: realT, HERDR_R42_VICTIM: realV, GENTLE_WORKTREE_THREAD: undefined });
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, true, `expected loud failure, got: ${text}`);
+      assert.ok(text.includes(realV), `error names the vanished path ${realV}: ${text}`);
+      assert.ok(fs.existsSync(realT), 'target checkout survives on disk');
+      assert.ok(livePaths(root).includes(realT), 'target still listed');
+      assert.equal(fs.existsSync(realV), false, 'victim was removed by the hostile backend');
+      assert.ok(!livePaths(root).includes(realV), 'victim gone from git list');
+      assert.deepEqual(fs.readFileSync(reg.registryPath(root)), beforeBytes, 'registry bytes unchanged (entry kept)');
+    } finally { restoreEnvCwd(); }
+  });
+  test('git path: vanished checkout is named, registry entry kept', async () => {
+    const root = makeRepo('r42-git');
+    const dirV = path.join(path.dirname(root), `${path.basename(root)}-victim`);
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-victim', dirV, 'HEAD']);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realV = fs.realpathSync(dirV); track(realV);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const reg = require('../lib/worktree-registry.js');
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const beforeBytes = fs.readFileSync(reg.registryPath(root));
+    const which = spawnSync('which', ['git'], { encoding: 'utf8' });
+    assert.equal(which.status, 0);
+    const realGit = which.stdout.trim();
+    const shimDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-r42-gitshim-')));
+    const gitLog = path.join(shimDir, 'git.log');
+    fs.writeFileSync(gitLog, '');
+    fs.writeFileSync(path.join(shimDir, 'git'), `#!/bin/sh\nprintf '%s\\n' "git $*" >> "${gitLog}"\ncase "$*" in\n  *"worktree remove"*) exec "${realGit}" -C "${root}" worktree remove --force "${realV}";;\n  *) exec "${realGit}" "$@";;\nesac\n`, { mode: 0o755 });
+    const modeEnv = scratchModeEnv();
+    const savedPath = process.env.PATH;
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR, HERDR_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-r42'), GENTLE_WORKTREE_THREAD: undefined, PATH: `${shimDir}${path.delimiter}${savedPath}` });
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, true, `expected loud failure, got: ${text}`);
+      assert.ok(text.includes(realV), `error names the vanished path ${realV}: ${text}`);
+      assert.ok(fs.existsSync(realT), 'target survives on disk');
+      assert.ok(livePaths(root).includes(realT), 'target still listed');
+      assert.deepEqual(fs.readFileSync(reg.registryPath(root)), beforeBytes, 'registry bytes unchanged (entry kept)');
+    } finally { restoreEnvCwd(); }
+  });
+  test('legitimate single-checkout removal still succeeds', async () => {
+    const root = makeRepo('r42-legit');
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const reg = require('../lib/worktree-registry.js');
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const modeEnv = scratchModeEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR, HERDR_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-r42legit'), GENTLE_WORKTREE_THREAD: undefined });
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
+      assert.equal(resultText(result), `worktree close: ${realT}`);
+      assert.equal(fs.existsSync(realT), false, 'target removed');
+    } finally { restoreEnvCwd(); }
+  });
+});
+
+describe('R4-3: removeWorktreeByPath drops every duplicate row', { concurrency: false }, () => {
+  test('two rows sharing one path leave no stale duplicate', async () => {
+    const root = makeRepo('r43');
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-a', dirT, 'HEAD']);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const reg = require('../lib/worktree-registry.js');
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-a', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-b', path: path.join(path.dirname(root), 'other'), thread: 't-2', issues: [1], odd: [] }).ok, true);
+    const file = reg.registryPath(root);
+    const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    doc.worktrees.find((e) => e.branch === 'feat-b').path = realT;
+    fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).worktrees.filter((e) => path.resolve(e.path) === realT).length, 2, 'fixture holds two duplicate rows');
+    const modeEnv = scratchModeEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR, HERDR_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-r43'), GENTLE_WORKTREE_THREAD: undefined });
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree close: ${realT}`);
+      assert.equal(fs.existsSync(realT), false, 'checkout removed from disk');
+      assert.ok(!livePaths(root).includes(realT), 'checkout gone from git list');
+      const after = reg.readRegistry(root);
+      assert.equal(after.ok, true);
+      assert.equal(after.worktrees.filter((e) => { try { return path.isAbsolute(e.path) && path.resolve(e.path) === realT; } catch { return false; } }).length, 0, `no stale duplicate survives (R4-3): ${JSON.stringify(after.worktrees)}`);
+    } finally { restoreEnvCwd(); }
+  });
+});
+
+function makeGhStubR4(knownIssues) {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-r4-gh-')));
+  const bin = path.join(dir, 'gh');
+  const cases = knownIssues.map((n) => `    ${n}) printf '{"number":${n},"title":"T${n}","state":"OPEN"}\\n'; exit 0;;`).join('\n');
+  fs.writeFileSync(bin, ['#!/bin/sh', 'if [ "$1" = "issue" ] && [ "$2" = "view" ]; then', '  case "$3" in', cases, '    *) echo "could not resolve to an Issue" >&2; exit 1;;', '  esac', 'fi', 'echo "gh stub" >&2; exit 1', ''].join('\n'), { mode: 0o755 });
+  return bin;
+}
+function makeHerdrCreateStubR4() {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-r4-hc-')));
+  const bin = path.join(dir, 'herdr');
+  const log = path.join(dir, 'argv.log');
+  fs.writeFileSync(bin, ['#!/bin/sh', 'printf \'%s\\n\' "$*" >> "$HERDR_SHIM_LOG"', 'if [ "$1" = "worktree" ] && [ "$2" = "create" ]; then', '  shift 2', '  branch=""; base=""; wtpath=""; cwd=""', '  while [ $# -gt 0 ]; do', '    case "$1" in', '      --branch) branch="$2"; shift 2;;', '      --base) base="$2"; shift 2;;', '      --path) wtpath="$2"; shift 2;;', '      --cwd) cwd="$2"; shift 2;;', '      *) shift;;', '    esac', '  done', '  [ -n "$branch" ] && [ -n "$wtpath" ] && [ -n "$cwd" ] || { echo "missing args" >&2; exit 1; }', '  exec git -C "$cwd" worktree add -b "$branch" "$wtpath" "$base"', 'fi', 'echo "herdr stub" >&2; exit 1', ''].join('\n'), { mode: 0o755 });
+  return { bin, log };
+}
+
+describe('R4-4: stale cleanup drops exactly the thread-owned row', { concurrency: false }, () => {
+  test('live feat-shared survives in both absolute and relative stale arms', async () => {
+    for (const arm of ['absolute', 'relative']) {
+      const root = makeRepo(`r44-${arm}`);
+      const liveDir = path.join(path.dirname(root), `${path.basename(root)}-live`);
+      git(root, ['worktree', 'add', '-b', 'feat-shared', liveDir, 'HEAD']);
+      const liveAbs = fs.realpathSync(liveDir); track(liveAbs);
+      const reg = require('../lib/worktree-registry.js');
+      assert.equal(reg.upsertWorktree(root, { branch: 'feat-shared', path: liveAbs, thread: 'other-thread', issues: [1], odd: [] }).ok, true);
+      const stalePath = arm === 'absolute' ? path.join(path.dirname(root), `${path.basename(root)}-stale-gone`) : 'relative/stale';
+      assert.equal(reg.upsertWorktree(root, { branch: 'feat-temp', path: stalePath, thread: 'creator', issues: [1], odd: [] }).ok, true);
+      const file = reg.registryPath(root);
+      const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+      doc.worktrees.find((e) => e.branch === 'feat-temp').branch = 'feat-shared';
+      fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+      const herdr = makeHerdrCreateStubR4();
+      const gh = makeGhStubR4([7]);
+      fs.writeFileSync(herdr.log, '');
+      const modeEnv = scratchModeEnv();
+      setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR, HERDR_BIN_PATH: herdr.bin, HERDR_SHIM_LOG: herdr.log, GH_BIN_PATH: gh, GENTLE_WORKTREE_THREAD: 'creator' });
+      try {
+        const tools = await loadExtension();
+        const ctx = { cwd: root, hasUI: false, sessionManager: { getSessionId: () => 'creator' }, ui: { confirm: async () => true, notify: () => {} } };
+        const result = await tools.get('worktree_create').execute('c1', { branch: 'feat-new-' + arm, issues: [7] }, undefined, undefined, ctx);
+        const text = resultText(result);
+        assert.equal(result.isError, undefined, `[${arm}] expected creation success, got: ${text}`);
+        const after = reg.readRegistry(root);
+        assert.equal(after.ok, true);
+        assert.ok(after.worktrees.some((e) => e.branch === 'feat-shared' && e.path === liveAbs), `[${arm}] live entry survives registered: ${JSON.stringify(after.worktrees)}`);
+        assert.ok(!after.worktrees.some((e) => e.thread === 'creator' && e.branch === 'feat-shared'), `[${arm}] stale row is gone: ${JSON.stringify(after.worktrees)}`);
+        assert.ok(fs.existsSync(liveAbs), `[${arm}] live checkout survives on disk`);
+        assert.ok(livePaths(root).includes(liveAbs), `[${arm}] live checkout still listed`);
+      } finally { restoreEnvCwd(); }
+    }
+  });
+});
+
+describe('R4-5: failed writes never leave a temp file behind', { concurrency: false }, () => {
+  test('mode and registry writers unlink the temp before rethrowing ENOSPC', async () => {
+    const modeLib = require('../lib/worktree-mode.js');
+    const modeDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-r45-mode-')));
+    const modeEnv = { GENTLE_STATUS_STATE_DIR: modeDir };
+    const origWrite = fs.writeFileSync;
+    let modeSawTemp = null;
+    fs.writeFileSync = function (file, data, opts) {
+      if (typeof file === 'string' && file.includes('.tmp.') && opts && opts.flag === 'wx') {
+        modeSawTemp = file;
+        origWrite.call(fs, file, 'partial');
+        const err = new Error('ENOSPC: no space left on device, write');
+        err.code = 'ENOSPC';
+        throw err;
+      }
+      return origWrite.call(fs, file, data, opts);
+    };
+    let modeThrew = null;
+    try { modeLib.writeMode(true, modeEnv); } catch (err) { modeThrew = err; } finally { fs.writeFileSync = origWrite; }
+    assert.ok(modeThrew, 'mode write rethrows (never a success)');
+    assert.match(String(modeThrew && modeThrew.message), /ENOSPC|no space/i);
+    assert.ok(modeSawTemp, 'the temp file was attempted');
+    assert.equal(fs.existsSync(modeSawTemp), false, `mode temp left behind at ${modeSawTemp}`);
+    assert.deepEqual(fs.readdirSync(modeDir).filter((n) => n.includes('.tmp.')), [], 'no mode temp files remain');
+    assert.equal(fs.existsSync(modeLib.modePath(modeEnv)), false, 'mode file not created on failure');
+    const root = makeRepo('r45-reg');
+    const reg = require('../lib/worktree-registry.js');
+    const file = reg.registryPath(root);
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-base', path: path.join(path.dirname(root), 'base-wt'), thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const beforeBytes = fs.readFileSync(file);
+    let regSawTemp = null;
+    fs.writeFileSync = function (f, data, opts) {
+      if (typeof f === 'string' && f.includes('.tmp.') && opts && opts.flag === 'wx') {
+        regSawTemp = f;
+        origWrite.call(fs, f, 'partial');
+        const err = new Error('ENOSPC: no space left on device, write');
+        err.code = 'ENOSPC';
+        throw err;
+      }
+      return origWrite.call(fs, f, data, opts);
+    };
+    let regThrew = null;
+    try { reg.upsertWorktree(root, { branch: 'feat-next', path: path.join(path.dirname(root), 'next-wt'), thread: 't-1', issues: [1], odd: [] }); } catch (err) { regThrew = err; } finally { fs.writeFileSync = origWrite; }
+    assert.ok(regThrew, 'registry write rethrows (never a success)');
+    assert.match(String(regThrew && regThrew.message), /ENOSPC|no space/i);
+    assert.ok(regSawTemp, 'the registry temp file was attempted');
+    assert.equal(fs.existsSync(regSawTemp), false, `registry temp left behind at ${regSawTemp}`);
+    assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((n) => n.includes('.tmp.')), [], 'no registry temp files remain');
+    assert.deepEqual(fs.readFileSync(file), beforeBytes, 'registry bytes unchanged after failed write');
+  });
+});

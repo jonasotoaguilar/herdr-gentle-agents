@@ -65,7 +65,10 @@ reported (`{ok: false, error}`) instead of thrown, and the file is left
 untouched — malformed never silently enables anything. Writes are atomic
 (a sibling temp file created exclusively with an unpredictable suffix
 plus rename, retrying a new name a bounded number of times and refusing
-with a clear error rather than following or reusing anything) and
+with a clear error rather than following or reusing anything; a write that
+fails after the temp file was created unlinks it best-effort before
+rethrowing, so a failed write never leaves a temp file behind and never
+reports success) and
 serialized by `withRegistryLock`, an
 exclusive lock file beside the registry with a bounded wait and
 stale-lock recovery. A malformed file is replaced on the next upsert,
@@ -87,7 +90,9 @@ live cross-check likewise never resolves a registry path against the
 process cwd (a non-absolute entry is reported `missing`, never live).
 Entry lookup matches by exact branch equality or exact absolute path
 equality only. The close drops its entry by that same absolute path
-(`removeWorktreeByPath`): one path identity end to end from resolve
+(`removeWorktreeByPath`), which drops every row whose path resolves to
+that value so no stale duplicate survives the close: one path identity
+end to end from resolve
 through verify and remove to drop, so duplicate branches or a branch that
 equals another entry's path can never divert the drop; `removeWorktree`'s
 branch-first behaviour is kept for any other caller and is unreachable in
@@ -95,10 +100,19 @@ the close flow. A Herdr workspace id is used only when its list entry's
 path resolves to exactly that same absolute target: absolute entries
 compare directly, relative entries resolve against the repository root
 derived from the caller's checkout (never the process cwd) for the
-comparison only and are never used as a removal base. When no entry
+comparison only and are never used as a removal base. When more than one
+list entry resolves to the target with different workspace ids, that is
+ambiguity: no id is returned, Herdr is skipped entirely, and the close
+uses the git path instead. One entry, or several entries carrying the
+same id, still resolves. When no entry
 matches, Herdr is skipped entirely and the close falls back to `git
 worktree remove` with fixed argv; no removal argv ever names a workspace
-that is not the verified target.
+that is not the verified target. After a removal completes, on both the
+herdr and the git paths, the close compares the live checkouts against
+the pre-removal snapshot: when a checkout other than the target
+disappeared, the close fails naming the vanished path, refuses to treat
+the close as successful, and leaves the registry entry in place.
+Removing only the target never trips this check.
 
 ## Creation path
 
@@ -169,7 +183,9 @@ non-regular mode path with a clear error and touches nothing (the normal
 path stays atomic: a sibling temp file created exclusively with an
 unpredictable suffix and renamed into place, retrying a new name a
 bounded number of times and refusing with a clear message rather than
-following or reusing anything), and the
+following or reusing anything; a write that fails after the temp file was
+created unlinks it best-effort before rethrowing, so a failed write never
+leaves a temp file behind and never reports success), and the
 command surfaces that refusal instead of claiming success. The shared mode file is
 `gentle-worktree-mode.json` (`{version: 1, enabled: boolean}`) in the
 plugin state directory — `GENTLE_STATUS_STATE_DIR`, else
@@ -197,6 +213,11 @@ another thread's checkout. A thread that already owns a registered,
 still-live worktree gets that checkout back — `worktree create: <path>`
 again with `created: false` — never a second checkout. A stale entry
 (checkout gone) is dropped best-effort and creation proceeds fresh.
+The cleanup drops the one row it identified as the thread's own by row
+identity — the (branch, path) pair of the selected entry
+(`removeWorktreeExact`) — never by branch alone and never by a path-key
+lookup that can match a different row, so a live entry sharing the branch
+survives whether the stale path is absolute or relative.
 `worktree_list` shows each entry's owning thread; `worktree_close`
 reports it (`details.thread`, plus `This checkout is owned by thread
 '…'.` in the approval prompt, or `This checkout has no recorded owning
