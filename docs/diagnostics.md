@@ -8,7 +8,7 @@ labels, or review verdicts. Herdr is reached only through fixed-argv
 
 ## Commands
 
-- `node bin/gentle-doctor.js [--help]` — daemon pidfile liveness
+- `node herdr-plugin/bin/gentle-doctor.js [--help]` — daemon pidfile liveness
   (signal 0; presence alone is not liveness), producer/token freshness
   from one `herdr agent list` snapshot, managed sidebar override marker
   scan. Prints `pass:`/`warn:`/`fail:` lines plus actionable `remedy:`
@@ -16,7 +16,7 @@ labels, or review verdicts. Herdr is reached only through fixed-argv
   inactive Gentle daemon/producer/override checks and still checks snapshot
   availability. An invalid mode file fails closed without exposing its contents.
   Exit 0 pass/warn only, 1 any fail or failed snapshot, 2 bad args.
-- `node bin/gentle-trace.js <pane-id>` — one JSON document for a pane
+- `node herdr-plugin/bin/gentle-trace.js <pane-id>` — one JSON document for a pane
   (e.g. `wBG:p1`): safe ids, agent, display, roles, count, freshness
   booleans, identity session hash, and the safe interruption record.
   A disappeared agent whose pane is still present traces as
@@ -24,7 +24,7 @@ labels, or review verdicts. Herdr is reached only through fixed-argv
   confirmed pane absence stays `pane_not_found`. A failed snapshot or
   unknown pane is a JSON `ok:false` failure, never an empty success.
   Exit 0 traced, 1 unavailable/not-found, 2 bad args.
-- `node bin/gentle-whois.js [--all]` — concise `PANE AGENT STATE ROLES
+- `node herdr-plugin/bin/gentle-whois.js [--all]` — concise `PANE AGENT STATE ROLES
   WORKSPACE` table in stable pane order, fitted to narrow widths with
   control characters stripped. Default lists only plugin-owned panes;
   `--all` also lists native/foreign panes without task names.
@@ -55,9 +55,9 @@ distinct from an empty-but-successful view.
 
 ## Shared library
 
-`lib/gentle-diagnostics.js` holds the read-only helpers (path
+`herdr-plugin/lib/gentle-diagnostics.js` holds the read-only helpers (path
 resolution without mkdir, bounded reads, sanitization/width fitting,
 strict ledger validation, pidfile signal-0 check, per-pane whitelist
-summary via `lib/gentle-tokens.js`). It exposes only safe pane/workspace
+summary via `herdr-plugin/lib/gentle-tokens.js`). It exposes only safe pane/workspace
 ids, validated agent names, the agent_status enum, role slugs, running
 counts, freshness booleans, and the identity hash.

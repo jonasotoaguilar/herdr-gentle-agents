@@ -1,17 +1,38 @@
 #!/bin/sh
-# release-preflight: fail-closed gate for tag releases of herdr-gentle-agents.
+# release-preflight: fail-closed gate for per-package tag releases.
 #
-# Validates that RELEASE_TAG is strict vSemVer and equals the package.json
-# version, then runs the releasable proof gates: Node tests, JS syntax checks,
-# sh/shellcheck syntax checks on install.sh, TOML manifest parse (+ version
-# consistency), and npm pack --dry-run. No publishing happens here.
+# Tag series (exactly two, strict semver, no prerelease or build metadata):
+#   pi-vX.Y.Z     the Pi package (repository root, package.json,
+#                 npm name @jonasotoaguilar/herdr-gentle-agents).
+#                 Publishes the npm package AND the GitHub Release with the
+#                 installer assets, so releases/latest/download/install.sh
+#                 keeps resolving after either series.
+#   herdr-vX.Y.Z  the Herdr plugin (herdr-plugin/herdr-plugin.toml).
+#                 Publishes the GitHub Release with the installer assets only;
+#                 never touches npm. The bare v* series is rejected.
+#
+# Version gate, per series: a pi-v tag must equal package.json version; a
+# herdr-v tag must equal the version in herdr-plugin/herdr-plugin.toml. The
+# other package's version is never compared.
+#
+# Shared gate (both series): Node tests (node --test tools/*.test.js), JS
+# syntax checks (node --check over bin/, lib/, herdr-plugin/bin/,
+# herdr-plugin/lib/), sh -n install.sh plus shellcheck -x install.sh, TOML
+# parse of herdr-plugin/herdr-plugin.toml including min_herdr_version
+# presence, npm pack --dry-run for the Pi package plus an npm pack
+# --dry-run --json assertion that the tarball contains no path under
+# herdr-plugin/, tools/, scripts/ or odd/ and does contain
+# extensions/gentle-herdr-state.ts. No publishing happens here; the npm
+# publish for the pi series lives in .github/workflows/release.yml and needs
+# the NPM_TOKEN repository secret via NODE_AUTH_TOKEN (fail closed when
+# absent; never on a herdr-v tag).
 #
 # Environment (set by release.yml; overridable for local checks):
-#   RELEASE_TAG         tag being released, e.g. v0.1.0 (required)
+#   RELEASE_TAG         tag being released, e.g. pi-v0.1.0 (required)
 #   RELEASE_COMMIT      commit the tag points at (informational)
 #   RELEASE_REPOSITORY  owner/repo (informational)
 #
-# Local use: RELEASE_TAG=v0.1.0 ./scripts/release-preflight
+# Local use: RELEASE_TAG=pi-v0.1.0 ./scripts/release-preflight
 
 set -eu
 
@@ -25,11 +46,11 @@ pass() {
 }
 
 TAG="${RELEASE_TAG:-}"
-[ -n "$TAG" ] || fail "RELEASE_TAG is required (e.g. RELEASE_TAG=v0.1.0)"
+[ -n "$TAG" ] || fail "RELEASE_TAG is required (e.g. RELEASE_TAG=pi-v0.1.0)"
 
-# Strict vSemVer: vMAJOR.MINOR.PATCH with no prerelease/build metadata.
-if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-  fail "RELEASE_TAG must be strict vSemVer (vX.Y.Z), got '$TAG'"
+# Exactly two series: pi-vX.Y.Z and herdr-vX.Y.Z, strict semver.
+if ! printf '%s' "$TAG" | grep -Eq '^(pi-v|herdr-v)[0-9]+\.[0-9]+\.[0-9]+$'; then
+  fail "RELEASE_TAG must be pi-vX.Y.Z or herdr-vX.Y.Z (strict semver, no prerelease or build metadata), got '$TAG'"
 fi
 pass "tag format OK: $TAG"
 
@@ -38,24 +59,37 @@ command -v npm >/dev/null 2>&1 || fail "npm is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 command -v shellcheck >/dev/null 2>&1 || fail "shellcheck is required"
 
-# Tag must equal the package.json version.
-PKG_VERSION="$(node -p "require('./package.json').version")"
-TAG_VERSION="$(printf '%s' "$TAG" | cut -c2-)"
-[ "$TAG_VERSION" = "$PKG_VERSION" ] \
-  || fail "tag $TAG does not match package.json version $PKG_VERSION"
-pass "tag matches package.json version $PKG_VERSION"
+case "$TAG" in
+  pi-v*) SERIES="pi"; TAG_VERSION="$(printf '%s' "$TAG" | sed 's/^pi-v//')" ;;
+  herdr-v*) SERIES="herdr"; TAG_VERSION="$(printf '%s' "$TAG" | sed 's/^herdr-v//')" ;;
+  *) fail "RELEASE_TAG must be pi-vX.Y.Z or herdr-vX.Y.Z (strict semver, no prerelease or build metadata), got '$TAG'" ;;
+esac
 
-# Manifest must parse and agree on the same version.
-TOML_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('herdr-plugin.toml','rb'))['version'])")"
-[ "$TOML_VERSION" = "$PKG_VERSION" ] \
-  || fail "herdr-plugin.toml version $TOML_VERSION does not match package.json version $PKG_VERSION"
-pass "herdr-plugin.toml parses, version $TOML_VERSION"
+# Manifest must parse and carry min_herdr_version.
+TOML_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('herdr-plugin/herdr-plugin.toml','rb'))['version'])")" \
+  || fail "herdr-plugin/herdr-plugin.toml does not parse"
+TOML_MIN="$(python3 -c "import tomllib; print(tomllib.load(open('herdr-plugin/herdr-plugin.toml','rb')).get('min_herdr_version',''))")" \
+  || fail "herdr-plugin/herdr-plugin.toml does not parse"
+[ -n "$TOML_MIN" ] || fail "herdr-plugin/herdr-plugin.toml must set min_herdr_version"
+pass "herdr-plugin/herdr-plugin.toml parses, version $TOML_VERSION"
+
+# Per-series version gate: only the tagged package is compared.
+if [ "$SERIES" = "pi" ]; then
+  PKG_VERSION="$(node -p "require('./package.json').version")"
+  [ "$TAG_VERSION" = "$PKG_VERSION" ] \
+    || fail "tag $TAG does not match package.json version $PKG_VERSION"
+  pass "tag matches package.json version $PKG_VERSION"
+else
+  [ "$TAG_VERSION" = "$TOML_VERSION" ] \
+    || fail "tag $TAG does not match herdr-plugin/herdr-plugin.toml version $TOML_VERSION"
+  pass "tag matches herdr-plugin/herdr-plugin.toml version $TOML_VERSION"
+fi
 
 pass "running: node --test tools/*.test.js"
 node --test tools/*.test.js
 
-pass "running: node --check on bin/ and lib/"
-for f in bin/*.js lib/*.js; do
+pass "running: node --check on bin/, lib/ and herdr-plugin/"
+for f in bin/*.js lib/*.js herdr-plugin/bin/*.js herdr-plugin/lib/*.js; do
   node --check "$f"
 done
 
@@ -67,5 +101,11 @@ shellcheck -x install.sh
 
 pass "running: npm pack --dry-run"
 npm pack --dry-run
+
+pass "running: npm pack --dry-run --json tarball surface check"
+PACK_JSON="$(npm pack --dry-run --json)" || fail "npm pack --dry-run --json failed"
+printf '%s' "$PACK_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{let arr;try{arr=JSON.parse(d);}catch(e){console.error('release-preflight: error: npm pack output is not JSON');process.exit(1);}let files=[];for(const e of arr){for(const f of (e.files||[])){files.push(f.path);}}const bad=['herdr-plugin/','tools/','scripts/','odd/'];for(const p of files){for(const b of bad){if(p===b.slice(0,-1)||p.startsWith(b)){console.error('release-preflight: error: npm tarball must not contain '+p);process.exit(1);}}}if(!files.includes('extensions/gentle-herdr-state.ts')){console.error('release-preflight: error: npm tarball must contain extensions/gentle-herdr-state.ts');process.exit(1);}})" \
+  || fail "npm tarball surface check failed"
+pass "npm tarball surface OK"
 
 pass "preflight OK for $TAG"
