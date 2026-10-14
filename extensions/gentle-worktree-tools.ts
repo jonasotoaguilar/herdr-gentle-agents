@@ -304,21 +304,43 @@ async function executeWorktreeCreate(params, ctx) {
     );
   }
 
-  // (i) Registry: upsert the entry owned by this thread.
+  // (i) Registry: upsert the entry owned by this thread. A hand-written
+  // row that carries this branch but points at a DIFFERENT live checkout
+  // is never replaced: that checkout keeps its registration, the new
+  // checkout is recorded alongside it, and the conflict is reported as a
+  // warning naming the kept checkout. Only an absolute row path can name
+  // a live checkout (never resolved against the process cwd).
   let stored;
+  const conflictWarnings = [];
   try {
-    stored = registry.upsertWorktree(repo.root, {
+    const liveSet = new Set(after.map((entry) => path.resolve(entry.path)));
+    const conflict = registry.findByBranch(repo.root, branch);
+    const conflictLive = conflict
+      && typeof conflict.path === "string"
+      && path.isAbsolute(conflict.path)
+      && path.resolve(conflict.path) !== resolvedTarget
+      && liveSet.has(path.resolve(conflict.path))
+      ? conflict
+      : null;
+    const recorded = {
       branch,
       path: target,
       thread,
       issues: issueNumbers,
       odd: [],
-    });
+    };
+    if (conflictLive) {
+      stored = registry.appendWorktree(repo.root, recorded);
+      if (stored.ok) {
+        conflictWarnings.push(
+          `kept the existing registration for branch '${branch}' at ${conflictLive.path}: a live checkout is recorded there, so the new checkout at ${target} was registered alongside it`,
+        );
+      }
+    } else {
+      stored = registry.upsertWorktree(repo.root, recorded);
+    }
   } catch (err) {
-    return errorResult(
-      `worktree created at ${target} but the registry write failed: ${(err && err.message) || err}`,
-      { branch, issues: issueNumbers, path: target, createdBy },
-    );
+    stored = { ok: false, error: (err && err.message) || String(err) };
   }
   if (!stored.ok) {
     return errorResult(
@@ -367,9 +389,10 @@ async function executeWorktreeCreate(params, ctx) {
   const backupDetails = {};
   if (stored.backup) backupDetails.registryBackup = stored.backup;
   if (stored.backupError) backupDetails.registryBackupError = stored.backupError;
+  const warnings = [...((hooks && hooks.warnings) || []), ...conflictWarnings];
   return textResult(
     successText(target),
-    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings: (hooks && hooks.warnings) || [], ...backupDetails },
+    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings, ...backupDetails },
     false,
   );
 }
@@ -397,7 +420,17 @@ const worktreeCreateTool = defineTool({
 //   worktree list: <path> <branch> unregistered
 // Nothing registered (and nothing unregistered with all) is a single:
 //   worktree list: none
-// The registry is only read, never written, by this tool.
+// S16 self-heal: an ABSOLUTE registry path that no longer exists on disk
+// (the user deleted the checkout by hand) is removed from the listing AND
+// pruned from the registry in one atomic write, so the tool always
+// exposes only real checkouts. The pruned paths travel in
+// `details.pruned` and in a `details.warnings` line that also says git may
+// still record the checkout until `git worktree prune`; when the prune
+// write itself fails, the listing still excludes them and says so (plus
+// `details.pruneError`). A path that EXISTS but git no longer lists stays
+// `missing` and is never pruned. A non-absolute entry can never be
+// existence-checked without resolving against the process cwd, so it
+// stays listed as `missing` (never live), exactly as before.
 async function executeWorktreeList(params, ctx) {
   const git = libRequire("worktree-git.js");
   const registry = libRequire("worktree-registry.js");
@@ -443,18 +476,27 @@ async function executeWorktreeList(params, ctx) {
     );
   }
 
-  // Cross-check the registry against git: a checkout deleted out of band
-  // is reported as `missing`, never as live. Nothing is written back. A
-  // registry path that is not absolute is never resolved against the
-  // process cwd, so it can never match a live checkout and is reported
-  // missing.
+  // Cross-check the registry against git, then self-heal (S16): a
+  // checkout deleted out of band is excluded from the listing and
+  // pruned from the registry. A registry path that is not absolute is
+  // never resolved against the process cwd, so it can never match a live
+  // checkout and is reported missing (and never pruned: without an
+  // absolute path there is nothing cwd-independent to check).
   const liveByPath = new Map(live.map((entry) => [path.resolve(entry.path), entry]));
   const lines = [];
   const items = [];
+  const deadPaths = [];
   for (const entry of read.worktrees) {
     const absolute = typeof entry.path === "string" && path.isAbsolute(entry.path)
       ? path.resolve(entry.path)
       : null;
+    // Existence probe on the absolute path only: existsSync on an
+    // absolute path never consults the process cwd. A dangling symlink
+    // reads as missing, which is correct — its checkout is gone.
+    if (absolute !== null && !fs.existsSync(entry.path)) {
+      deadPaths.push(entry.path);
+      continue;
+    }
     const liveHit = absolute === null ? undefined : liveByPath.get(absolute);
     const issues = Array.isArray(entry.issues) ? entry.issues.slice() : [];
     const thread = typeof entry.thread === "string" && entry.thread.length > 0
@@ -466,6 +508,35 @@ async function executeWorktreeList(params, ctx) {
       + (liveHit ? "" : " missing"),
     );
     items.push({ path: entry.path, branch: entry.branch, thread, issues, status });
+  }
+  // Prune exactly the dead rows in one atomic registry write, best
+  // effort: when the write fails the listing below still excludes them
+  // and the warning says so.
+  let pruned = [];
+  let pruneError = null;
+  if (deadPaths.length > 0) {
+    try {
+      const outcome = registry.pruneWorktrees(repo.root, deadPaths);
+      if (outcome && outcome.ok) {
+        pruned = Array.isArray(outcome.pruned) ? outcome.pruned : [];
+      } else {
+        pruneError = (outcome && outcome.error) || "unknown prune error";
+      }
+    } catch (err) {
+      pruneError = (err && err.message) || String(err);
+    }
+  }
+  const warnings = [];
+  if (deadPaths.length > 0) {
+    if (pruneError) {
+      warnings.push(
+        `could not prune ${deadPaths.length} stale worktree path(s) from the registry (${deadPaths.join(", ")}): ${pruneError}; the listing still excludes them, and git may still record the checkout until 'git worktree prune'`,
+      );
+    } else {
+      warnings.push(
+        `pruned ${pruned.length} stale worktree path(s) from the registry: ${pruned.join(", ")}; git may still record the checkout until 'git worktree prune'`,
+      );
+    }
   }
   if (all) {
     // Only absolute registry paths participate: anything else cannot name
@@ -487,9 +558,9 @@ async function executeWorktreeList(params, ctx) {
     }
   }
   if (lines.length === 0) {
-    return textResult("worktree list: none", { worktrees: [], count: 0, all }, false);
+    return textResult("worktree list: none", { worktrees: [], count: 0, all, pruned, warnings, pruneError }, false);
   }
-  return textResult(lines.join("\n"), { worktrees: items, count: items.length, all }, false);
+  return textResult(lines.join("\n"), { worktrees: items, count: items.length, all, pruned, warnings, pruneError }, false);
 }
 
 // Rank registry entries by common-prefix score against the query so an
@@ -571,6 +642,32 @@ function herdrWorkspaceId(stdout, resolvedTarget, repoRoot) {
   }
   if (matched === 0 || missing || matchedIds.size !== 1) return null;
   return [...matchedIds][0];
+}
+
+// Checkouts from the pre-removal snapshot that are gone now, excluding
+// the target itself. A hostile or confused remover that deleted another
+// checkout fails loudly through this: the caller names the vanished path
+// instead of treating the close as successful (or as a bare failure).
+// Never throws and never masks the caller's own error: any listing or
+// comparison failure reports nothing. Pass the already-fetched post
+// listing when there is one; otherwise one is fetched best-effort.
+function vanishedCheckouts(git, repoRoot, live, resolvedTarget, after) {
+  let current = after;
+  if (!current) {
+    try {
+      current = git.listWorktrees(repoRoot);
+    } catch {
+      return [];
+    }
+  }
+  try {
+    const afterSet = new Set(current.map((item) => path.resolve(item.path)));
+    return live
+      .map((item) => path.resolve(item.path))
+      .filter((p) => p !== resolvedTarget && !afterSet.has(p));
+  } catch {
+    return [];
+  }
 }
 
 // Core of `worktree_close` (S7, D6): remove the checkout and its Herdr
@@ -765,6 +862,17 @@ async function executeWorktreeClose(params, ctx) {
     }
   }
   if (!removedBy) {
+    // The remover exited non-zero — but a lying backend may still have
+    // deleted a checkout other than the target on its way out, so the
+    // vanished comparison runs BEFORE this early return, never after it.
+    // Either way the registry entry is kept; only the message differs.
+    const vanishedOnFailure = vanishedCheckouts(git, repo.root, live, resolvedTarget);
+    if (vanishedOnFailure.length > 0) {
+      return errorResult(
+        `worktree removal failed (${removeError || "failed to remove worktree"}) and removed an unexpected checkout at ${vanishedOnFailure[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
+        { branch, path: target, force, removed: false, vanished: vanishedOnFailure },
+      );
+    }
     // The backend's own reason (e.g. git's dirty-checkout refusal) is the
     // whole message; checkout and registry entry are left untouched.
     return errorResult(removeError || "failed to remove worktree", {
@@ -788,19 +896,12 @@ async function executeWorktreeClose(params, ctx) {
   // successful, and the registry entry is left in place. Covers both the
   // herdr and the git removal paths; a legitimate single-checkout removal
   // (only the target gone) never trips it.
-  try {
-    const afterSet = new Set(after.map((item) => path.resolve(item.path)));
-    const vanished = live
-      .map((item) => path.resolve(item.path))
-      .filter((p) => p !== resolvedTarget && !afterSet.has(p));
-    if (vanished.length > 0) {
-      return errorResult(
-        `worktree removal removed an unexpected checkout at ${vanished[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
-        { branch, path: target, force, removedBy, vanished },
-      );
-    }
-  } catch {
-    // Path comparison must never mask the verification below.
+  const vanished = vanishedCheckouts(git, repo.root, live, resolvedTarget, after);
+  if (vanished.length > 0) {
+    return errorResult(
+      `worktree removal removed an unexpected checkout at ${vanished[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
+      { branch, path: target, force, removedBy, vanished },
+    );
   }
   if (after.some((item) => path.resolve(item.path) === resolvedTarget)) {
     return errorResult(
@@ -830,7 +931,7 @@ async function executeWorktreeClose(params, ctx) {
 const worktreeListTool = defineTool({
   name: "worktree_list",
   label: "Worktree List",
-  description: "List agent worktrees registered for this repository, cross-checked against live checkouts with their owning thread. Pass all:true to also show live checkouts the registry does not know about. Read-only: never mutates the registry.",
+  description: "List agent worktrees registered for this repository, cross-checked against live checkouts with their owning thread. Pass all:true to also show live checkouts the registry does not know about. Rows whose paths no longer exist are excluded and pruned from the registry.",
   parameters: Type.Object({
     all: opt(Type.Boolean({ description: "Include live checkouts the registry does not know about" })),
   }),

@@ -729,3 +729,74 @@ describe('R4-5: failed writes never leave a temp file behind', { concurrency: fa
     assert.deepEqual(fs.readFileSync(file), beforeBytes, 'registry bytes unchanged after failed write');
   });
 });
+
+describe('S13: close drops a row whose path reaches the checkout through a symlink', { concurrency: false }, () => {
+  test('a hand-written symlink row is dropped with the removed checkout', async () => {
+    const root = makeRepo('s13-sym');
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realT = fs.realpathSync(dirT); track(realT);
+    // A hand-written row whose path is a SYMLINK to the removed checkout.
+    const linkT = path.join(path.dirname(root), `${path.basename(root)}-link`);
+    fs.symlinkSync(realT, linkT); track(linkT);
+    const reg = require('../lib/worktree-registry.js');
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    // Hand-write the second row (a symlink path no upsert would produce).
+    const file = reg.registryPath(root);
+    const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const now = new Date().toISOString();
+    doc.worktrees.push({ branch: 'feat-alias', path: linkT, thread: 't-9', issues: [1], odd: [], createdAt: now, updatedAt: now });
+    fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).worktrees.length, 2, 'fixture holds both rows');
+
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: scratchModeEnv().GENTLE_STATUS_STATE_DIR, HERDR_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-s13'), GENTLE_WORKTREE_THREAD: undefined });
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree close: ${realT}`);
+      assert.equal(fs.existsSync(realT), false, 'removed checkout gone from disk');
+      assert.ok(!livePaths(root).includes(realT), 'removed checkout not listed');
+      // Both rows reach the removed checkout: none may survive as stale bookkeeping.
+      const after = reg.readRegistry(root);
+      assert.equal(after.ok, true);
+      assert.deepEqual(after.worktrees, [], `no stale row survives the close: ${JSON.stringify(after.worktrees)}`);
+    } finally { restoreEnvCwd(); }
+  });
+});
+
+describe('S15: a removal that vanishes another checkout names it even on a non-zero exit', { concurrency: false }, () => {
+  test('git path: lying remover deletes another checkout and exits non-zero', async () => {
+    const root = makeRepo('s15-git');
+    const dirV = path.join(path.dirname(root), `${path.basename(root)}-victim`);
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-victim', dirV, 'HEAD']);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realV = fs.realpathSync(dirV); track(realV);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const reg = require('../lib/worktree-registry.js');
+    assert.equal(reg.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const beforeBytes = fs.readFileSync(reg.registryPath(root));
+    const which = spawnSync('which', ['git'], { encoding: 'utf8' });
+    assert.equal(which.status, 0);
+    const realGit = which.stdout.trim();
+    // A lying remover: deletes the VICTIM instead of the target, then
+    // exits non-zero. The close must still name the vanished path.
+    const shimDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-s15-gitshim-')));
+    fs.writeFileSync(path.join(shimDir, 'git'), `#!/bin/sh\ncase \"$*\" in\n  *\"worktree remove\"*) \"${realGit}\" -C \"${root}\" worktree remove --force \"${realV}\" >/dev/null 2>&1; echo \"lying remover failed\" >&2; exit 1;;\n  *) exec \"${realGit}\" \"$@\";;\nesac\n`, { mode: 0o755 });
+    const modeEnv = scratchModeEnv();
+    const savedPath = process.env.PATH;
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR, HERDR_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-s15'), GENTLE_WORKTREE_THREAD: undefined, PATH: `${shimDir}${path.delimiter}${savedPath}` });
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, true, `expected loud failure, got: ${text}`);
+      assert.ok(text.includes(realV), `error names the vanished path ${realV}, not just the failure: ${text}`);
+      assert.ok(fs.existsSync(realT), 'target checkout survives on disk');
+      assert.ok(livePaths(root).includes(realT), 'target still listed');
+      assert.deepEqual(fs.readFileSync(reg.registryPath(root)), beforeBytes, 'registry bytes unchanged (entry kept)');
+    } finally { restoreEnvCwd(); }
+  });
+});

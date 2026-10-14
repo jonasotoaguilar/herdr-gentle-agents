@@ -743,3 +743,61 @@ describe('worktree-issues: verifyIssues', { concurrency: false }, () => {
     }
   });
 });
+
+describe('worktree_create never unregisters a live checkout (S14)', { concurrency: false }, () => {
+  test('a hand-written row carrying the created branch keeps its live checkout registered', async () => {
+    const root = makeRepo('dupbranch');
+    // A live checkout owned by another thread, registered under the branch
+    // this call is about to create (a hand-written duplicate-branch row).
+    const liveDir = path.join(path.dirname(root), `${path.basename(root)}-live`);
+    track(liveDir);
+    git(root, ['worktree', 'add', '-b', 'feat-live', liveDir, 'HEAD']);
+    const liveAbs = fs.realpathSync(liveDir);
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.equal(registryLib.upsertWorktree(root, {
+      branch: 'feat/new', path: liveAbs, thread: 'other-thread', issues: [7], odd: [],
+    }).ok, true);
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_SHIM_EXIT: undefined,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-1' });
+      const target = expectedTarget(root, 'feat-new');
+      const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      // The other checkout is still on disk, still listed, still registered.
+      assert.ok(fs.existsSync(liveAbs), 'live checkout survives on disk');
+      assert.ok(listWorktreePaths(root).includes(liveAbs), 'live checkout still listed by git');
+      const after = registryLib.readRegistry(root);
+      assert.equal(after.ok, true);
+      assert.ok(
+        after.worktrees.some((entry) => entry.branch === 'feat/new' && path.resolve(entry.path) === liveAbs),
+        `the conflicting row keeps its registration: ${JSON.stringify(after.worktrees)}`,
+      );
+      assert.ok(
+        after.worktrees.some((entry) => entry.branch === 'feat/new' && path.resolve(entry.path) === target),
+        `the new checkout is registered too: ${JSON.stringify(after.worktrees)}`,
+      );
+      // The conflict is reported as a warning naming the kept checkout.
+      assert.ok(Array.isArray(result.details.warnings), 'warnings travel in details');
+      assert.ok(
+        result.details.warnings.join('\n').includes(liveAbs),
+        `the warning names the kept checkout ${liveAbs}: ${JSON.stringify(result.details.warnings)}`,
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+});

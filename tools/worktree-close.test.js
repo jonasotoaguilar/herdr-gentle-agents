@@ -427,7 +427,7 @@ describe('worktree_list output', { concurrency: false }, () => {
     }
   });
 
-  test('a registered path deleted out of band is marked `missing` and kept', async () => {
+  test('a registered path deleted out of band is excluded from the listing and pruned (S16)', async () => {
     const root = makeRepo('list-drift');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([35]);
@@ -437,20 +437,25 @@ describe('worktree_list output', { concurrency: false }, () => {
       const target = addRegistered(root, 'feat/drifted', { thread: 'thread-1', issues: [35] });
       git(root, ['worktree', 'remove', target]);
       assert.ok(!livePaths(root).includes(target), 'the checkout is really gone');
-      const before = registryBytes(root);
 
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callList(tools, {}, ctx);
       assert.equal(result.isError, undefined);
-      assert.equal(
-        resultText(result),
-        `worktree list: ${target} feat/drifted thread=thread-1 issues=35 missing`,
+      // S16 self-heal: nothing registered and real, so the listing is
+      // empty — and the dead row is pruned from the registry, named in
+      // details.pruned and in the warning (which also says git may still
+      // record the checkout until `git worktree prune`).
+      assert.equal(resultText(result), 'worktree list: none');
+      assert.deepEqual(result.details.worktrees, []);
+      assert.deepEqual(result.details.pruned, [target]);
+      assert.ok(
+        result.details.warnings.join('\n').includes(target),
+        `the warning names the pruned path: ${JSON.stringify(result.details.warnings)}`,
       );
-      // Drift is reported, never repaired: the entry stays put.
-      assert.deepEqual(registryBytes(root), before);
       const registryLib = require('../lib/worktree-registry.js');
-      assert.equal(registryLib.findByBranch(root, 'feat/drifted').path, target);
+      assert.equal(registryLib.findByBranch(root, 'feat/drifted'), null);
+      assert.deepEqual(registryLib.readRegistry(root).worktrees, []);
     } finally {
       restoreEnv();
     }
