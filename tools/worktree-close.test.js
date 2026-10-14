@@ -834,3 +834,103 @@ describe('worktree_close', { concurrency: false }, () => {
     }
   });
 });
+
+describe('F4: vanished checkout named even when the post-removal listing fails', { concurrency: false }, () => {
+  function makeFailingListGitShim({ root, victim, exitCode }) {
+    const which = spawnSync('which', ['git'], { encoding: 'utf8' });
+    assert.equal(which.status, 0);
+    const realGit = which.stdout.trim();
+    const shimDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-f4-gitshim-')));
+    const marker = path.join(shimDir, 'removed.marker');
+    fs.writeFileSync(path.join(shimDir, 'git'), [
+      '#!/bin/sh',
+      'case "$*" in',
+      '  *"worktree list"*)',
+      `    if [ -f "${marker}" ]; then echo "git worktree list failed: boom" >&2; exit 1; fi`,
+      '    exec "$REAL_GIT" "$@";;',
+      '  *"worktree remove"*)',
+      `    "$REAL_GIT" -C "${root}" worktree remove --force "${victim}" >/dev/null 2>&1`,
+      `    touch "${marker}"`,
+      '    echo "lying remover failed" >&2',
+      `    exit ${exitCode};;`,
+      '  *) exec "$REAL_GIT" "$@";;',
+      'esac',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    return { shimDir, realGit };
+  }
+
+  test('exit 0 with post-list failing names the vanished path, registry unchanged', async () => {
+    const root = makeRepo('f4-zero');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    const dirV = path.join(path.dirname(root), `${path.basename(root)}-victim`);
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-victim', dirV, 'HEAD']);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realV = fs.realpathSync(dirV); track(realV);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.equal(registryLib.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const beforeBytes = registryBytes(root);
+    const shim = makeFailingListGitShim({ root, victim: realV, exitCode: 0 });
+    const savedPath = process.env.PATH;
+    setEnv({
+      ...stdEnv({ herdr, gh, modeEnv }),
+      HERDR_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-f4'),
+      PATH: `${shim.shimDir}${path.delimiter}${savedPath}`,
+      REAL_GIT: shim.realGit,
+    });
+    // The shim reads REAL_GIT from its own env: re-export explicitly.
+    process.env.REAL_GIT = shim.realGit;
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { path: realT, force: true }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, true, `expected loud failure, got: ${text}`);
+      assert.ok(text.includes(realV), `error names the vanished path ${realV}: ${text}`);
+      assert.deepEqual(registryBytes(root), beforeBytes, 'registry bytes unchanged (entry kept)');
+    } finally {
+      delete process.env.REAL_GIT;
+      restoreEnv();
+    }
+  });
+
+  test('non-zero exit with post-list failing names the vanished path, registry unchanged', async () => {
+    const root = makeRepo('f4-nonzero');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    const dirV = path.join(path.dirname(root), `${path.basename(root)}-victim`);
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-victim', dirV, 'HEAD']);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realV = fs.realpathSync(dirV); track(realV);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.equal(registryLib.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const beforeBytes = registryBytes(root);
+    const shim = makeFailingListGitShim({ root, victim: realV, exitCode: 1 });
+    const savedPath = process.env.PATH;
+    setEnv({
+      ...stdEnv({ herdr, gh, modeEnv }),
+      HERDR_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-f4'),
+      PATH: `${shim.shimDir}${path.delimiter}${savedPath}`,
+    });
+    process.env.REAL_GIT = shim.realGit;
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { path: realT, force: true }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, true, `expected loud failure, got: ${text}`);
+      assert.ok(text.includes(realV), `error names the vanished path ${realV}, not a bare failure: ${text}`);
+      assert.deepEqual(registryBytes(root), beforeBytes, 'registry bytes unchanged (entry kept)');
+    } finally {
+      delete process.env.REAL_GIT;
+      restoreEnv();
+    }
+  });
+});

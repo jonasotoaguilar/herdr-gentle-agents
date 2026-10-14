@@ -800,4 +800,150 @@ describe('worktree_create never unregisters a live checkout (S14)', { concurrenc
       restoreEnv();
     }
   });
+
+  test('F2a: a same-branch row that is a SYMLINK to a live checkout is kept and warned about', async () => {
+    const root = makeRepo('symlink-conflict');
+    const liveDir = path.join(path.dirname(root), `${path.basename(root)}-live`);
+    track(liveDir);
+    git(root, ['worktree', 'add', '-b', 'feat-live', liveDir, 'HEAD']);
+    const liveAbs = fs.realpathSync(liveDir);
+    // A hand-written row whose path is a SYMLINK reaching the live checkout.
+    const linkAbs = path.join(path.dirname(root), `${path.basename(root)}-link`);
+    track(linkAbs);
+    fs.symlinkSync(liveAbs, linkAbs);
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.equal(registryLib.upsertWorktree(root, {
+      branch: 'feat/new', path: linkAbs, thread: 'other-thread', issues: [7], odd: [],
+    }).ok, true);
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_SHIM_EXIT: undefined,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-1' });
+      const target = expectedTarget(root, 'feat-new');
+      const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      const after = registryLib.readRegistry(root);
+      assert.equal(after.ok, true);
+      assert.ok(
+        after.worktrees.some((entry) => entry.branch === 'feat/new' && entry.path === linkAbs),
+        `the symlink row keeps its registration: ${JSON.stringify(after.worktrees)}`,
+      );
+      assert.ok(
+        after.worktrees.some((entry) => entry.branch === 'feat/new' && path.resolve(entry.path) === target),
+        `the new checkout is registered too: ${JSON.stringify(after.worktrees)}`,
+      );
+      assert.ok(
+        result.details.warnings.join('\n').includes(linkAbs),
+        `the warning names the kept symlink path ${linkAbs}: ${JSON.stringify(result.details.warnings)}`,
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('F2b: thread stale cleanup keeps an owned SYMLINK to a live checkout', async () => {
+    const root = makeRepo('symlink-stale');
+    const liveDir = path.join(path.dirname(root), `${path.basename(root)}-live`);
+    track(liveDir);
+    git(root, ['worktree', 'add', '-b', 'feat-lived', liveDir, 'HEAD']);
+    const liveAbs = fs.realpathSync(liveDir);
+    const linkAbs = path.join(path.dirname(root), `${path.basename(root)}-owned-link`);
+    track(linkAbs);
+    fs.symlinkSync(liveAbs, linkAbs);
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.equal(registryLib.upsertWorktree(root, {
+      branch: 'feat/owned', path: linkAbs, thread: 'creator', issues: [7], odd: [],
+    }).ok, true);
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: 'creator',
+    });
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'creator' });
+      const result = await callCreate(tools, { branch: 'feat/whatever', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected idempotent return, got: ${text}`);
+      assert.equal(result.details.created, false, 'no second checkout is created');
+      assert.equal(result.details.path, linkAbs, 'the owned symlink checkout is returned');
+      const after = registryLib.readRegistry(root);
+      assert.ok(
+        after.worktrees.some((entry) => entry.thread === 'creator' && entry.path === linkAbs),
+        `the owned symlink row survives: ${JSON.stringify(after.worktrees)}`,
+      );
+      assert.ok(fs.existsSync(liveAbs), 'live checkout survives on disk');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('F3: dead-first/live-second same-branch rows still warn naming the live path', async () => {
+    const root = makeRepo('dead-first');
+    const liveDir = path.join(path.dirname(root), `${path.basename(root)}-live`);
+    track(liveDir);
+    git(root, ['worktree', 'add', '-b', 'feat-lived', liveDir, 'HEAD']);
+    const liveAbs = fs.realpathSync(liveDir);
+    const registryLib = require('../lib/worktree-registry.js');
+    const deadAbs = path.join(path.dirname(root), `${path.basename(root)}-dead-gone`);
+    // DEAD row first: same branch, absolute path that names no checkout.
+    assert.equal(registryLib.upsertWorktree(root, {
+      branch: 'feat/new', path: deadAbs, thread: 'other-thread', issues: [7], odd: [],
+    }).ok, true);
+    // LIVE row second: append (upsert would replace the dead row).
+    assert.equal(registryLib.appendWorktree(root, {
+      branch: 'feat/new', path: liveAbs, thread: 'other-thread', issues: [7], odd: [],
+    }).ok, true);
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_SHIM_EXIT: undefined,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-1' });
+      const target = expectedTarget(root, 'feat-new');
+      const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      const after = registryLib.readRegistry(root);
+      assert.ok(
+        after.worktrees.some((entry) => entry.branch === 'feat/new' && path.resolve(entry.path) === liveAbs),
+        `the live row survives: ${JSON.stringify(after.worktrees)}`,
+      );
+      assert.ok(
+        result.details.warnings.join('\n').includes(liveAbs),
+        `the warning names the kept live path ${liveAbs}: ${JSON.stringify(result.details.warnings)}`,
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
 });

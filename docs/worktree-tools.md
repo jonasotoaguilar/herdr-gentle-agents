@@ -76,7 +76,13 @@ prune`. When the prune write itself fails, the listing still excludes
 them and the warning says so (plus `details.pruneError`). A path that
 exists but git no longer lists stays `missing` and is never pruned; a
 non-absolute entry can never be verified without the process cwd, so it
-stays `missing` (never live), exactly as before.
+stays `missing` (never live), exactly as before. The `all: true` extras
+obey the same rule: they are built from the post-prune registry, and every
+git entry is existence-checked on its absolute form (a relative entry
+resolves against the repository root, never the process cwd) — a path that
+does not exist is never reported, in any status, so a hand-deleted checkout
+git still records cannot reappear as `unregistered` on the next call, and
+`details.worktrees` never carries a path that fails the existence check.
 
 ## Registry
 
@@ -113,8 +119,14 @@ already carries the branch being created but points at a DIFFERENT live
 checkout, that row is not replaced — it keeps its registration, the new
 checkout is recorded alongside it (`appendWorktree`, which always appends
 instead of replacing by branch), and the conflict is reported in the
-create `warnings` naming the kept checkout. Replacement by branch still
-applies to every other row.
+create `warnings` naming the kept checkout. Liveness is identity-based:
+the row's resolved realpath (falling back to the resolved absolute path
+when the filesystem cannot resolve it, never the process cwd) is compared
+against the realpaths of the live checkouts, so a row that reaches a live
+checkout through a symlink is live and is kept and warned about. Every
+same-branch row is examined, so the warning names the live checkout
+regardless of row order — even when a dead row comes first. Replacement by
+branch still applies to every other row.
 
 Registry entry paths must be absolute. A `worktree_close` whose entry
 path is not absolute is refused with an error naming the entry and the
@@ -133,7 +145,10 @@ duplicate and no hand-written symlink row survives the close: one path
 identity end to end from resolve
 through verify and remove to drop, so duplicate branches or a branch that
 equals another entry's path can never divert the drop; a relative row
-still cannot be matched, which stays documented. `removeWorktree`'s
+still cannot be matched, which stays documented. The readlink walk is
+bounded: a hand-written chain longer than 10 links is not followed, so a
+row behind a longer chain can survive a close. That is a stated bound, not
+a silent bug. `removeWorktree`'s
 branch-first behaviour is kept for any other caller and is unreachable in
 the close flow. A Herdr workspace id is used only when its list entry's
 path resolves to exactly that same absolute target: absolute entries
@@ -155,7 +170,12 @@ disappeared, the close fails naming the vanished path (on a non-zero exit
 the backend's own reason is quoted first, then the vanished path),
 refuses to treat the close as successful, and leaves the registry entry
 in place in both cases.
-Removing only the target never trips this check.
+Removing only the target never trips this check. The comparison never
+depends on the post-removal listing alone: when that listing fails, the
+close falls back to an existence check on the pre-removal live paths
+(excluding the target) — a pre-removal live checkout whose directory no
+longer exists has vanished and is named, on both exit codes and both
+removal paths, with the registry entry kept in every case.
 
 ## Creation path
 
@@ -254,7 +274,11 @@ One worktree per thread. Thread identity resolves from
 fails closed (`cannot resolve thread identity: …`) and never adopts
 another thread's checkout. A thread that already owns a registered,
 still-live worktree gets that checkout back — `worktree create: <path>`
-again with `created: false` — never a second checkout. A stale entry
+again with `created: false` — never a second checkout. Still-live is
+identity-based (the owned row's resolved realpath against the live
+checkouts' realpaths, never the process cwd), so an owned row that reaches
+a live checkout through a symlink is live and is returned, never dropped.
+A stale entry
 (checkout gone) is dropped best-effort and creation proceeds fresh.
 The cleanup drops the one row it identified as the thread's own by row
 identity — the (branch, path) pair of the selected entry

@@ -313,4 +313,35 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       restoreEnv();
     }
   });
+
+  test('F1: a hand-deleted checkout git still lists never reappears as unregistered', async () => {
+    const root = makeRepo('prune-hand-deleted');
+    setEnv(stdEnv());
+    try {
+      const live = addRegistered(root, 'feat/live', { thread: 'thread-1', issues: [35] });
+      const dead = addRegistered(root, 'feat/dead', { thread: 'thread-2', issues: [7] });
+      // Hand-delete the checkout directory: git still records it, the
+      // path no longer exists. Never `git worktree remove` here.
+      fs.rmSync(dead, { recursive: true, force: true });
+      assert.equal(fs.existsSync(dead), false, 'the path no longer exists');
+      assert.ok(livePaths(root).includes(dead), 'git still records the deleted checkout');
+
+      const tools = await loadExtension();
+      const first = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      assert.equal(first.isError, undefined);
+      assert.deepEqual(first.details.pruned, [dead], 'first call prunes the dead row');
+
+      const second = await tools.get('worktree_list').execute('c', { all: true }, undefined, undefined, makeCtx(root));
+      const text = resultText(second);
+      assert.equal(second.isError, undefined, `expected success, got: ${text}`);
+      assert.ok(!text.includes(dead), `second all:true call must not contain the dead path: ${text}`);
+      for (const item of second.details.worktrees) {
+        assert.equal(fs.existsSync(item.path), true, `details.worktrees carries no non-existent path: ${item.path}`);
+      }
+      assert.ok(!second.details.worktrees.some((item) => item.path === dead), 'dead path absent from details');
+      assert.ok(livePaths(root).includes(live), 'live checkout still listed');
+    } finally {
+      restoreEnv();
+    }
+  });
 });
