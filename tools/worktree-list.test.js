@@ -440,3 +440,34 @@ describe('consolidated checkout liveness: files + relative git listing', { concu
     }
   });
 });
+
+describe('H2: one liveness predicate everywhere in the list', { concurrency: false }, () => {
+  test('a symlink spelling of a live checkout is live, never missing', async () => {
+    const root = makeRepo('symlink-live');
+    setEnv(stdEnv());
+    try {
+      const live = addRegistered(root, 'feat/live', { thread: 'thread-1', issues: [35] });
+      const linkAbs = path.join(path.dirname(root), `${path.basename(root)}-alias-link`);
+      track(linkAbs);
+      fs.symlinkSync(live, linkAbs);
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.upsertWorktree(root, {
+        branch: 'feat/alias', path: linkAbs, thread: 'thread-2', issues: [7], odd: [],
+      }).ok, true);
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const aliasLine = text.split('\n').find((line) => line.includes('feat/alias'));
+      assert.ok(aliasLine, `the alias row is listed: ${text}`);
+      assert.ok(!aliasLine.endsWith(' missing'), `a symlink to a live checkout is live, never missing: ${aliasLine}`);
+      const aliasItem = result.details.worktrees.find((item) => item.branch === 'feat/alias');
+      assert.ok(aliasItem, 'the alias row is in details');
+      assert.equal(aliasItem.status, 'live');
+      assert.deepEqual(result.details.pruned, [], 'nothing is pruned');
+    } finally {
+      restoreEnv();
+    }
+  });
+});

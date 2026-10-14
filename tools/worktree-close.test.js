@@ -934,3 +934,33 @@ describe('F4: vanished checkout named even when the post-removal listing fails',
     }
   });
 });
+
+describe('H2: a file at a path is never a live checkout in the close', { concurrency: false }, () => {
+  test('a checkout replaced by a file is stale, the entry is kept and nothing is removed', async () => {
+    const root = makeRepo('h2-file-close');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const target = addRegistered(root, 'feat/filed', { thread: 'thread-1', issues: [35] });
+      // The checkout directory becomes a FILE git still records: the same
+      // path list reports `missing` must never read `live` here either.
+      fs.rmSync(target, { recursive: true, force: true });
+      fs.writeFileSync(target, 'not a checkout\n');
+      assert.ok(livePaths(root).includes(target), 'git still records the path');
+      const beforeRegistry = registryBytes(root);
+
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { branch: 'feat/filed', force: true }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, true, `a file is never a live checkout, got: ${text}`);
+      assert.match(text, /not a live checkout.*stale registry entry/i, `the stale entry is named and kept: ${text}`);
+      assert.deepEqual(registryBytes(root), beforeRegistry, 'registry untouched: the row stays for inspection');
+      assert.ok(fs.existsSync(target), 'the file is left alone');
+    } finally {
+      restoreEnv();
+    }
+  });
+});

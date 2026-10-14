@@ -1029,3 +1029,129 @@ describe('consolidated checkout liveness: ghost idempotency + conflict guard', {
     }
   });
 });
+
+describe('H1: a stale git record never blocks a create (prune + recover)', { concurrency: false }, () => {
+  test('same-branch recreate after a hand-delete succeeds, reports the prune, and close can act on the new row', async () => {
+    const root = makeRepo('h1-same');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_SHIM_EXIT: undefined,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const first = await callCreate(tools, { branch: 'feat/h1-same', issues: [35] }, makeCtx({ repoRoot: root, thread: 'thread-h1' }).ctx);
+      assert.equal(first.isError, undefined, `setup create failed: ${resultText(first)}`);
+      const target = first.details.path;
+      // The user deletes the checkout by hand: git still records it.
+      fs.rmSync(target, { recursive: true, force: true });
+      assert.equal(fs.existsSync(target), false, 'checkout hand-deleted');
+      assert.ok(listWorktreePaths(root).includes(target), 'git still records the deleted checkout');
+
+      const second = await callCreate(tools, { branch: 'feat/h1-same', issues: [35] }, makeCtx({ repoRoot: root, thread: 'thread-h1' }).ctx);
+      const text = resultText(second);
+      assert.equal(second.isError, undefined, `expected stale-record recovery, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      assert.equal(second.details.created, true, 'a fresh checkout is created, never created:false at a ghost');
+      assert.ok(fs.existsSync(target), 'a real checkout is back on disk');
+      assert.ok(listWorktreePaths(root).includes(target), 'git lists the new checkout');
+      const registryLib = require('../lib/worktree-registry.js');
+      const row = registryLib.findByBranch(root, 'feat/h1-same');
+      assert.ok(row, 'the registry row is back');
+      assert.equal(path.resolve(row.path), path.resolve(target));
+      assert.ok(fs.existsSync(row.path), 'the row points at a real checkout');
+      assert.ok(Array.isArray(second.details.pruned) && second.details.pruned.length > 0, `the prune is reported in details: ${JSON.stringify(second.details)}`);
+      assert.ok(
+        (second.details.warnings || []).join('\n').includes('prune'),
+        `the warning names the recovery: ${JSON.stringify(second.details.warnings)}`,
+      );
+
+      // The recovered row is closable: close acts on it and keeps the branch.
+      const closed = await tools.get('worktree_close').execute(
+        'call-9', { branch: 'feat/h1-same', force: true }, undefined, undefined,
+        makeCtx({ repoRoot: root, thread: 'thread-h1' }).ctx,
+      );
+      assert.equal(closed.isError, undefined, `close must act on the new row, got: ${resultText(closed)}`);
+      assert.equal(resultText(closed), `worktree close: ${target}`);
+      assert.ok(!listWorktreePaths(root).includes(target), 'checkout removed');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('slug collision with a deleted checkout succeeds instead of refusing the stale path', async () => {
+    const root = makeRepo('h1-slug');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    // `feat/foo` and `feat-foo` flatten to the same target. Occupy it,
+    // then hand-delete it so git still records a checkout that is gone.
+    const target = expectedTarget(root, 'feat-foo');
+    track(target);
+    git(root, ['worktree', 'add', '-b', 'feat/foo', target, 'HEAD']);
+    fs.rmSync(target, { recursive: true, force: true });
+    assert.equal(fs.existsSync(target), false, 'checkout hand-deleted');
+    assert.ok(listWorktreePaths(root).includes(target), 'git still records the deleted checkout');
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_SHIM_EXIT: undefined,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const result = await callCreate(tools, { branch: 'feat-foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 'thread-new' }).ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected slug-collision recovery, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      assert.ok(fs.existsSync(target), 'a real checkout is on disk');
+      assert.ok(listWorktreePaths(root).includes(target), 'git lists the new checkout');
+      const registryLib = require('../lib/worktree-registry.js');
+      const row = registryLib.findByBranch(root, 'feat-foo');
+      assert.ok(row && fs.existsSync(row.path), 'the registry row points at a real checkout');
+      assert.ok(Array.isArray(result.details.pruned) && result.details.pruned.length > 0, `the prune is reported: ${JSON.stringify(result.details)}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('H3: relative git listing paths never resolve against the process cwd', { concurrency: false }, () => {
+  test('isPathInAnyCheckout gives the same verdict from a decoy cwd', async () => {
+    const root = makeRepo('decoy-cwd');
+    const wtDir = path.join(path.dirname(root), `${path.basename(root)}-wt`);
+    track(wtDir);
+    git(root, ['worktree', 'add', '-b', 'feat/decoy', wtDir, 'HEAD']);
+    const liveAbs = fs.realpathSync(wtDir);
+    const rel = path.relative(root, liveAbs);
+    assert.ok(!path.isAbsolute(rel), `expected a relative spelling, got: ${rel}`);
+    const decoyBase = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-decoy-')));
+    const decoy = path.join(decoyBase, 'sub', 'deep');
+    fs.mkdirSync(decoy, { recursive: true });
+    const gitLib = require('../lib/worktree-git.js');
+    const origList = gitLib.listWorktrees;
+    gitLib.listWorktrees = () => [{ path: rel, branch: 'feat/decoy', head: null, detached: false, bare: false }];
+    const savedCwd = process.cwd();
+    try {
+      process.chdir(root);
+      const atRoot = gitLib.isPathInAnyCheckout(root, liveAbs);
+      process.chdir(decoy);
+      const atDecoy = gitLib.isPathInAnyCheckout(root, liveAbs);
+      assert.equal(atRoot, true, 'the relative listing blocks from the repository root');
+      assert.equal(atDecoy, true, 'the same verdict holds from a decoy cwd (never resolved against process.cwd)');
+    } finally {
+      gitLib.listWorktrees = origList;
+      try { process.chdir(savedCwd); } catch {}
+    }
+  });
+});
