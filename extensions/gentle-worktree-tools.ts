@@ -43,6 +43,92 @@ function toolCwd(ctx) {
   return process.cwd();
 }
 
+// Consolidated liveness predicate: the ONE definition of "is this path a
+// real, live checkout?" Every call site below (list liveness + prune +
+// extras, create idempotency + conflict guard + refusals + verification,
+// close pre/post checks + vanished comparison) resolves through this, so
+// the question is never re-answered with slightly different logic.
+//
+// Returns {absolute, real, exists, isDirectory} and never throws:
+// - absolute: the path resolved WITHOUT the process cwd (absolute inputs
+//   via path.resolve, which never consults the cwd for them; relative
+//   inputs against the repository root). A non-absolute input with no
+//   repository root yields no state at all (absolute null).
+// - real: the symlink-resolved realpath, or null when the filesystem
+//   cannot resolve it (missing checkout, dangling link).
+// - exists: something is present (statSync, which FOLLOWS symlinks, so a
+//   dangling link reads as absent).
+// - isDirectory: that something is a directory — a FILE at the path is
+//   not a checkout, so liveness always requires exists && isDirectory.
+function checkoutState(entryPath, repoRoot) {
+  const none = { absolute: null, real: null, exists: false, isDirectory: false };
+  try {
+    if (typeof entryPath !== "string" || entryPath.length === 0) return { ...none };
+    let absolute = null;
+    try {
+      if (path.isAbsolute(entryPath)) absolute = path.resolve(entryPath);
+      else {
+        if (typeof repoRoot !== "string" || repoRoot.length === 0) return { ...none };
+        absolute = path.resolve(repoRoot, entryPath);
+      }
+    } catch {
+      return { ...none };
+    }
+    if (absolute === null) return { ...none };
+    let exists = false;
+    let isDirectory = false;
+    try {
+      isDirectory = fs.statSync(absolute).isDirectory();
+      exists = true;
+    } catch {
+      exists = false;
+      isDirectory = false;
+    }
+    let real = null;
+    try {
+      real = fs.realpathSync(absolute);
+    } catch {
+      real = null;
+    }
+    return { absolute, real, exists, isDirectory };
+  } catch {
+    return { absolute: null, real: null, exists: false, isDirectory: false };
+  }
+}
+
+// Realpath identities of live checkouts, for symlink-transparent
+// liveness: a registry row that reaches a live checkout through a
+// symlink shares its realpath even though the spellings differ. Built
+// through checkoutState: a git entry contributes only when something
+// exists there AND it is a directory, so a hand-deleted checkout git
+// still records never makes a row live. Relative list paths (never
+// expected from git) resolve against the repository root, never the
+// process cwd.
+function liveIdentities(listed, repoRoot) {
+  const ids = new Set();
+  for (const entry of listed || []) {
+    if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
+    const st = checkoutState(entry.path, repoRoot);
+    if (!st.exists || !st.isDirectory) continue;
+    if (st.real !== null) ids.add(st.real);
+    else if (st.absolute !== null) ids.add(st.absolute);
+  }
+  return ids;
+}
+
+// A git listing record names a LIVE checkout only through the one
+// predicate: its path resolves (absolute inputs directly, relative inputs
+// against the repository root, never the process cwd) AND something
+// exists there AND it is a directory. A record git still holds for a
+// hand-deleted checkout, or for a path replaced by a FILE, is stale and
+// never blocks a create, never reads live in the list, and never passes
+// the close pre-check.
+function isLiveGitRecord(entry, repoRoot) {
+  if (!entry || typeof entry.path !== "string" || entry.path.length === 0) return false;
+  const st = checkoutState(entry.path, repoRoot);
+  return st.absolute !== null && st.exists && st.isDirectory;
+}
+
 // Marks a TypeBox property optional. Production `Type` is the full TypeBox
 // export, but older test doubles stub only the constructors `worktree_create`
 // needed; falling back to the bare schema keeps the module loadable there
@@ -172,14 +258,24 @@ async function executeWorktreeCreate(params, ctx) {
   // by definition checked out at its target, so checking (d) first would
   // make this return unreachable.
   const owned = registry.findByThread(repo.root, thread);
+  // A stale owned row is dropped only after its replacement checkout is
+  // verified (see (h)): dropping it here would leave an empty registry
+  // behind a refusal with no way back.
+  let staleOwned = null;
   if (owned) {
-    // Only an absolute owned path can be matched against the live list:
-    // a relative one is never resolved against the process cwd.
-    const ownedAbsolute = typeof owned.path === "string" && path.isAbsolute(owned.path)
-      ? path.resolve(owned.path)
-      : null;
-    const stillLive = ownedAbsolute !== null
-      && listed.some((entry) => path.resolve(entry.path) === ownedAbsolute);
+    // Liveness is the consolidated checkoutState: the owned row is still
+    // live only when something exists there AND it is a directory AND its
+    // resolved realpath matches a live checkout's realpath, so an owned
+    // SYMLINK to a live checkout is live and never dropped as stale while
+    // a hand-deleted checkout git still records is stale (its state has
+    // nothing existing, so it can never match). A relative owned path can
+    // never match, exactly as before.
+    const ownedState = (typeof owned.path === "string" && path.isAbsolute(owned.path))
+      ? checkoutState(owned.path, repo.root)
+      : { absolute: null, real: null, exists: false, isDirectory: false };
+    const stillLive = ownedState.real !== null
+      && ownedState.exists && ownedState.isDirectory
+      && liveIdentities(listed, repo.root).has(ownedState.real);
     if (stillLive) {
       return textResult(
         successText(owned.path),
@@ -187,42 +283,139 @@ async function executeWorktreeCreate(params, ctx) {
         false,
       );
     }
-    // Stale entry (checkout gone): drop it best-effort and create fresh.
-    // Drop by row identity — the (branch, path) pair of the entry this
-    // thread owns — never by branch alone and never by a path-key lookup
-    // that can match a different row. With a hand-edited registry holding
-    // a live entry sharing the branch, either shortcut could delete the
-    // live entry instead of the stale one.
-    try {
-      if (typeof registry.removeWorktreeExact === "function") registry.removeWorktreeExact(repo.root, owned.branch, owned.path);
-      else if (ownedAbsolute !== null) registry.removeWorktreeByPath(repo.root, ownedAbsolute);
-      else registry.removeWorktree(repo.root, owned.branch);
-    } catch {
-      // Creation below still produces a correct checkout + entry.
-    }
+    // Stale entry (checkout gone): remembered, not dropped. The drop
+    // happens after the replacement checkout verifies, so a refusal or a
+    // failed creation below still leaves this row intact with a way back.
+    staleOwned = owned;
   }
 
-  // (d) Refusals: branch checked out anywhere, target already live, or
-  // target inside any checkout / the git common dir.
-  const checkedOutAt = listed.find((entry) => entry.branch === branch);
-  if (checkedOutAt) {
-    return errorResult(
-      `branch '${branch}' is already checked out at ${checkedOutAt.path}: pick another branch or close that worktree first`,
-      { branch, issues: issueNumbers, path: checkedOutAt.path },
-    );
-  }
-  const liveAtTarget = listed.find((entry) => path.resolve(entry.path) === resolvedTarget);
-  if (liveAtTarget) {
-    return errorResult(
-      `target path ${target} is already a live worktree (branch '${liveAtTarget.branch}'): pick another branch`,
-      { branch, issues: issueNumbers, path: target },
-    );
+  // (d) Refusals: the branch already checked out at a LIVE path, the
+  // target already a LIVE worktree, or the target inside any checkout /
+  // the git common dir. Every record is judged through the one predicate
+  // (exists AND is-a-directory): a git record whose path is not a live
+  // checkout never blocks a create on its own. When such stale records are
+  // the ONLY thing holding the branch or the target path, the tool
+  // recovers with a scoped `git worktree prune` (which drops only records
+  // whose directories are missing) and proceeds to create; a branch
+  // genuinely checked out at a LIVE path is refused exactly as before,
+  // with the registry row left intact either way.
+  const branchRecords = listed.filter((entry) => entry.branch === branch);
+  const liveBranchRecords = branchRecords.filter((entry) => isLiveGitRecord(entry, repo.root));
+  const targetRecords = listed.filter((entry) => {
+    const st = checkoutState(entry.path, repo.root);
+    return st.absolute !== null && st.absolute === resolvedTarget;
+  });
+  const liveTargetRecords = targetRecords.filter((entry) => isLiveGitRecord(entry, repo.root));
+  // Stale records recovered below; reported in details.pruned and in the
+  // create warnings so the caller can name what `git worktree prune` took.
+  let prunedStale = [];
+  if (liveBranchRecords.length === 0 && liveTargetRecords.length === 0
+    && (branchRecords.length > 0 || targetRecords.length > 0)) {
+    const stalePaths = [];
+    for (const entry of [...branchRecords, ...targetRecords]) {
+      const st = checkoutState(entry.path, repo.root);
+      if (st.absolute !== null && !stalePaths.includes(st.absolute)) stalePaths.push(st.absolute);
+    }
+    const pruned = git.runArgv("git", ["worktree", "prune"], { cwd: repo.root });
+    if (pruned.status !== 0) {
+      const reason = ((pruned.stderr || pruned.error || "unknown error") + "").trim();
+      return errorResult(
+        `cannot create worktree for branch '${branch}': the branch or target path is recorded at ${stalePaths.join(", ")} but no live checkout exists there, and 'git worktree prune' failed (${reason}); run 'git worktree prune' by hand and retry; the registry was left untouched`,
+        { branch, issues: issueNumbers, path: target, pruned: [], pruneError: reason },
+      );
+    }
+    let relisted;
+    try {
+      relisted = git.listWorktrees(repo.root);
+    } catch (err) {
+      return errorResult(
+        `cannot create worktree for branch '${branch}': the branch or target path is recorded at ${stalePaths.join(", ")} but no live checkout exists there, and the worktree list could not be re-read after pruning (${(err && err.message) || err}); the registry was left untouched`,
+        { branch, issues: issueNumbers, path: target, pruned: [], pruneError: (err && err.message) || String(err) },
+      );
+    }
+    const stillLiveBranch = relisted.filter((entry) => entry.branch === branch && isLiveGitRecord(entry, repo.root));
+    const stillLiveTarget = relisted.filter((entry) => {
+      const st = checkoutState(entry.path, repo.root);
+      return st.absolute !== null && st.absolute === resolvedTarget && isLiveGitRecord(entry, repo.root);
+    });
+    if (stillLiveBranch.length > 0) {
+      return errorResult(
+        `branch '${branch}' is already checked out at ${stillLiveBranch[0].path}: pick another branch or close that worktree first`,
+        { branch, issues: issueNumbers, path: stillLiveBranch[0].path, pruned: [] },
+      );
+    }
+    if (stillLiveTarget.length > 0) {
+      return errorResult(
+        `target path ${target} is already a live worktree (branch '${stillLiveTarget[0].branch}'): pick another branch`,
+        { branch, issues: issueNumbers, path: target, pruned: [] },
+      );
+    }
+    const relistedAbs = new Set();
+    for (const entry of relisted) {
+      const st = checkoutState(entry.path, repo.root);
+      if (st.absolute !== null) relistedAbs.add(st.absolute);
+    }
+    prunedStale = stalePaths.filter((absolute) => !relistedAbs.has(absolute));
+    listed = relisted;
+  } else {
+    if (liveBranchRecords.length > 0) {
+      return errorResult(
+        `branch '${branch}' is already checked out at ${liveBranchRecords[0].path}: pick another branch or close that worktree first`,
+        { branch, issues: issueNumbers, path: liveBranchRecords[0].path },
+      );
+    }
+    const liveAtTarget = liveTargetRecords[0];
+    if (liveAtTarget) {
+      return errorResult(
+        `target path ${target} is already a live worktree (branch '${liveAtTarget.branch}'): pick another branch`,
+        { branch, issues: issueNumbers, path: target },
+      );
+    }
   }
   if (git.isPathInAnyCheckout(repo.root, target)) {
     return errorResult(
       `target path ${target} is inside an existing checkout: pick another branch`,
-      { branch, issues: issueNumbers, path: target },
+      { branch, issues: issueNumbers, path: target, pruned: prunedStale },
     );
+  }
+  // (e2) Non-directory occupant (I3): a file, FIFO, or dangling symlink at
+  // the target path would otherwise surface git's raw
+  // `fatal: '<path>' already exists` and leave the caller with no action.
+  // Judge through the one predicate (exists AND is-a-directory): when
+  // something is present via lstat but it is not a directory via stat
+  // (stat follows symlinks, so a dangling link counts as an occupant),
+  // refuse with an actionable message and no registry mutation, so removing
+  // the occupant lets the next create succeed.
+  try {
+    let occupant = null;
+    try {
+      fs.lstatSync(resolvedTarget);
+      occupant = true;
+    } catch {
+      occupant = null;
+    }
+    if (occupant) {
+      const st = checkoutState(resolvedTarget, repo.root);
+      if (!(st.exists && st.isDirectory)) {
+        let kind = "non-directory";
+        try {
+          const lst = fs.lstatSync(resolvedTarget);
+          if (lst.isSymbolicLink()) kind = "symlink";
+          else if (lst.isFile()) kind = "file";
+          else if (lst.isFIFO()) kind = "FIFO";
+          else if (lst.isDirectory()) kind = "non-directory";
+          else kind = "non-directory";
+        } catch {
+          kind = "non-directory";
+        }
+        return errorResult(
+          `target path ${target} is occupied by a ${kind} (not a directory): remove it by hand and retry; the registry was left untouched`,
+          { branch, issues: issueNumbers, path: target, pruned: prunedStale },
+        );
+      }
+    }
+  } catch {
+    // A failed probe never blocks: the backends report their own error.
   }
 
   // (f) Approval when the host offers dialog UI; non-interactive modes
@@ -276,13 +469,27 @@ async function executeWorktreeCreate(params, ctx) {
     if (fallback.status === 0) {
       createdBy = "git";
     } else {
-      createError = ((fallback.stderr || fallback.error || "unknown error") + "").trim();
+      // Same-branch recovery (H1): the branch ref survives the
+      // hand-deleted checkout, so `-b` fails with "already exists".
+      // Checking out the existing branch at the fresh path is the
+      // recovery; anything else keeps the backend's own error.
+      const ref = git.runArgv("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repo.root });
+      if (ref.status === 0) {
+        const retry = git.runArgv("git", ["worktree", "add", target, branch], { cwd: repo.root, timeoutMs: 120000 });
+        if (retry.status === 0) {
+          createdBy = "git";
+        } else {
+          createError = ((retry.stderr || retry.error || "unknown error") + "").trim();
+        }
+      } else {
+        createError = ((fallback.stderr || fallback.error || "unknown error") + "").trim();
+      }
     }
   }
   if (!createdBy) {
     return errorResult(
       `failed to create worktree for branch '${branch}': ${createError || "herdr and git both failed"}`,
-      { branch, issues: issueNumbers, path: target },
+      { branch, issues: issueNumbers, path: target, pruned: prunedStale },
     );
   }
 
@@ -294,31 +501,127 @@ async function executeWorktreeCreate(params, ctx) {
   } catch (err) {
     return errorResult(
       `worktree creation could not be verified at ${target}: ${(err && err.message) || err}`,
-      { branch, issues: issueNumbers, path: target, createdBy },
+      { branch, issues: issueNumbers, path: target, createdBy, pruned: prunedStale },
     );
   }
-  if (!after.some((entry) => path.resolve(entry.path) === resolvedTarget)) {
+  if (!after.some((entry) => {
+    const st = checkoutState(entry.path, repo.root);
+    return st.absolute !== null && st.absolute === resolvedTarget;
+  })) {
     return errorResult(
       `worktree creation could not be verified at ${target}`,
-      { branch, issues: issueNumbers, path: target, createdBy },
+      { branch, issues: issueNumbers, path: target, createdBy, pruned: prunedStale },
     );
   }
 
-  // (i) Registry: upsert the entry owned by this thread.
-  let stored;
+  // The stale owned row (if any) is dropped only now that the replacement
+  // checkout is verified: every failure above returns with the row intact.
+  // Drop by row identity — the (branch, path) pair of the entry this
+  // thread owned — never by branch alone and never by a path-key lookup
+  // that can match a different row, so a live entry sharing the branch
+  // survives whether the stale path is absolute or relative.
+  if (staleOwned) {
+    try {
+      if (typeof registry.removeWorktreeExact === "function") registry.removeWorktreeExact(repo.root, staleOwned.branch, staleOwned.path);
+      else if (typeof staleOwned.path === "string" && path.isAbsolute(staleOwned.path)) registry.removeWorktreeByPath(repo.root, path.resolve(staleOwned.path));
+      else registry.removeWorktree(repo.root, staleOwned.branch);
+    } catch {
+      // The upsert below still records the new checkout.
+    }
+  }
+
+  // I1 one-owner-per-path: when a create lands on its target path, that
+  // path ends with exactly ONE registry row — the one just created. Any
+  // other row whose path resolves to the same path (whatever its branch or
+  // thread, absolute spelling, trailing-slash spelling, or a symlink to the
+  // target) is stale by definition and is dropped as part of the create.
+  // Never drops a row for a different path; relative rows never match.
+  let replacedRows = [];
   try {
-    stored = registry.upsertWorktree(repo.root, {
+    const reread = registry.readRegistry(repo.root);
+    const rows = reread && reread.ok === true && Array.isArray(reread.worktrees) ? reread.worktrees : [];
+    const targetState = checkoutState(target, repo.root);
+    for (const row of rows) {
+      if (!row || typeof row.path !== "string" || !path.isAbsolute(row.path)) continue;
+      // Skip the stale-owned row already dropped above (same identity).
+      if (staleOwned && row.branch === staleOwned.branch && row.path === staleOwned.path) continue;
+      let same = false;
+      try {
+        const rowState = checkoutState(row.path, repo.root);
+        if (rowState.absolute !== null && targetState.absolute !== null && rowState.absolute === targetState.absolute) same = true;
+        else if (rowState.real !== null && targetState.real !== null && rowState.real === targetState.real) same = true;
+      } catch {
+        same = false;
+      }
+      if (same) replacedRows.push(row);
+    }
+    for (const row of replacedRows) {
+      try {
+        if (typeof registry.removeWorktreeExact === "function") registry.removeWorktreeExact(repo.root, row.branch, row.path);
+        else registry.removeWorktree(repo.root, row.branch);
+      } catch {
+        // Best effort: the upsert below still records the new checkout.
+      }
+    }
+  } catch {
+    replacedRows = [];
+  }
+
+  // (i) Registry: upsert the entry owned by this thread. A hand-written
+  // row that carries this branch but points at a DIFFERENT live checkout
+  // is never replaced: that checkout keeps its registration, the new
+  // checkout is recorded alongside it, and the conflict is reported as a
+  // warning naming the kept checkout. Liveness is the consolidated
+  // checkoutState (exists AND is a directory AND realpath equality, never
+  // the process cwd), so a row that reaches a live checkout through a
+  // symlink is live while a row whose path git still lists but which no
+  // longer exists is never a live conflict. EVERY
+  // same-branch row is examined, so a live row is warned about regardless
+  // of whether a dead row comes first. Only an absolute row path can name
+  // a live checkout (never resolved against the process cwd).
+  let stored;
+  const conflictWarnings = [];
+  try {
+    const afterIds = liveIdentities(after, repo.root);
+    const targetReal = checkoutState(target, repo.root).real;
+    let conflictLive = null;
+    try {
+      const reread = registry.readRegistry(repo.root);
+      const rows = reread && reread.ok === true && Array.isArray(reread.worktrees)
+        ? reread.worktrees
+        : [];
+      for (const row of rows) {
+        if (!row || row.branch !== branch) continue;
+        if (typeof row.path !== "string" || !path.isAbsolute(row.path)) continue;
+        const rowState = checkoutState(row.path, repo.root);
+        if (!rowState.exists || !rowState.isDirectory) continue;
+        if (rowState.real === null || !afterIds.has(rowState.real)) continue;
+        if (targetReal !== null && rowState.real === targetReal) continue;
+        conflictLive = row;
+        break;
+      }
+    } catch {
+      conflictLive = null;
+    }
+    const recorded = {
       branch,
       path: target,
       thread,
       issues: issueNumbers,
       odd: [],
-    });
+    };
+    if (conflictLive) {
+      stored = registry.appendWorktree(repo.root, recorded);
+      if (stored.ok) {
+        conflictWarnings.push(
+          `kept the existing registration for branch '${branch}' at ${conflictLive.path}: a live checkout is recorded there, so the new checkout at ${target} was registered alongside it`,
+        );
+      }
+    } else {
+      stored = registry.upsertWorktree(repo.root, recorded);
+    }
   } catch (err) {
-    return errorResult(
-      `worktree created at ${target} but the registry write failed: ${(err && err.message) || err}`,
-      { branch, issues: issueNumbers, path: target, createdBy },
-    );
+    stored = { ok: false, error: (err && err.message) || String(err) };
   }
   if (!stored.ok) {
     return errorResult(
@@ -367,9 +670,16 @@ async function executeWorktreeCreate(params, ctx) {
   const backupDetails = {};
   if (stored.backup) backupDetails.registryBackup = stored.backup;
   if (stored.backupError) backupDetails.registryBackupError = stored.backupError;
+  const pruneWarnings = prunedStale.length > 0
+    ? [`pruned ${prunedStale.length} stale worktree record(s) via 'git worktree prune': ${prunedStale.join(", ")}; git no longer records the missing checkout`]
+    : [];
+  const replacedWarnings = replacedRows.length > 0
+    ? [`replaced ${replacedRows.length} stale registry row(s) at the same path ${target}: ${replacedRows.map((r) => `branch '${r.branch}' at ${r.path}`).join(", ")}; one path has one owner, so the row just created is the only registration`]
+    : [];
+  const warnings = [...((hooks && hooks.warnings) || []), ...conflictWarnings, ...pruneWarnings, ...replacedWarnings];
   return textResult(
     successText(target),
-    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings: (hooks && hooks.warnings) || [], ...backupDetails },
+    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings, pruned: prunedStale, replacedRows: replacedRows.map((r) => ({ branch: r.branch, path: r.path })), ...backupDetails },
     false,
   );
 }
@@ -397,7 +707,17 @@ const worktreeCreateTool = defineTool({
 //   worktree list: <path> <branch> unregistered
 // Nothing registered (and nothing unregistered with all) is a single:
 //   worktree list: none
-// The registry is only read, never written, by this tool.
+// S16 self-heal: an ABSOLUTE registry path that no longer exists on disk
+// (the user deleted the checkout by hand) is removed from the listing AND
+// pruned from the registry in one atomic write, so the tool always
+// exposes only real checkouts. The pruned paths travel in
+// `details.pruned` and in a `details.warnings` line that also says git may
+// still record the checkout until `git worktree prune`; when the prune
+// write itself fails, the listing still excludes them and says so (plus
+// `details.pruneError`). A path that EXISTS but git no longer lists stays
+// `missing` and is never pruned. A non-absolute entry can never be
+// existence-checked without resolving against the process cwd, so it
+// stays listed as `missing` (never live), exactly as before.
 async function executeWorktreeList(params, ctx) {
   const git = libRequire("worktree-git.js");
   const registry = libRequire("worktree-registry.js");
@@ -443,19 +763,41 @@ async function executeWorktreeList(params, ctx) {
     );
   }
 
-  // Cross-check the registry against git: a checkout deleted out of band
-  // is reported as `missing`, never as live. Nothing is written back. A
-  // registry path that is not absolute is never resolved against the
+  // Cross-check the registry against git, then self-heal (S16), all
+  // through the consolidated checkoutState. A row is live only when its
+  // state exists AND is a directory AND its resolved identity (realpath,
+  // absolute fallback) matches a live checkout's — so a row reaching a
+  // live checkout through a symlink is live, while a FILE is never live
+  // even when git names its path. A row is pruned only when nothing exists
+  // at its path (a FILE exists, so it stays missing and is never pruned).
+  // A registry path that is not absolute is never resolved against the
   // process cwd, so it can never match a live checkout and is reported
-  // missing.
-  const liveByPath = new Map(live.map((entry) => [path.resolve(entry.path), entry]));
+  // missing (and never pruned). Git's own listing paths resolve through
+  // the same predicate, so a relative listing path resolves against the
+  // repository root, never the process cwd.
+  const liveIds = liveIdentities(live, repo.root);
   const lines = [];
   const items = [];
+  const deadPaths = [];
   for (const entry of read.worktrees) {
-    const absolute = typeof entry.path === "string" && path.isAbsolute(entry.path)
-      ? path.resolve(entry.path)
-      : null;
-    const liveHit = absolute === null ? undefined : liveByPath.get(absolute);
+    const isAbsoluteRow = typeof entry.path === "string" && path.isAbsolute(entry.path);
+    const st = isAbsoluteRow ? checkoutState(entry.path, repo.root) : null;
+    const absolute = st ? st.absolute : null;
+    // Consolidated existence probe: nothing present (missing checkout,
+    // dangling symlink) is pruned; a FILE is present, so it stays listed
+    // as missing and is never pruned. Liveness additionally requires a
+    // directory (checked below).
+    if (absolute !== null && !st.exists) {
+      deadPaths.push(entry.path);
+      continue;
+    }
+    // A FILE is never live even when git names its path, and a symlink
+    // spelling of a live checkout IS live: liveness is exists AND
+    // is-a-directory AND resolved-identity membership, the one predicate.
+    const liveHit = st && st.absolute !== null && st.exists && st.isDirectory
+      && (st.real !== null ? liveIds.has(st.real) : liveIds.has(st.absolute))
+      ? true
+      : undefined;
     const issues = Array.isArray(entry.issues) ? entry.issues.slice() : [];
     const thread = typeof entry.thread === "string" && entry.thread.length > 0
       ? entry.thread
@@ -467,29 +809,98 @@ async function executeWorktreeList(params, ctx) {
     );
     items.push({ path: entry.path, branch: entry.branch, thread, issues, status });
   }
+  // Prune exactly the dead rows in one atomic registry write, best
+  // effort: when the write fails the listing below still excludes them
+  // and the warning says so.
+  let pruned = [];
+  let pruneError = null;
+  if (deadPaths.length > 0) {
+    try {
+      const outcome = registry.pruneWorktrees(repo.root, deadPaths);
+      if (outcome && outcome.ok) {
+        pruned = Array.isArray(outcome.pruned) ? outcome.pruned : [];
+      } else {
+        pruneError = (outcome && outcome.error) || "unknown prune error";
+      }
+    } catch (err) {
+      pruneError = (err && err.message) || String(err);
+    }
+  }
+  const warnings = [];
+  if (deadPaths.length > 0) {
+    if (pruneError) {
+      warnings.push(
+        `could not prune ${deadPaths.length} stale worktree path(s) from the registry (${deadPaths.join(", ")}): ${pruneError}; the listing still excludes them, and git may still record the checkout until 'git worktree prune'`,
+      );
+    } else {
+      warnings.push(
+        `pruned ${pruned.length} stale worktree path(s) from the registry: ${pruned.join(", ")}; git may still record the checkout until 'git worktree prune'`,
+      );
+    }
+  }
   if (all) {
     // Only absolute registry paths participate: anything else cannot name
-    // a live checkout without resolving against the process cwd.
-    const registered = new Set(read.worktrees
-      .filter((entry) => typeof entry.path === "string" && path.isAbsolute(entry.path))
-      .map((entry) => path.resolve(entry.path)));
+    // a live checkout without resolving against the process cwd. The set
+    // comes from the POST-prune registry (re-read; when the re-read fails
+    // the pre-prune set minus the pruned paths stands in), so a row pruned
+    // above never reappears as "unregistered" just because git still
+    // records it. Every git entry is existence-checked on its absolute
+    // form (relative entries resolve against the repository root, never
+    // the process cwd): a path that does not exist is never reported, in
+    // any status, and stays out of details.worktrees as well.
+    let postPrune = null;
+    try {
+      const reread = registry.readRegistry(repo.root);
+      if (reread && reread.ok === true && Array.isArray(reread.worktrees)) postPrune = reread.worktrees;
+    } catch {
+      postPrune = null;
+    }
+    const registered = new Set();
+    for (const entry of postPrune || read.worktrees) {
+      if (typeof entry.path !== "string" || !path.isAbsolute(entry.path)) continue;
+      const st = checkoutState(entry.path, repo.root);
+      // Both spellings count: a symlink row and the git spelling of the
+      // same checkout share the realpath, so the checkout is never
+      // double-reported as unregistered.
+      if (st.absolute !== null) registered.add(st.absolute);
+      if (st.real !== null) registered.add(st.real);
+    }
+    if (!postPrune) {
+      for (const dropped of pruned) {
+        try {
+          registered.delete(path.resolve(dropped));
+        } catch {
+          // Nothing to delete.
+        }
+      }
+    }
     const self = path.resolve(repo.root);
     const extra = live
       .filter((entry) => {
-        const resolved = path.resolve(entry.path);
-        return !registered.has(resolved) && resolved !== self;
+        if (!entry || typeof entry.path !== "string" || entry.path.length === 0) return false;
+        // Consolidated predicate: only an existing DIRECTORY surfaces,
+        // relative entries resolving against the repository root.
+        const st = checkoutState(entry.path, repo.root);
+        if (st.absolute === null || !st.exists || !st.isDirectory) return false;
+        if (registered.has(st.absolute)) return false;
+        if (st.real !== null && registered.has(st.real)) return false;
+        if (st.absolute === self) return false;
+        return true;
       })
       .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     for (const entry of extra) {
       const branch = entry.branch || "(detached)";
-      lines.push(`worktree list: ${entry.path} ${branch} unregistered`);
-      items.push({ path: entry.path, branch, thread: null, issues: [], status: "unregistered" });
+      // Report the resolved absolute form so details.worktrees never
+      // carries a relative spelling or a path that does not exist.
+      const shown = checkoutState(entry.path, repo.root).absolute || entry.path;
+      lines.push(`worktree list: ${shown} ${branch} unregistered`);
+      items.push({ path: shown, branch, thread: null, issues: [], status: "unregistered" });
     }
   }
   if (lines.length === 0) {
-    return textResult("worktree list: none", { worktrees: [], count: 0, all }, false);
+    return textResult("worktree list: none", { worktrees: [], count: 0, all, pruned, warnings, pruneError }, false);
   }
-  return textResult(lines.join("\n"), { worktrees: items, count: items.length, all }, false);
+  return textResult(lines.join("\n"), { worktrees: items, count: items.length, all, pruned, warnings, pruneError }, false);
 }
 
 // Rank registry entries by common-prefix score against the query so an
@@ -571,6 +982,91 @@ function herdrWorkspaceId(stdout, resolvedTarget, repoRoot) {
   }
   if (matched === 0 || missing || matchedIds.size !== 1) return null;
   return [...matchedIds][0];
+}
+
+// Checkouts from the pre-removal snapshot that are gone now, excluding
+// the target itself. A hostile or confused remover that deleted another
+// checkout fails loudly through this: the caller names the vanished path
+// instead of treating the close as successful (or as a bare failure).
+// Never throws and never masks the caller's own error. Pass the
+// already-fetched post listing when there is one; otherwise one is fetched
+// best-effort. When no post-removal listing is available (it failed), the
+// comparison falls back to an existence check on the pre-removal live
+// paths: a pre-removal live checkout whose directory no longer exists has
+// vanished. Every probe is absolute and never consults the process cwd.
+function vanishedCheckouts(git, repoRoot, live, resolvedTarget, after) {
+  // Identity through the consolidated predicate: compare resolved
+  // realpaths (absolute fallback), never bare spellings, so a symlink
+  // spelling of a surviving checkout is not misreported as vanished. The
+  // target itself is excluded by the same resolved identity (absolute OR
+  // realpath), never by lexical spelling alone. Both legs name only paths
+  // where NOTHING exists — a path replaced by a FILE reads `missing` in
+  // the list and is not reported vanished here either, so list, create and
+  // close agree that exists AND is-a-directory is the rule.
+  let targetReal = null;
+  try {
+    targetReal = checkoutState(resolvedTarget, repoRoot).real;
+  } catch {
+    targetReal = null;
+  }
+  const isTarget = (st) => {
+    if (st.absolute === null) return true;
+    if (st.absolute === resolvedTarget) return true;
+    if (st.real !== null && targetReal !== null && st.real === targetReal) return true;
+    return false;
+  };
+  const identityOf = (item) => {
+    if (!item || typeof item.path !== "string" || item.path.length === 0) return null;
+    const st = checkoutState(item.path, repoRoot);
+    if (st.absolute === null) return null;
+    if (isTarget(st)) return null;
+    return { id: st.real !== null ? st.real : st.absolute, absolute: st.absolute, exists: st.exists, isDirectory: st.isDirectory };
+  };
+  let current = after;
+  if (!current) {
+    try {
+      current = git.listWorktrees(repoRoot);
+    } catch {
+      current = null;
+    }
+  }
+  if (current) {
+    try {
+      const afterSet = new Set();
+      for (const item of current) {
+        const seen = identityOf(item);
+        // The target itself is excluded by identityOf; every other listed
+        // record counts as present by resolved identity.
+        if (seen !== null) afterSet.add(seen.id);
+      }
+      const vanished = [];
+      for (const item of live || []) {
+        const before = identityOf(item);
+        if (before === null) continue;
+        if (!afterSet.has(before.id)) {
+          // Same rule as the fallback: only a path where NOTHING exists
+          // has vanished; a FILE reads missing, never vanished.
+          if (!before.exists) vanished.push(before.absolute);
+        }
+      }
+      return vanished;
+    } catch {
+      // Fall through to the existence check below.
+    }
+  }
+  const vanished = [];
+  try {
+    for (const item of live || []) {
+      const before = identityOf(item);
+      if (before === null) continue;
+      // Only a path where nothing exists has vanished: something present
+      // (even a FILE) is reported `missing` elsewhere, never vanished.
+      if (!before.exists) vanished.push(before.absolute);
+    }
+  } catch {
+    return [];
+  }
+  return vanished;
 }
 
 // Core of `worktree_close` (S7, D6): remove the checkout and its Herdr
@@ -686,7 +1182,15 @@ async function executeWorktreeClose(params, ctx) {
       { branch, path: target, force },
     );
   }
-  if (!live.some((item) => path.resolve(item.path) === resolvedTarget)) {
+  // Pre-removal liveness through the same predicate: the target must exist
+  // as a directory AND be recorded by git. A hand-deleted checkout git
+  // still records, or a path replaced by a FILE, is stale — the entry is
+  // kept, exactly like the list's `missing`.
+  const closeLiveIds = liveIdentities(live, repo.root);
+  const targetState = checkoutState(target, repo.root);
+  const targetLive = targetState.absolute !== null && targetState.exists && targetState.isDirectory
+    && (targetState.real !== null ? closeLiveIds.has(targetState.real) : closeLiveIds.has(targetState.absolute));
+  if (!targetLive) {
     return errorResult(
       `worktree at ${target} is not a live checkout (stale registry entry for branch '${branch}'): the entry was kept`,
       { branch, path: target, force },
@@ -765,6 +1269,17 @@ async function executeWorktreeClose(params, ctx) {
     }
   }
   if (!removedBy) {
+    // The remover exited non-zero — but a lying backend may still have
+    // deleted a checkout other than the target on its way out, so the
+    // vanished comparison runs BEFORE this early return, never after it.
+    // Either way the registry entry is kept; only the message differs.
+    const vanishedOnFailure = vanishedCheckouts(git, repo.root, live, resolvedTarget);
+    if (vanishedOnFailure.length > 0) {
+      return errorResult(
+        `worktree removal failed (${removeError || "failed to remove worktree"}) and removed an unexpected checkout at ${vanishedOnFailure[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
+        { branch, path: target, force, removed: false, vanished: vanishedOnFailure },
+      );
+    }
     // The backend's own reason (e.g. git's dirty-checkout refusal) is the
     // whole message; checkout and registry entry are left untouched.
     return errorResult(removeError || "failed to remove worktree", {
@@ -773,10 +1288,21 @@ async function executeWorktreeClose(params, ctx) {
   }
 
   // Verify against git before dropping the entry: the path must be gone.
+  // The check never depends on the post-removal listing alone: when the
+  // listing itself fails, the existence fallback above still names a
+  // vanished checkout (registry kept) instead of hiding it behind an
+  // unverifiable-removal message. Covers both the herdr and git paths.
   let after;
   try {
     after = git.listWorktrees(repo.root);
   } catch (err) {
+    const vanishedWithoutList = vanishedCheckouts(git, repo.root, live, resolvedTarget, null);
+    if (vanishedWithoutList.length > 0) {
+      return errorResult(
+        `worktree removal removed an unexpected checkout at ${vanishedWithoutList[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
+        { branch, path: target, force, removedBy, vanished: vanishedWithoutList },
+      );
+    }
     return errorResult(
       `worktree removal could not be verified at ${target}: ${(err && err.message) || err}`,
       { branch, path: target, force, removedBy },
@@ -788,21 +1314,17 @@ async function executeWorktreeClose(params, ctx) {
   // successful, and the registry entry is left in place. Covers both the
   // herdr and the git removal paths; a legitimate single-checkout removal
   // (only the target gone) never trips it.
-  try {
-    const afterSet = new Set(after.map((item) => path.resolve(item.path)));
-    const vanished = live
-      .map((item) => path.resolve(item.path))
-      .filter((p) => p !== resolvedTarget && !afterSet.has(p));
-    if (vanished.length > 0) {
-      return errorResult(
-        `worktree removal removed an unexpected checkout at ${vanished[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
-        { branch, path: target, force, removedBy, vanished },
-      );
-    }
-  } catch {
-    // Path comparison must never mask the verification below.
+  const vanished = vanishedCheckouts(git, repo.root, live, resolvedTarget, after);
+  if (vanished.length > 0) {
+    return errorResult(
+      `worktree removal removed an unexpected checkout at ${vanished[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
+      { branch, path: target, force, removedBy, vanished },
+    );
   }
-  if (after.some((item) => path.resolve(item.path) === resolvedTarget)) {
+  if (after.some((item) => {
+    const st = checkoutState(item.path, repo.root);
+    return st.absolute !== null && st.absolute === resolvedTarget;
+  })) {
     return errorResult(
       `worktree removal could not be verified at ${target}: the checkout is still listed`,
       { branch, path: target, force, removedBy },
@@ -830,7 +1352,7 @@ async function executeWorktreeClose(params, ctx) {
 const worktreeListTool = defineTool({
   name: "worktree_list",
   label: "Worktree List",
-  description: "List agent worktrees registered for this repository, cross-checked against live checkouts with their owning thread. Pass all:true to also show live checkouts the registry does not know about. Read-only: never mutates the registry.",
+  description: "List agent worktrees registered for this repository, cross-checked against live checkouts with their owning thread. Pass all:true to also show live checkouts the registry does not know about. Rows whose paths no longer exist are excluded and pruned from the registry.",
   parameters: Type.Object({
     all: opt(Type.Boolean({ description: "Include live checkouts the registry does not know about" })),
   }),

@@ -427,7 +427,7 @@ describe('worktree_list output', { concurrency: false }, () => {
     }
   });
 
-  test('a registered path deleted out of band is marked `missing` and kept', async () => {
+  test('a registered path deleted out of band is excluded from the listing and pruned (S16)', async () => {
     const root = makeRepo('list-drift');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([35]);
@@ -437,20 +437,25 @@ describe('worktree_list output', { concurrency: false }, () => {
       const target = addRegistered(root, 'feat/drifted', { thread: 'thread-1', issues: [35] });
       git(root, ['worktree', 'remove', target]);
       assert.ok(!livePaths(root).includes(target), 'the checkout is really gone');
-      const before = registryBytes(root);
 
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callList(tools, {}, ctx);
       assert.equal(result.isError, undefined);
-      assert.equal(
-        resultText(result),
-        `worktree list: ${target} feat/drifted thread=thread-1 issues=35 missing`,
+      // S16 self-heal: nothing registered and real, so the listing is
+      // empty — and the dead row is pruned from the registry, named in
+      // details.pruned and in the warning (which also says git may still
+      // record the checkout until `git worktree prune`).
+      assert.equal(resultText(result), 'worktree list: none');
+      assert.deepEqual(result.details.worktrees, []);
+      assert.deepEqual(result.details.pruned, [target]);
+      assert.ok(
+        result.details.warnings.join('\n').includes(target),
+        `the warning names the pruned path: ${JSON.stringify(result.details.warnings)}`,
       );
-      // Drift is reported, never repaired: the entry stays put.
-      assert.deepEqual(registryBytes(root), before);
       const registryLib = require('../lib/worktree-registry.js');
-      assert.equal(registryLib.findByBranch(root, 'feat/drifted').path, target);
+      assert.equal(registryLib.findByBranch(root, 'feat/drifted'), null);
+      assert.deepEqual(registryLib.readRegistry(root).worktrees, []);
     } finally {
       restoreEnv();
     }
@@ -824,6 +829,136 @@ describe('worktree_close', { concurrency: false }, () => {
       const registryLib = require('../lib/worktree-registry.js');
       assert.equal(registryLib.findByBranch(root, 'feat/fallback-close'), null);
       assert.equal(fs.existsSync(herdr.log), false, 'herdr was never invoked');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('F4: vanished checkout named even when the post-removal listing fails', { concurrency: false }, () => {
+  function makeFailingListGitShim({ root, victim, exitCode }) {
+    const which = spawnSync('which', ['git'], { encoding: 'utf8' });
+    assert.equal(which.status, 0);
+    const realGit = which.stdout.trim();
+    const shimDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-f4-gitshim-')));
+    const marker = path.join(shimDir, 'removed.marker');
+    fs.writeFileSync(path.join(shimDir, 'git'), [
+      '#!/bin/sh',
+      'case "$*" in',
+      '  *"worktree list"*)',
+      `    if [ -f "${marker}" ]; then echo "git worktree list failed: boom" >&2; exit 1; fi`,
+      '    exec "$REAL_GIT" "$@";;',
+      '  *"worktree remove"*)',
+      `    "$REAL_GIT" -C "${root}" worktree remove --force "${victim}" >/dev/null 2>&1`,
+      `    touch "${marker}"`,
+      '    echo "lying remover failed" >&2',
+      `    exit ${exitCode};;`,
+      '  *) exec "$REAL_GIT" "$@";;',
+      'esac',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    return { shimDir, realGit };
+  }
+
+  test('exit 0 with post-list failing names the vanished path, registry unchanged', async () => {
+    const root = makeRepo('f4-zero');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    const dirV = path.join(path.dirname(root), `${path.basename(root)}-victim`);
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-victim', dirV, 'HEAD']);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realV = fs.realpathSync(dirV); track(realV);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.equal(registryLib.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const beforeBytes = registryBytes(root);
+    const shim = makeFailingListGitShim({ root, victim: realV, exitCode: 0 });
+    const savedPath = process.env.PATH;
+    setEnv({
+      ...stdEnv({ herdr, gh, modeEnv }),
+      HERDR_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-f4'),
+      PATH: `${shim.shimDir}${path.delimiter}${savedPath}`,
+      REAL_GIT: shim.realGit,
+    });
+    // The shim reads REAL_GIT from its own env: re-export explicitly.
+    process.env.REAL_GIT = shim.realGit;
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { path: realT, force: true }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, true, `expected loud failure, got: ${text}`);
+      assert.ok(text.includes(realV), `error names the vanished path ${realV}: ${text}`);
+      assert.deepEqual(registryBytes(root), beforeBytes, 'registry bytes unchanged (entry kept)');
+    } finally {
+      delete process.env.REAL_GIT;
+      restoreEnv();
+    }
+  });
+
+  test('non-zero exit with post-list failing names the vanished path, registry unchanged', async () => {
+    const root = makeRepo('f4-nonzero');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    const dirV = path.join(path.dirname(root), `${path.basename(root)}-victim`);
+    const dirT = path.join(path.dirname(root), `${path.basename(root)}-target`);
+    git(root, ['worktree', 'add', '-b', 'feat-victim', dirV, 'HEAD']);
+    git(root, ['worktree', 'add', '-b', 'feat-target', dirT, 'HEAD']);
+    const realV = fs.realpathSync(dirV); track(realV);
+    const realT = fs.realpathSync(dirT); track(realT);
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.equal(registryLib.upsertWorktree(root, { branch: 'feat-target', path: realT, thread: 't-1', issues: [1], odd: [] }).ok, true);
+    const beforeBytes = registryBytes(root);
+    const shim = makeFailingListGitShim({ root, victim: realV, exitCode: 1 });
+    const savedPath = process.env.PATH;
+    setEnv({
+      ...stdEnv({ herdr, gh, modeEnv }),
+      HERDR_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-f4'),
+      PATH: `${shim.shimDir}${path.delimiter}${savedPath}`,
+    });
+    process.env.REAL_GIT = shim.realGit;
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { path: realT, force: true }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, true, `expected loud failure, got: ${text}`);
+      assert.ok(text.includes(realV), `error names the vanished path ${realV}, not a bare failure: ${text}`);
+      assert.deepEqual(registryBytes(root), beforeBytes, 'registry bytes unchanged (entry kept)');
+    } finally {
+      delete process.env.REAL_GIT;
+      restoreEnv();
+    }
+  });
+});
+
+describe('H2: a file at a path is never a live checkout in the close', { concurrency: false }, () => {
+  test('a checkout replaced by a file is stale, the entry is kept and nothing is removed', async () => {
+    const root = makeRepo('h2-file-close');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const target = addRegistered(root, 'feat/filed', { thread: 'thread-1', issues: [35] });
+      // The checkout directory becomes a FILE git still records: the same
+      // path list reports `missing` must never read `live` here either.
+      fs.rmSync(target, { recursive: true, force: true });
+      fs.writeFileSync(target, 'not a checkout\n');
+      assert.ok(livePaths(root).includes(target), 'git still records the path');
+      const beforeRegistry = registryBytes(root);
+
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { branch: 'feat/filed', force: true }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, true, `a file is never a live checkout, got: ${text}`);
+      assert.match(text, /not a live checkout.*stale registry entry/i, `the stale entry is named and kept: ${text}`);
+      assert.deepEqual(registryBytes(root), beforeRegistry, 'registry untouched: the row stays for inspection');
+      assert.ok(fs.existsSync(target), 'the file is left alone');
     } finally {
       restoreEnv();
     }

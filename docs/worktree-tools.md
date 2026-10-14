@@ -11,27 +11,46 @@ checkable against `extensions/gentle-worktree-tools.ts` and
 All three are registered with `pi.registerTool()` from
 `extensions/gentle-worktree-tools.ts` (listed in the Pi package's
 `pi.extensions`). Failures return `isError: true` with structured
-`details`; success output is terse, one line per worktree at most.
+`details`; success output is terse, one line per worktree at most. The
+declared `min_herdr_version` in `herdr-plugin/herdr-plugin.toml` tracks
+the version this code has actually been exercised against: `0.9.4`,
+verified read-only (`herdr --version`, `herdr plugin list --json`, and
+`--help` for every command the plugin depends on — `plugin list`,
+`plugin install`, `plugin update`, `worktree list`, `worktree create`,
+`worktree remove`, `worktree open` — all present with the flags the
+allowlist uses). It is never lowered to a version that cannot be tested.
 
 | Tool | Parameters | Approval | Success text |
 | --- | --- | --- | --- |
 | `worktree_create` | `branch: string` (required), `issues: number[]` (required, at least one) | Prompts via `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`); non-interactive sessions proceed without it, and a refusal mutates nothing | `worktree create: <path>` |
-| `worktree_list` | `all?: boolean` (optional) | None — read-only, never mutates the registry | One `worktree list: …` line per entry, or `worktree list: none` |
+| `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | One `worktree list: …` line per entry, or `worktree list: none` |
 | `worktree_close` | `path?: string`, `branch?: string` (at least one required), `force?: boolean` | Same `ctx.ui.confirm` gate as create; a refusal keeps checkout and entry | `worktree close: <path>` |
 
 Structured `details` on success:
 
-- create: `{path, branch, issues, created, hooks, warnings}` — `created`
+- create: `{path, branch, issues, created, hooks, warnings, pruned, replacedRows}` — `created`
   is `false` when the call returned the thread's existing checkout (see
-  per-thread ownership); `hooks` is the creation-hook report (`{ok,
+  per-thread ownership); `pruned` lists the stale git records a
+  `git worktree prune` recovery dropped (empty when nothing was stale);
+  `replacedRows` lists the stale registry rows dropped by the one-owner-per-path
+  rule below (`[{branch, path}]`, empty when nothing shared the target path);
+  when the recovery itself fails, the create fails with the row intact and
+  `pruneError` carries the cause; `hooks` is the creation-hook report (`{ok,
   steps, warnings}`), so a failed hook step stays visible there and never
   turns success into an error. When the write replaced a malformed
   registry, the sibling backup path travels as `registryBackup`; when no
   backup could be written, the failure travels as `registryBackupError`
-  (best-effort, never fatal).
+  (best-effort, never fatal). `warnings` carries the hook warnings plus,
+  when a same-branch row pointing at a different live checkout was kept,
+  the conflict line naming that checkout.
 - list: `{worktrees: [{path, branch, thread, issues, status}], count,
-  all}` — `status` is `live`, `missing` (registered but no live checkout),
-  or `unregistered` (only with `all: true`).
+  all, pruned, warnings, pruneError}` — `status` is `live`, `missing`
+  (registered and still on disk but no live checkout, or a non-absolute
+  path that can never name one), or `unregistered` (only with `all:
+  true`). `pruned` lists the registry paths dropped by the self-heal
+  below (empty when nothing was dead, or when the prune write failed —
+  then `pruneError` carries the cause); `warnings` carries the one line
+  naming them (see below) and is empty otherwise.
 - close: `{path, branch, removed: true, branchKept: true, thread}` —
   `thread` is the owning thread, or `null` when none was recorded.
 
@@ -50,6 +69,34 @@ unregistered. Close refuses an unregistered target and names the three
 closest registered candidates (common-prefix rank on branch, small bonus
 on path match) instead of removing anything; passing both `path` and
 `branch` that disagree is an error telling the caller to pass only one.
+
+`worktree_list` self-heals (S16) through the one consolidated liveness
+definition (`checkoutState` in `extensions/gentle-worktree-tools.ts`, plus
+`isLiveGitRecord`/`liveIdentities` built on it): a live checkout is a path
+whose state exists AND is a directory, resolved without the process cwd
+(absolute inputs directly, relative inputs against the repository root)
+and matched by resolved realpath identity — a row reaching a live checkout
+through a symlink IS live, a FILE at the path is never live even when git
+names it, and a dangling symlink reads as absent. Every absolute
+registered path is checked
+on every call. A row is `live` only when its state exists, is a
+directory, and its realpath matches a live checkout's realpath — a FILE at the path is never
+`live`, even when git names it. A path where nothing exists (the user
+deleted the checkout by hand) is removed from the listing AND pruned from
+the registry in one atomic write, so the tool always exposes only real
+checkouts; the pruned paths travel in `details.pruned` and in a warning
+line that also says git may still record the checkout until `git worktree
+prune`. When the prune write itself fails, the listing still excludes
+them and the warning says so (plus `details.pruneError`). A path that
+exists but git no longer lists stays `missing` and is never pruned; a
+non-absolute entry can never be verified without the process cwd, so it
+stays `missing` (never live), exactly as before. The `all: true` extras
+obey the same rule: they are built from the post-prune registry, and every
+git entry is existence-checked on its absolute form (a relative entry
+resolves against the repository root, never the process cwd) — a path that
+does not exist is never reported, in any status, so a hand-deleted checkout
+git still records cannot reappear as `unregistered` on the next call, and
+`details.worktrees` never carries a path that fails the existence check.
 
 ## Registry
 
@@ -81,20 +128,63 @@ upsert result and in the `worktree_create` details as `registryBackup` (or
 `registryBackupError` when no backup could be written) so
 the caller can name it. A valid registry is never backed up.
 
+`worktree_create` never unregisters a live checkout (S14): when a row
+already carries the branch being created but points at a DIFFERENT live
+checkout, that row is not replaced — it keeps its registration, the new
+checkout is recorded alongside it (`appendWorktree`, which always appends
+instead of replacing by branch), and the conflict is reported in the
+create `warnings` naming the kept checkout. Liveness is one consolidated
+predicate (`checkoutState` in `extensions/gentle-worktree-tools.ts`): a
+path names a live checkout only when something exists there AND it is a
+directory (a FILE is never a checkout; a dangling symlink reads as
+absent) AND its resolved realpath matches a live checkout's realpath —
+relative inputs resolving against the repository root, never the process
+cwd — so a row that reaches a live checkout through a symlink is live
+and is kept and warned about, while a row whose path git still lists but
+which no longer exists is never a live conflict. Every
+same-branch row is examined, so the warning names the live checkout
+regardless of row order — even when a dead row comes first. Replacement by
+branch still applies to every other row.
+
+One owner per path: when a create lands on its target path, that path ends
+with exactly ONE registry row — the one just created. Any other row whose
+path resolves to the same path (whatever its branch or thread: the same
+absolute spelling, the same spelling with a trailing slash, or a symlink to
+the target) is stale by definition and is dropped as part of the create, in
+addition to the thread-owned stale row dropped after verification. A row for
+a different path is never dropped, and relative rows never match. The dropped
+rows travel in `details.replacedRows` (`[{branch, path}]`) and in a warning
+line naming each dropped branch (for example `replaced 1 stale registry
+row(s) at the same path <target>: branch 'feat/foo' at <path>; one path has
+one owner ...`). Without this rule a slug collision (`feat/foo` deleted by
+hand, then `feat-foo` created on the same flattened path) left two rows for
+one path, and closing the old branch deleted the new checkout.
+
 Registry entry paths must be absolute. A `worktree_close` whose entry
 path is not absolute is refused with an error naming the entry and the
 reason, with no mutation of any checkout and no registry change; the
-pre-removal check, any removal, and the post-removal verification all use
+pre-removal liveness check goes through the same predicate (the target
+must exist as a directory AND be recorded by git, so a hand-deleted
+checkout git still records, or a path replaced by a FILE, is refused as a
+stale entry with the row kept), and the pre-removal check, any removal,
+and the post-removal verification all use
 the same absolute value derived from the entry, and `worktree_list`'s
 live cross-check likewise never resolves a registry path against the
 process cwd (a non-absolute entry is reported `missing`, never live).
 Entry lookup matches by exact branch equality or exact absolute path
-equality only. The close drops its entry by that same absolute path
-(`removeWorktreeByPath`), which drops every row whose path resolves to
-that value so no stale duplicate survives the close: one path identity
-end to end from resolve
+equality only. The close drops its entry by resolved identity (`removeWorktreeByPath`
+with `pathIdentities`): every row that reaches the removed checkout
+is dropped — the same absolute value, a realpath-equal row, or a row
+whose path is a symlink (live or dangling) to it, resolved through an
+explicit readlink walk that never touches the process cwd — so no stale
+duplicate and no hand-written symlink row survives the close: one path
+identity end to end from resolve
 through verify and remove to drop, so duplicate branches or a branch that
-equals another entry's path can never divert the drop; `removeWorktree`'s
+equals another entry's path can never divert the drop; a relative row
+still cannot be matched, which stays documented. The readlink walk is
+bounded: a hand-written chain longer than 10 links is not followed, so a
+row behind a longer chain can survive a close. That is a stated bound, not
+a silent bug. `removeWorktree`'s
 branch-first behaviour is kept for any other caller and is unreachable in
 the close flow. A Herdr workspace id is used only when its list entry's
 path resolves to exactly that same absolute target: absolute entries
@@ -108,11 +198,24 @@ same id, still resolves. When no entry
 matches, Herdr is skipped entirely and the close falls back to `git
 worktree remove` with fixed argv; no removal argv ever names a workspace
 that is not the verified target. After a removal completes, on both the
-herdr and the git paths, the close compares the live checkouts against
-the pre-removal snapshot: when a checkout other than the target
-disappeared, the close fails naming the vanished path, refuses to treat
-the close as successful, and leaves the registry entry in place.
-Removing only the target never trips this check.
+herdr and the git paths — and also when the remover itself exits
+non-zero — the close compares the live checkouts against the
+pre-removal snapshot BEFORE any early return: when a checkout other than
+the target
+disappeared, the close fails naming the vanished path (on a non-zero exit
+the backend's own reason is quoted first, then the vanished path),
+refuses to treat the close as successful, and leaves the registry entry
+in place in both cases.
+Removing only the target never trips this check. The comparison never
+depends on the post-removal listing alone and compares resolved realpath
+identity, never bare spellings: when that listing fails, the
+close falls back to an existence check on the pre-removal live paths
+through the same consolidated predicate (`checkoutState`, relative
+entries resolving against the repository root) — a pre-removal live
+checkout where nothing exists anymore has vanished and is named, on both
+exit codes and both
+removal paths, with the registry entry kept in every case. A path replaced
+by a FILE reads `missing`, never vanished, so both legs agree on files.
 
 ## Creation path
 
@@ -120,16 +223,31 @@ Removing only the target never trips this check.
 issues, then repository/path refusals. Branch validation is `git
 check-ref-format --branch` as the authority, after up-front rejection of
 empty names, a leading `-`, whitespace, control characters, and Unicode
-bidi marks. Refusals: the branch is already checked out anywhere, the
-target path is already a live worktree, or the target sits inside any
-existing checkout or the shared git common dir.
+bidi marks. Refusals: the branch is already checked out at a LIVE path,
+the target path is already a live worktree, or the target sits inside any
+existing checkout or the shared git common dir. LIVE is the one
+consolidated definition below (`checkoutState`): a path whose state exists
+AND is a directory, resolved without the process cwd and matched by
+resolved identity — so a git record whose path is gone (the user deleted
+the checkout by hand) or was replaced by a FILE never blocks a create on
+its own. When such stale records are the ONLY thing holding the branch or
+the target path, the tool recovers with a scoped `git worktree prune`
+(which drops only records whose directories are missing) and proceeds to
+create; the pruned paths travel in `details.pruned` and in a warning line.
+A branch genuinely checked out at a LIVE path is refused exactly as before.
+No worktree path in any tool is ever resolved against the process cwd:
+absolute inputs resolve directly, relative inputs (registry rows, relative
+listing paths) resolve against the repository root.
 
 The target path flattens the branch into one component
 (`feat/foo-bar` → `feat-foo-bar`) at
 `<repo-parent>/<repo-name>-worktrees/<slug>` (`slugifyBranch` /
 `worktreePath` in `lib/worktree-git.js`). Creation is herdr-first (`herdr
 worktree create` with fixed argv, values as separate elements because
-herdr rejects `--flag=value`) with a `git worktree add -b` fallback; the
+herdr rejects `--flag=value`) with a `git worktree add -b` fallback; when
+the branch ref already exists (the same-branch recovery above) the fallback
+checks the existing branch out at the fresh path instead of failing on
+`-b`. The
 base ref is the repository's current `HEAD`. Neither backend passes
 `--focus` or `--trust-repository`: trusting a repository is a human
 decision these tools never take. Success is verified against `git
@@ -137,6 +255,24 @@ worktree list --porcelain -z` before anything is claimed, never trusted
 from Herdr JSON. Every external process uses a fixed argv array — no
 shell string is ever built. Issues are verified to exist through `gh
 issue view <n> --json number,title,state` (see limitations).
+
+A non-directory occupant (a file, a FIFO, a dangling symlink) at the target
+path is refused before any backend runs: `target path <path> is occupied by
+a <file|symlink|FIFO|non-directory> (not a directory): remove it by hand and
+retry; the registry was left untouched`. Git's raw `fatal: '<path>' already
+exists` never surfaces, and no registry row is written, so removing the
+occupant lets the next create at the same path succeed.
+
+The remaining path decisions share the one predicate (exists AND is a
+directory, realpath identity where identity is the question):
+`isPathInAnyCheckout` (`lib/worktree-git.js`) skips non-directory records and
+compares both spellings and realpaths (resolving non-existent tails through
+their parents), so a symlink spelling of a checkout gives the same
+inside-verdict as the real spelling; `vanishedCheckouts` excludes the close
+target by absolute-or-realpath identity (never lexical spelling alone) and
+names only paths where nothing exists on both legs, so a FILE reads `missing`
+and is never reported vanished — list, create and close cannot disagree about
+the same path in any shape.
 
 ## Creation hooks
 
@@ -211,8 +347,23 @@ One worktree per thread. Thread identity resolves from
 fails closed (`cannot resolve thread identity: …`) and never adopts
 another thread's checkout. A thread that already owns a registered,
 still-live worktree gets that checkout back — `worktree create: <path>`
-again with `created: false` — never a second checkout. A stale entry
-(checkout gone) is dropped best-effort and creation proceeds fresh.
+again with `created: false` — never a second checkout. Still-live is the
+same consolidated predicate (`checkoutState`): the owned row's state must
+exist AND be a directory AND its realpath must match a live checkout
+(relative inputs resolving against the repository root, never the process
+cwd), so an owned row that reaches a live checkout through a symlink is
+live and is returned, never dropped. Idempotency consequence: a
+tool-created row whose checkout the user deleted by hand is stale even
+while git still lists it — the stale git record is pruned (`git worktree
+prune`), creation proceeds fresh at the same path (checking out the
+surviving branch ref), and the result reports the prune instead of
+answering `created: false` at a missing path.
+A stale entry
+(checkout gone) is remembered and dropped only after its replacement
+checkout verifies — a refusal or a failed creation leaves the row intact,
+so the tool either creates successfully or fails with the row still
+registered and an actionable message, never an empty registry behind a
+refusal.
 The cleanup drops the one row it identified as the thread's own by row
 identity — the (branch, path) pair of the selected entry
 (`removeWorktreeExact`) — never by branch alone and never by a path-key
