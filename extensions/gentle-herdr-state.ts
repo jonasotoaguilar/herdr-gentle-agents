@@ -1348,6 +1348,589 @@ function registerMoshiToggle(pi) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Sidebar integration switch (S7): OUR sidebar versus the native Herdr
+// sidebar. `/herdr-gentle:sidebar toggle|enable|disable|status` (no
+// argument opens a selector, following the Moshi convention above).
+// Enable means OURS (owned native exclusion + managed `configure` rows);
+// disable means NATIVE (only the owned exclusion removed + managed rows
+// unconfigured, so the native sidebar renders again). This block is
+// self-contained like the rest of this file: the installed copy ships
+// without sibling modules, so the marker-bound exclusion below mirrors
+// lib/pi-extension-exclusion.js semantics inline (exact entry, canonical
+// target binding, foreign/misbound refusal, byte-identical rollback)
+// without importing it. Row convergence runs the installed plugin's own
+// bin/configure.js synchronously after resolving its root through the
+// read-only plugin list; only a zero exit plus a re-read managed-row
+// effect commits the mode or exclusion, and Pi sessions always need
+// /reload.
+const SIDEBAR_NATIVE_REL = "extensions/herdr-agent-state.ts";
+const SIDEBAR_NATIVE_ENTRY = "-extensions/herdr-agent-state.ts";
+const SIDEBAR_MODE_VERSION = 1;
+const SIDEBAR_MARKER_VERSION = 1;
+const SIDEBAR_PLUGIN_ID = "herdr-gentle-agents";
+const SIDEBAR_MARKER_NAME = "pi-extension-exclusion-owned";
+const SIDEBAR_MANAGED_BEGIN = "# BEGIN herdr-gentle-agents (managed; do not edit)";
+const SIDEBAR_MANAGED_END = "# END herdr-gentle-agents";
+
+// Shared mode file under the existing resolved state directory (same
+// resolution as the Moshi flag above): {version:1,enabled:boolean}.
+// Missing defaults to enabled for current-install compatibility.
+function sidebarModePath() {
+  const env = process.env;
+  const override = env.GENTLE_STATUS_STATE_DIR ?? env.HERDR_PLUGIN_STATE_DIR;
+  if (typeof override === "string" && override.length > 0) return join(override, "gentle-sidebar-mode.json");
+  const base = env.XDG_STATE_HOME
+    ? join(env.XDG_STATE_HOME, "herdr")
+    : join(homedir(), ".local", "state", "herdr");
+  return join(base, "plugins", "herdr-gentle-agents", "gentle-sidebar-mode.json");
+}
+
+function sidebarMarkerPath() {
+  return join(dirname(sidebarModePath()), SIDEBAR_MARKER_NAME);
+}
+
+function sidebarNativePath() {
+  return join(piAgentDir(), "extensions", "herdr-agent-state.ts");
+}
+
+function sidebarHerdrBin() {
+  const override = process.env.HERDR_BIN_PATH;
+  return typeof override === "string" && override.length > 0 ? override : "herdr";
+}
+
+// Read-only Herdr config location (same resolution as bin/configure.js).
+// Used only for the status rows probe; this file never writes it.
+function sidebarConfigPath() {
+  if (process.env.HERDR_CONFIG_PATH) return process.env.HERDR_CONFIG_PATH;
+  const xdg = process.env.XDG_CONFIG_HOME;
+  if (xdg) return join(xdg, "herdr", "config.toml");
+  return join(homedir(), ".config", "herdr", "config.toml");
+}
+
+// Missing means enabled (compatibility); malformed never enables
+// (fail closed, reported by the command paths below).
+function readSidebarMode() {
+  let raw;
+  try {
+    raw = fs.readFileSync(sidebarModePath(), "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { state: "missing", publish: true };
+    return { state: "malformed", publish: false };
+  }
+  let doc;
+  try {
+    doc = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
+  } catch {
+    return { state: "malformed", publish: false };
+  }
+  if (!isRecord(doc) || doc.version !== SIDEBAR_MODE_VERSION || typeof doc.enabled !== "boolean") {
+    return { state: "malformed", publish: false };
+  }
+  return doc.enabled ? { state: "enabled", publish: true } : { state: "disabled", publish: false };
+}
+
+function sidebarPublishingEnabled() {
+  try {
+    return readSidebarMode().publish;
+  } catch {
+    return false;
+  }
+}
+
+function writeSidebarMode(enabled) {
+  const file = sidebarModePath();
+  fs.mkdirSync(dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify({ version: SIDEBAR_MODE_VERSION, enabled })}\n`);
+}
+
+function sidebarBasename(p) {
+  const parts = String(p).split(/[\\/]/);
+  return parts.length > 0 ? parts[parts.length - 1] : String(p);
+}
+
+// Canonical ownership target through symlinks (parent-resolved when the
+// file is absent), mirroring lib/pi-extension-exclusion.js. Null when
+// unresolvable: the caller fails closed.
+function sidebarCurrentTarget(settings) {
+  try {
+    return fs.realpathSync(settings);
+  } catch (error) {
+    if (error?.code !== "ENOENT") return null;
+    try {
+      return join(fs.realpathSync(dirname(settings)), sidebarBasename(settings));
+    } catch {
+      return null;
+    }
+  }
+}
+
+// Validate the ownership record against this exact entry and settings
+// target. Absent means never owned (caller decides); foreign, invalid,
+// or misbound fails closed without touching settings.
+function checkSidebarMarker(settings) {
+  const marker = sidebarMarkerPath();
+  let markerRaw;
+  try {
+    markerRaw = fs.readFileSync(marker, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { ok: true, owned: false };
+    return { ok: false, note: `cannot read ownership record ${marker}: ${error?.message ?? error}.` };
+  }
+  let record = null;
+  try {
+    record = JSON.parse(markerRaw);
+  } catch {
+    record = null;
+  }
+  if (
+    !isRecord(record) ||
+    record.version !== SIDEBAR_MARKER_VERSION ||
+    typeof record.entry !== "string" ||
+    record.entry === "" ||
+    typeof record.settings !== "string" ||
+    record.settings === ""
+  ) {
+    return { ok: false, note: `ownership record ${marker} is foreign or invalid; delete the record or the entry manually.` };
+  }
+  if (record.entry !== SIDEBAR_NATIVE_ENTRY) {
+    return { ok: false, note: `ownership record ${marker} authorizes a different entry (${record.entry}); delete the record or the entry manually.` };
+  }
+  const current = sidebarCurrentTarget(settings);
+  if (current === null || current !== record.settings) {
+    return { ok: false, note: `ownership record ${marker} is bound to ${record.settings}, not ${settings}; delete the record or the entry manually.` };
+  }
+  return { ok: true, owned: true };
+}
+
+function writeSidebarMarker(settings) {
+  const canon = sidebarCurrentTarget(settings);
+  if (canon === null) return false;
+  try {
+    const marker = sidebarMarkerPath();
+    fs.mkdirSync(dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, `${JSON.stringify({ version: SIDEBAR_MARKER_VERSION, entry: SIDEBAR_NATIVE_ENTRY, settings: canon })}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeSidebarMarker() {
+  try {
+    fs.rmSync(sidebarMarkerPath(), { force: true });
+  } catch {
+    // Best-effort marker cleanup.
+  }
+}
+
+// Byte-identical settings restore after a failed marker write: a failed
+// ensure never leaves a changed settings file behind while claiming
+// otherwise. Null `before` means this run created the file.
+function restoreSidebarSettings(settings, before) {
+  try {
+    const target = sidebarCurrentTarget(settings) ?? settings;
+    if (before === null) fs.rmSync(target, { force: true });
+    else fs.writeFileSync(target, before);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Only ever appends the exact native entry, preserving every other key,
+// value, and entry. Gated on the native hook file existing (with no hook
+// there is nothing to exclude); a pre-existing user entry without our
+// marker is left as-is and never adopted.
+function ensureSidebarExclusion() {
+  if (!fs.existsSync(sidebarNativePath())) {
+    return { ok: true, changed: false, note: `${SIDEBAR_NATIVE_REL} is not installed; settings.json untouched.` };
+  }
+  const settings = piSettingsPath();
+  const binding = checkSidebarMarker(settings);
+  if (!binding.ok) return { ok: false, changed: false, note: `refusing to record ${SIDEBAR_NATIVE_ENTRY}: ${binding.note}` };
+  const loaded = readSettingsDoc(settings);
+  if (loaded === null) {
+    return { ok: false, changed: false, note: `could not update ${settings}: unreadable or invalid JSON.` };
+  }
+  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
+  if (list.includes(SIDEBAR_NATIVE_ENTRY)) {
+    return {
+      ok: true,
+      changed: false,
+      note: binding.owned
+        ? "exclusion already present."
+        : "exclusion already present (pre-existing user entry, not owned; left as-is).",
+    };
+  }
+  let before = null;
+  try {
+    before = fs.readFileSync(settings, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      return { ok: false, changed: false, note: `could not read ${settings}: ${error?.message ?? error}.` };
+    }
+  }
+  try {
+    fs.mkdirSync(dirname(settings), { recursive: true });
+    writeSettingsDoc(settings, { ...loaded.doc, extensions: [...list, SIDEBAR_NATIVE_ENTRY] });
+  } catch (error) {
+    return { ok: false, changed: false, note: `could not write ${settings}: ${error?.message ?? error}.` };
+  }
+  if (!writeSidebarMarker(settings)) {
+    const restored = restoreSidebarSettings(settings, before);
+    return {
+      ok: false,
+      changed: false,
+      note: restored
+        ? `could not record ownership (${sidebarMarkerPath()}); settings restored unchanged.`
+        : `could not record ownership (${sidebarMarkerPath()}); settings could NOT be restored, remove ${SIDEBAR_NATIVE_ENTRY} manually or re-run enable.`,
+    };
+  }
+  return { ok: true, changed: true, note: `added ${SIDEBAR_NATIVE_ENTRY}.` };
+}
+
+// Removes only the plugin-owned entry. A pre-existing user entry (no
+// marker) and any foreign/misbound record are preserved, failing closed.
+function removeSidebarExclusion() {
+  if (!fs.existsSync(sidebarNativePath())) {
+    return { ok: true, changed: false, note: `${SIDEBAR_NATIVE_REL} is not installed; settings.json untouched.` };
+  }
+  const settings = piSettingsPath();
+  const binding = checkSidebarMarker(settings);
+  if (!binding.ok) return { ok: false, changed: false, note: `refusing to remove ${SIDEBAR_NATIVE_ENTRY}: ${binding.note}` };
+  if (!binding.owned) {
+    return { ok: true, changed: false, note: "no owned exclusion; settings.json untouched." };
+  }
+  try {
+    fs.lstatSync(settings);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      removeSidebarMarker();
+      return { ok: true, changed: false, note: "settings.json already absent; stale ownership dropped." };
+    }
+    return { ok: false, changed: false, note: `cannot stat ${settings}: ${error?.message ?? error}.` };
+  }
+  const loaded = readSettingsDoc(settings);
+  if (loaded === null) {
+    return { ok: false, changed: false, note: `could not update ${settings}: unreadable or invalid JSON.` };
+  }
+  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
+  if (!list.includes(SIDEBAR_NATIVE_ENTRY)) {
+    removeSidebarMarker();
+    return { ok: true, changed: false, note: "no exclusion to remove." };
+  }
+  const kept = list.filter((entry) => entry !== SIDEBAR_NATIVE_ENTRY);
+  const next = { ...loaded.doc };
+  if (kept.length === 0) delete next.extensions;
+  else next.extensions = kept;
+  try {
+    writeSettingsDoc(settings, next);
+  } catch (error) {
+    return { ok: false, changed: false, note: `could not write ${settings}: ${error?.message ?? error}.` };
+  }
+  removeSidebarMarker();
+  return { ok: true, changed: true, note: `removed ${SIDEBAR_NATIVE_ENTRY}.` };
+}
+
+// Row convergence through the installed plugin's own configure script,
+// run synchronously: the plugin root is resolved via the read-only
+// `herdr plugin list --json` shape (the same lookup install.sh uses),
+// then `<root>/bin/configure.js --apply|--uninstall --reload` runs under
+// this process's node with a bounded timeout. Exit 0 alone is still not
+// the commit gate — the managed-row effect is re-read from the Herdr
+// config and must match (present for enable, absent for disable) before
+// the mode or exclusion changes. An accepted-but-incomplete run therefore
+// never commits state and never claims success.
+// Resolve the installed plugin root via read-only `herdr plugin list
+// --json` (verified shape: result.plugins[] with plugin_id/plugin_root).
+// Fail-closed: zero, ambiguous, non-absolute, or script-less roots refuse.
+function resolveSidebarPluginRoot() {
+  let result;
+  try {
+    result = spawnSync(
+      sidebarHerdrBin(),
+      ["plugin", "list", "--plugin", SIDEBAR_PLUGIN_ID, "--json"],
+      { encoding: "utf8", timeout: 15000, windowsHide: true },
+    );
+  } catch (error) {
+    return { ok: false, note: `could not resolve the installed plugin root: ${error?.message ?? error}.` };
+  }
+  if (result.error) {
+    return { ok: false, note: `could not resolve the installed plugin root: ${result.error.message}.` };
+  }
+  if (result.status !== 0) {
+    return { ok: false, note: `could not resolve the installed plugin root (plugin list exited ${result.status}).` };
+  }
+  let roots;
+  try {
+    const doc = JSON.parse(result.stdout || "");
+    const arr = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
+    if (!Array.isArray(arr)) throw new Error("no plugins array");
+    const hits = arr.filter((p) => p && (p.plugin_id === SIDEBAR_PLUGIN_ID || p.id === SIDEBAR_PLUGIN_ID));
+    roots = [...new Set(hits.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0))];
+  } catch (error) {
+    return { ok: false, note: `could not resolve the installed plugin root: malformed plugin list (${error?.message ?? error}).` };
+  }
+  if (roots.length !== 1 || !roots[0].startsWith("/")) {
+    return { ok: false, note: `could not resolve the installed plugin root (${roots.length === 0 ? "no match" : "ambiguous or non-absolute"}).` };
+  }
+  if (!fs.existsSync(join(roots[0], "bin", "configure.js"))) {
+    return { ok: false, note: `could not resolve the installed plugin root (${roots[0]} has no bin/configure.js).` };
+  }
+  return { ok: true, root: roots[0] };
+}
+
+// Run the installed configure script synchronously (fixed argv, no
+// shell; config path and reload binary resolve inside that script from
+// the inherited environment). Returns the exit and bounded output.
+function runSidebarConfigure(root, op, reload) {
+  const args = [join(root, "bin", "configure.js"), op];
+  if (reload) args.push("--reload");
+  let result;
+  try {
+    result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60000, windowsHide: true });
+  } catch (error) {
+    return { exit: -1, output: `configure ${op} could not start: ${error?.message ?? error}.` };
+  }
+  if (result.error) {
+    return { exit: -1, output: `configure ${op} could not start: ${result.error.message}.` };
+  }
+  const output = `${result.stdout || ""}${result.stderr || ""}`.trim().slice(0, 300);
+  return { exit: result.status, output };
+}
+
+function readSidebarConfig() {
+  try {
+    return { ok: true, text: fs.readFileSync(sidebarConfigPath(), "utf8") };
+  } catch (error) {
+    if (error?.code === "ENOENT") return { ok: true, text: null };
+    return { ok: false, text: null, note: `config ${sidebarConfigPath()} unreadable: ${error?.message ?? error}.` };
+  }
+}
+
+function sidebarRowsManaged(text) {
+  return typeof text === "string" && text.includes(SIDEBAR_MANAGED_BEGIN) && text.includes(SIDEBAR_MANAGED_END);
+}
+
+// Read-only managed-rows probe for status (never writes the config).
+function sidebarRowsState() {
+  const file = sidebarConfigPath();
+  let body;
+  try {
+    body = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return "rows absent (no Herdr config yet)";
+    return "rows unknown (config unreadable)";
+  }
+  if (body.includes(SIDEBAR_MANAGED_BEGIN) && body.includes(SIDEBAR_MANAGED_END)) {
+    return "managed rows present";
+  }
+  return "managed rows absent";
+}
+
+function sidebarStatusMessage() {
+  const mode = readSidebarMode();
+  const state = mode.state === "missing"
+    ? "enabled (default; no mode file)"
+    : mode.state === "malformed"
+      ? "unknown (mode file malformed)"
+      : mode.state;
+  const which = mode.publish ? "ours" : mode.state === "disabled" ? "native" : "unknown";
+  const installed = fs.existsSync(sidebarNativePath());
+  let excluded;
+  if (!installed) excluded = "not installed";
+  else {
+    const loaded = readSettingsDoc(piSettingsPath());
+    if (loaded === null) excluded = "unknown (settings.json unreadable)";
+    else {
+      const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
+      excluded = list.includes(SIDEBAR_NATIVE_ENTRY) ? "excluded yes" : "excluded no";
+    }
+  }
+  const hook = `${SIDEBAR_NATIVE_REL}: ${excluded}`;
+  return `Gentle sidebar is ${state} (${which}; ${hook}; ${sidebarRowsState()}). Use /herdr-gentle:sidebar toggle|enable|disable|status.`;
+}
+
+async function sidebarEnable(ctx) {
+  const notify = ctx?.ui?.notify;
+  const reRun = "Re-run /herdr-gentle:sidebar enable to converge.";
+  // Preflight before any mutation: unreadable settings or a
+  // foreign/misbound record fails closed with nothing touched.
+  if (fs.existsSync(sidebarNativePath())) {
+    if (readSettingsDoc(piSettingsPath()) === null) {
+      notify?.(`Could not enable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then re-run /herdr-gentle:sidebar enable.`, "error");
+      return;
+    }
+    const binding = checkSidebarMarker(piSettingsPath());
+    if (!binding.ok) {
+      notify?.(`Could not enable: ${binding.note} Re-run after resolving it.`, "error");
+      return;
+    }
+  }
+  // Completion proof before any local state changes: resolve the
+  // installed root, run its configure synchronously, and re-read the
+  // managed-row effect. Exclusion and mode only change after this.
+  const resolved = resolveSidebarPluginRoot();
+  if (!resolved.ok) {
+    notify?.(`Could not enable: ${resolved.note} ${reRun}`, "error");
+    return;
+  }
+  const before = readSidebarConfig();
+  if (!before.ok) {
+    notify?.(`Could not enable: ${before.note} ${reRun}`, "error");
+    return;
+  }
+  const hadManaged = sidebarRowsManaged(before.text);
+  const ran = runSidebarConfigure(resolved.root, "--apply", true);
+  const after = readSidebarConfig();
+  const nowManaged = after.ok && sidebarRowsManaged(after.text);
+  if (ran.exit !== 0 || !nowManaged) {
+    // Bounded rows restore: only our own markers are ever removed, so
+    // user tables and concurrent edits outside them are preserved.
+    let restored = "rows left as found";
+    if (!hadManaged && nowManaged) {
+      const undone = runSidebarConfigure(resolved.root, "--uninstall", false);
+      const check = readSidebarConfig();
+      restored = undone.exit === 0 && check.ok && !sidebarRowsManaged(check.text)
+        ? "stranded rows removed again"
+        : "rows could NOT be restored; remove the managed block manually or re-run enable";
+    }
+    const detail = ran.exit !== 0
+      ? `configure exited ${ran.exit}${ran.output ? `: ${ran.output}` : "."}`
+      : "managed rows missing after configure.";
+    notify?.(`Could not enable: ${detail} ${restored}; mode and exclusion unchanged. ${reRun}`, "error");
+    return;
+  }
+  const exclusion = ensureSidebarExclusion();
+  if (!exclusion.ok) {
+    if (!hadManaged) runSidebarConfigure(resolved.root, "--uninstall", false);
+    notify?.(`Could not enable: ${exclusion.note} Rows rolled back; mode unchanged. ${reRun}`, "error");
+    return;
+  }
+  try {
+    writeSidebarMode(true);
+  } catch (error) {
+    if (exclusion.changed) removeSidebarExclusion();
+    if (!hadManaged) runSidebarConfigure(resolved.root, "--uninstall", false);
+    notify?.(`Could not enable: cannot write ${sidebarModePath()}: ${error?.message ?? error}. State rolled back. ${reRun}`, "error");
+    return;
+  }
+  notify?.(
+    `Gentle sidebar enabled (ours). ${exclusion.note} Managed rows applied and verified (configure exit 0). Sessions already running need /reload to pick up the extension-list change.`,
+    "info",
+  );
+}
+
+async function sidebarDisable(ctx) {
+  const notify = ctx?.ui?.notify;
+  const reRun = "Re-run /herdr-gentle:sidebar disable to converge.";
+  if (fs.existsSync(sidebarNativePath())) {
+    if (readSettingsDoc(piSettingsPath()) === null) {
+      notify?.(`Could not disable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then re-run /herdr-gentle:sidebar disable.`, "error");
+      return;
+    }
+    const binding = checkSidebarMarker(piSettingsPath());
+    if (!binding.ok) {
+      notify?.(`Could not disable: ${binding.note} Re-run after resolving it.`, "error");
+      return;
+    }
+  }
+  const resolved = resolveSidebarPluginRoot();
+  if (!resolved.ok) {
+    notify?.(`Could not disable: ${resolved.note} ${reRun}`, "error");
+    return;
+  }
+  const before = readSidebarConfig();
+  if (!before.ok) {
+    notify?.(`Could not disable: ${before.note} ${reRun}`, "error");
+    return;
+  }
+  const hadManaged = sidebarRowsManaged(before.text);
+  const ran = runSidebarConfigure(resolved.root, "--uninstall", true);
+  const after = readSidebarConfig();
+  const nowAbsent = after.ok && !sidebarRowsManaged(after.text);
+  if (ran.exit !== 0 || !nowAbsent) {
+    // Bounded rows restore (marker-scoped re-apply only): user tables
+    // and concurrent edits outside our markers are preserved.
+    let restored = "rows left as found";
+    if (hadManaged && after.ok && !sidebarRowsManaged(after.text)) {
+      const redone = runSidebarConfigure(resolved.root, "--apply", false);
+      const check = readSidebarConfig();
+      restored = redone.exit === 0 && check.ok && sidebarRowsManaged(check.text)
+        ? "prior owned rows restored"
+        : "rows could NOT be restored; re-run disable or apply the managed block manually";
+    }
+    const detail = ran.exit !== 0
+      ? `configure exited ${ran.exit}${ran.output ? `: ${ran.output}` : "."}`
+      : "managed rows still present after configure.";
+    notify?.(`Could not disable: ${detail} ${restored}; exclusion and mode unchanged. ${reRun}`, "error");
+    return;
+  }
+  const exclusion = removeSidebarExclusion();
+  if (!exclusion.ok) {
+    notify?.(`Could not disable: ${exclusion.note} Rows are native; mode unchanged. ${reRun}`, "error");
+    return;
+  }
+  try {
+    writeSidebarMode(false);
+  } catch (error) {
+    if (exclusion.changed) ensureSidebarExclusion();
+    notify?.(`Could not disable: cannot write ${sidebarModePath()}: ${error?.message ?? error}. Exclusion restored; rows are native. ${reRun}`, "error");
+    return;
+  }
+  notify?.(
+    `Gentle sidebar disabled (native renders again). ${exclusion.note} Managed rows removed and verified (configure exit 0). Sessions already running need /reload to pick up the extension-list change.`,
+    "info",
+  );
+}
+
+// Registered before the `enabled()` guard on purpose: the switch belongs
+// to the Pi session, not to a Herdr pane, so it must exist even where
+// this extension publishes nothing. Hosts whose Pi build has no commands
+// simply skip it.
+function registerSidebarToggle(pi) {
+  if (typeof pi?.registerCommand !== "function") return;
+  pi.registerCommand("herdr-gentle:sidebar", {
+    description: "Switch OUR Herdr sidebar integration versus the native sidebar",
+    handler: async (args, ctx) => {
+      const raw = String(args ?? "").trim().toLowerCase();
+      let verb = raw;
+      // No argument opens the selector when the host can render one; a
+      // cancelled or unavailable selector falls back to status.
+      if (verb === "") {
+        let choice;
+        try {
+          choice = await ctx?.ui?.select?.("Gentle sidebar", ["Enable", "Disable", "Status"]);
+        } catch {
+          choice = undefined;
+        }
+        verb = typeof choice === "string" && choice.length > 0 ? choice.toLowerCase() : "status";
+      }
+      if (verb === "on") verb = "enable";
+      if (verb === "off") verb = "disable";
+      if (verb !== "enable" && verb !== "disable" && verb !== "status" && verb !== "toggle") {
+        ctx?.ui?.notify?.(`Unknown option "${raw}". Use /herdr-gentle:sidebar toggle|enable|disable|status.`, "error");
+        return;
+      }
+      if (verb === "status") {
+        ctx?.ui?.notify?.(sidebarStatusMessage(), "info");
+        return;
+      }
+      if (verb === "toggle") {
+        const mode = readSidebarMode();
+        if (mode.state === "malformed") {
+          ctx?.ui?.notify?.(`Could not toggle: ${sidebarModePath()} is malformed (expected {"version":1,"enabled":boolean}); fix or remove it, then re-run. Nothing was changed.`, "error");
+          return;
+        }
+        verb = mode.publish ? "disable" : "enable";
+      }
+      if (verb === "enable") await sidebarEnable(ctx);
+      else await sidebarDisable(ctx);
+    },
+  });
+}
+
 /* ------------------------------------------------------------ moshi */
 
 // Optional Moshi replacement (DESIGN §7). With the toggle on, this extension
@@ -1584,6 +2167,7 @@ function lastFinishedLabel(taskMap) {
 
 export default function (pi) {
   registerMoshiToggle(pi);
+  registerSidebarToggle(pi);
   if (!enabled()) return;
 
   let rootSession = false;
@@ -1853,6 +2437,18 @@ export default function (pi) {
 
   function updateBlocker() {
     if (!rootSession) return;
+    // Disabled sidebar hands the lifecycle back to native: no gentle
+    // labels are claimed. A stale active label is released once so the
+    // consumer can settle, then this leg stays silent.
+    if (!sidebarPublishingEnabled()) {
+      if (emittedLabel !== undefined) {
+        emittedLabel = undefined;
+        try {
+          pi.events.emit(BLOCKED_EVENT, { active: false });
+        } catch {}
+      }
+      return;
+    }
     ensureAskIntent();
     if (!askActiveNow()) {
       askIntentId = undefined;
@@ -2223,7 +2819,7 @@ export default function (pi) {
   let nativeSessionSeq = Date.now() * 1000;
 
   async function reportSession(sessionStartSource) {
-    if (!enabled()) return;
+    if (!enabled() || !sidebarPublishingEnabled()) return;
     const binding = nativeBinding();
     if (!binding) return;
     nativeSessionSeq += 1;
@@ -2316,7 +2912,7 @@ export default function (pi) {
   }
 
   function queueNative() {
-    if (!enabled()) return;
+    if (!enabled() || !sidebarPublishingEnabled()) return;
     const want = desiredNativeReport();
     if (!want) return;
     if (
@@ -2340,7 +2936,7 @@ export default function (pi) {
   }
 
   async function publishNow() {
-    if (!rootSession) return;
+    if (!rootSession || !sidebarPublishingEnabled()) return;
     if (publishInFlight) {
       // LIVE-3: an in-flight beat must never swallow a newer snapshot —
       // notably the true-empty settle idle, which has no later trigger
