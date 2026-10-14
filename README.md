@@ -303,9 +303,17 @@ webhook. `[[startup]] node bin/gentle-status.js` (no args) is the polling-daemon
 bootstrap (ensures the adaptive poll daemon is running: 10 s baseline,
 `GENTLE_STATUS_POLL_MS`-overridable, with a 2 s fast cycle while recent ask
 activity or send/publish failures are observed); `[[events]] on =
-"pane.agent_detected"` runs `node bin/gentle-status.js --once` as an immediate
-one-frame refresh so a newly opened project name/state renders without waiting
-for the next poll tick. See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer).
+"pane.agent_detected"`, `pane.agent_status_changed`, `pane.exited`, and
+`pane.closed` each run `node bin/gentle-status.js --refresh`, which ensures the
+adaptive poll daemon is running and requests one coalesced immediate frame
+so a newly opened project name/state renders without waiting for the next
+poll tick. Polling stays the fallback for every lifecycle signal, so a missed
+or undelivered event never sticks. Read-only
+supervision triage ships beside it: the `doctor` and `whois` plugin actions
+(`node bin/gentle-doctor.js`, `node bin/gentle-whois.js`) plus the explicit-pane
+`node bin/gentle-trace.js <pane-id>` CLI — all read-only, none mutating state.
+See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
+[docs/diagnostics.md](docs/diagnostics.md) for the triage commands.
 
 ## Key Features You Should Know About
 
@@ -336,7 +344,12 @@ for the next poll tick. See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consu
   session model and never carried across sessions.
 - Single-writer coexistence with `herdr-pi-tree`: no shared token names, no
   dual-write, scoped sweep of own tokens on handover.
-- Always-on native owner (no opt-in flag): this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for a real error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement above is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file is deleted and the user controls installs (no auto-restore) — never reinstall the native publisher from Herdr for the same pane (dual publishers collide). Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
+- Gentle mode is enabled by default: while selected, this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for a real error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement above is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file stays on disk and is excluded through an ownership-bound Pi settings entry while Gentle mode is selected. `/herdr-gentle:sidebar disable` removes only our owned exclusion and managed rows, gates our producer/daemon, and requests `/reload` to hand back the native sidebar; never run both publishers on the same pane. Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
+- Sidebar selection: `/herdr-gentle:sidebar toggle|enable|disable|status`
+  switches between Gentle and native Herdr sidebar integration. No argument
+  opens a selector. Status is read-only; settings changes require Pi `/reload`
+  and the command reports it. User-owned exclusions and sidebar overrides
+  are preserved. See [docs/sidebar-control.md](docs/sidebar-control.md).
 - Optional Moshi replacement (off by default): `/herdr-gentle:moshi` takes
   `enable` / `disable` / `status` (no argument opens a selector with those
   three options). With it on, this plugin **replaces the Moshi-managed Pi
@@ -369,6 +382,9 @@ for the next poll tick. See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consu
 | Protocol, token grammar, reducer, and coexistence rules | [DESIGN.md](DESIGN.md) |
 | Compatibility, migration, and rollback | [DESIGN.md](DESIGN.md) §9 |
 | Open decisions blocking implementation | [DESIGN.md](DESIGN.md) §10 |
+| Supervision triage (read-only doctor/trace/whois) | [docs/diagnostics.md](docs/diagnostics.md) |
+| Lifecycle recovery and interruption (polling fallback) | [docs/supervision.md](docs/supervision.md) |
+| Sidebar toggle (`/herdr-gentle:sidebar`) | [docs/sidebar-control.md](docs/sidebar-control.md) |
 
 ## Next Steps
 
