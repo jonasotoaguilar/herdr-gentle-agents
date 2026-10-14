@@ -610,7 +610,7 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   hook loaded until it reloads — both would notify in that window. The
   enable notice warns about it; fresh sessions are single-emitter by
   construction (exclusion record + flag).
-- Always-on native owner (no opt-in flag): the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq seeded from the clock as
+- Gentle mode is enabled by default: while selected, the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq seeded from the clock as
 `Date.now() * 1000` exactly like Herdr's own plugin SDK, serial latest-wins
 coalesced queue, bounded retries; never `done`/`finished`, never a
 notification method). The clock seed is load-bearing: Herdr ignores a report
@@ -621,8 +621,13 @@ the producer keeps beating for the new one — the consumer then rejects those
 fresh tokens as a session-hash mismatch and the pane stays on `idle` until a
 report with a higher seq lands. Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once with no re-emit on repeat settles). Live background jobs come from Gentle Shell's own bus event `gentle-ai:jobs-sidebar` (`bash_background` / `monitor`), session-scoped; an absent Gentle Shell simply reports none (today's behavior). `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Single publisher by design: the managed native extension file is excluded
   reversibly (`-extensions/herdr-agent-state.ts` in Pi settings, bytes
-  preserved on disk, never auto-loaded next to ours) — never reinstall the
-  native publisher from Herdr for the same pane (dual publishers collide). Limits (unverified, host-owned): the host `idle`->`done`->`finished` mapping (finished text, toast/sound) and unknown-state handling are owned by Herdr.
+  preserved on disk, never auto-loaded next to ours). `/herdr-gentle:sidebar`
+  accepts `toggle`, `enable`, `disable`, and read-only `status`; disable gates
+  our producer/daemon, removes only our ownership-bound native exclusion and
+  managed sidebar rows, and reports the Pi `/reload` requirement. Its shared
+  `gentle-sidebar-mode.json` uses `{version:1,enabled:boolean}`; missing means
+  enabled, malformed fails closed. Never run both publishers on the same pane
+  (dual publishers collide). See [docs/sidebar-control.md](docs/sidebar-control.md). Limits (unverified, host-owned): the host `idle`->`done`->`finished` mapping (finished text, toast/sound) and unknown-state handling are owned by Herdr.
 
 ## 8. Limits
 
@@ -650,10 +655,11 @@ report with a higher seq lands. Parity contract: `working` carries the specific 
   (`GENTLE_STATUS_FAST_QUIET_FRAMES`) or a TTL-bounded window
   (`GENTLE_STATUS_FAST_WINDOW_MS`), 250 ms floor, single dynamic
   `setTimeout` chain.
-  The `pane.agent_detected`
-  event (`node bin/gentle-status.js --once`) is an immediate one-frame refresh
-  on agent detection, not the cadence itself; `[[startup]]` (no args)
-  remains the polling-daemon bootstrap.
+  The four lifecycle hooks (`pane.agent_detected`, `pane.agent_status_changed`,
+  `pane.exited`, `pane.closed`) each run `node bin/gentle-status.js --refresh`
+  (daemon ensure plus one coalesced immediate frame), not the cadence itself;
+  `[[startup]]` (no args) remains the polling-daemon bootstrap and polling
+  remains the fallback for every lifecycle signal.
 - Scale: one producer per Pi pane; one consumer daemon per host; no
   cross-pane aggregation in v1.
 
@@ -696,10 +702,15 @@ report with a higher seq lands. Parity contract: `working` carries the specific 
   per-agent mute, no plugin veto).
 - **U2. Event catalog + poll cadence:** full `[[events]]` catalog of the
   plugin host and the daemon's snapshot poll cadence (must be ≪ TTL).
-  Resolved in part: `pane.agent_detected` invokes
-  `node bin/gentle-status.js --once` as an immediate one-frame refresh, while
-  `[[startup]]` (no args) remains the polling-daemon bootstrap. The remaining
-  catalog beyond this hook stays unresolved.
+  Resolved: `pane.agent_detected`, `pane.agent_status_changed`, `pane.exited`,
+  and `pane.closed` — all confirmed in the installed 0.9.4 schema (T1 probe)
+  — each invoke `node bin/gentle-status.js --refresh` (L6: daemon ensure
+  plus one coalesced immediate frame, never a second writer loop), while
+  `[[startup]]` (no args) remains the polling-daemon bootstrap and polling
+  remains the fallback for every lifecycle signal. `--once` keeps its
+  existing one-frame public behavior for manual use and is not wired as a
+  hook. Runtime proofs of the `--refresh` contract belong to the lifecycle
+  unit's tests, not this protocol record.
 - **U3. pi-tree producer file:** which file in `herdr-pi-tree` emits
   `pi_subagents_work_v1` (only `lib/state.js` consumers were traced); needed
   to confirm no shared writer path.
