@@ -1,7 +1,10 @@
 # Local Pi runtime state
 .atl/
 
-# Local override: this repo SHIPS a Herdr daemon in bin/ (task 7).
-# The global gitignore excludes bin/ (Go builds); re-include it here.
+# Local override: the Pi package ships helper CLIs in bin/
+# (bin/gentle-sidebar.js). The global gitignore excludes bin/ (Go builds);
+# re-include it here, for the Pi helpers and for the Herdr plugin's bin/.
 !bin/
 !bin/**
+!herdr-plugin/bin/
+!herdr-plugin/bin/**

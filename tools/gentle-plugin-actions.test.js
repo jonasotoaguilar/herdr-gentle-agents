@@ -150,11 +150,11 @@ describe('manifest compatibility floor (S5: min 0.9.4)', () => {
     assert.equal(readManifest().top.min_herdr_version, '0.9.4');
   });
 
-  // Release-preflight enforces this lockstep, so pinning a literal version
-  // here would break every release instead of protecting the invariant.
-  it('keeps the manifest version in lockstep with package.json', () => {
-    const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'));
-    assert.equal(readManifest().top.version, pkg.version);
+  // The two packages version independently (per-package tags pi-vX.Y.Z and
+  // herdr-vX.Y.Z), so no lockstep is asserted here; each series' release
+  // preflight checks its own tag against its own version file.
+  it('keeps a valid, independently versioned manifest version', () => {
+    assert.match(readManifest().top.version, /^\d+\.\d+\.\d+$/);
   });
 
   it('stays linux-only', () => {
