@@ -1,22 +1,25 @@
 id = "herdr-gentle-agents"
 name = "Herdr Gentle Agents"
 version = "0.3.3"
-min_herdr_version = "0.9.0"
+min_herdr_version = "0.9.4"
 description = "Herdr sidebar states for Pi + Gentle Shell agents: oldest running role (explorer, worker, verify, judge) with total count in parentheses only when above one, ask, review, blocked, done, idle, plus exact +N/-N SessionChanges segments and ↑N behind-upstream marker."
 platforms = ["linux"]
 
 # Task 5 scaffold: identity metadata only.
 #
-# min_herdr_version tracks herdr-pi-tree (0.9.0): this plugin extends the same
-# pane-metadata transport and snapshot surface (DESIGN.md §2 E8/E10, §9).
+# min_herdr_version tracks the installed 0.9.4 schema: the plugin reads the
+# same pane-metadata transport and snapshot surface (DESIGN.md §2 E8/E10,
+# §9), and the installed schema confirms the pane.agent_detected,
+# pane.agent_status_changed, pane.exited, and pane.closed event names.
 # platforms stays linux-only until the daemon ships: cross-platform scope is
 # unresolved (DESIGN.md §10 U6).
 #
 # [[build]] and [[panes]] are intentionally absent. DESIGN.md
 # §10 U1 is resolved (v0.3.1: the consumer emits no toast, so notification
-# CLI syntax is moot); U2 (event catalog + poll cadence) stays unresolved,
-# and task 6 (extensions/ producer) owns the settings paths.
-# [[actions]] below holds only the verified configure/unconfigure pair.
+# CLI syntax is moot); U2 uses the verified lifecycle hooks below with
+# adaptive polling as fallback. The producer owns the Pi settings paths.
+# [[actions]] below holds the verified configure/unconfigure pair plus the
+# read-only doctor/whois diagnostics pair (trace stays an explicit-pane CLI).
 # Sections below are added only as their commands become verifiable.
 #
 # Coexistence: single-writer handoff with herdr-pi-tree, which stays installed
@@ -33,17 +36,28 @@ platforms = ["linux"]
 [[startup]]
 command = ["node", "bin/gentle-status.js"]
 
-# Watchdog + immediate refresh: --once renders one frame then exits, so a
-# newly opened project name/state appears immediately instead of waiting for
-# the next poll tick. The daemon stays the polling loop (see [[startup]]
-# above); --once is the per-event one-frame refresh, not the wake mechanism
-# for a crashed daemon (a crashed daemon still comes back via ensure-running
-# on the next agent detection — same pattern as herdr-pi-tree's agent-state
-# watchdog). No per-flip event hooks: U2's event catalog is unresolved, so
-# no [[events]] beyond this refresh hook is wired.
+# Lifecycle refresh: --refresh ensures the daemon is running and
+# requests one coalesced immediate frame without spawning a second writer
+# loop; --once stays the existing one-frame public behavior for manual use
+# but is not wired here. All four hooks below use event names confirmed in
+# the installed 0.9.4 schema; the event payload arrives via HERDR_PLUGIN_EVENT
+# / HERDR_PLUGIN_EVENT_JSON. Polling ([[startup]] above) remains the fallback for
+# every lifecycle signal, so a missed or undelivered event never sticks.
 [[events]]
 on = "pane.agent_detected"
-command = ["node", "bin/gentle-status.js", "--once"]
+command = ["node", "bin/gentle-status.js", "--refresh"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["node", "bin/gentle-status.js", "--refresh"]
+
+[[events]]
+on = "pane.exited"
+command = ["node", "bin/gentle-status.js", "--refresh"]
+
+[[events]]
+on = "pane.closed"
+command = ["node", "bin/gentle-status.js", "--refresh"]
 
 # Sidebar wiring (DESIGN.md §5.3 install configuration): the daemon publishes
 # presence-encoded gentle_title_* labels plus the exact +N/-N SessionChanges
@@ -76,3 +90,22 @@ command = ["node", "bin/configure.js", "--uninstall", "--reload"]
 description = "Remove the managed pi-only sidebar override and reload; the user [ui.sidebar.agents] table is left intact. Run before uninstalling."
 platforms = ["linux"]
 title = "Configure: remove the pi-only sidebar override"
+
+# Read-only diagnostics (docs/diagnostics.md): fixed-argv readers that never
+# write state/tokens/config, never start/stop the daemon, and never dump
+# raw private tokens, task labels, or review verdicts. trace stays a
+# documented explicit-pane CLI: with no static pane id there is no honest
+# static action form, so no trace action is wired here.
+[[actions]]
+id = "doctor"
+command = ["node", "bin/gentle-doctor.js"]
+description = "Read-only supervision diagnostics: daemon pidfile liveness, producer/token freshness from one agent snapshot, managed sidebar marker scan. Never writes state."
+platforms = ["linux"]
+title = "Diagnose: read-only daemon/token/sidebar checks"
+
+[[actions]]
+id = "whois"
+command = ["node", "bin/gentle-whois.js"]
+description = "Read-only global pane view (plugin-owned panes; Interrumpido is diagnostic-only, the sidebar is unchanged). Never writes state."
+platforms = ["linux"]
+title = "Diagnose: read-only global pane view"

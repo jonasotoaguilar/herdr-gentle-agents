@@ -13,8 +13,17 @@
 //   node bin/gentle-status.js          ensure the daemon is running
 //   node bin/gentle-status.js --run    BE the daemon (Herdr [[startup]])
 //   node bin/gentle-status.js --once   single frame, then exit (debugging)
+//   node bin/gentle-status.js --refresh ensure one daemon + coalesced
+//                                        immediate refresh (event hooks)
 //   node bin/gentle-status.js --stop   stop the daemon (scoped sweep of live
 //   node bin/gentle-status.js --stop --purge   also clear every owned token)
+//
+// S7 sidebar gate: the sibling sidebar writer owns
+// <stateDir>/gentle-sidebar-mode.json ({version:1,enabled:boolean}); this
+// daemon only reads it. Missing defaults to enabled (current installs
+// unchanged); enabled:false (or malformed, fail-closed) suppresses all
+// sidebar publishes and clears only the owned family once per pane. No
+// daemon path — including --refresh — ever writes the flag.
 //
 // Transport mirrors herdr-pi-tree lib/ipc.js + lib/herdr.js: socket calls
 // with one CLI fallback each, so a misbehaving socket degrades to slow, not
@@ -37,6 +46,7 @@ const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 
 const contract = require('../lib/gentle-tokens');
+const interruptions = require('../lib/gentle-interruptions');
 
 // This daemon's token source tag. The producer extension reports under
 // `gentle:v1`; the daemon writes under the plugin convention
@@ -204,6 +214,62 @@ function stateRoot() {
 }
 
 const PID_FILE = () => path.join(stateRoot(), 'gentle-status.pid');
+const SIDEBAR_MODE_FILE = () => path.join(stateRoot(), 'gentle-sidebar-mode.json');
+const SIDEBAR_MODE_MAX_BYTES = 64 * 1024;
+
+// S7 shared gate (sidebar writer owns writing this flag; the daemon only
+// reads): {version:1,enabled:boolean}. Missing file defaults to enabled,
+// preserving current installations. enabled:false selects the native
+// sidebar: this daemon publishes no sidebar tokens and clears only its own
+// family once per pane (retrying transport failures). Malformed content
+// fails closed as disabled — a naive truthy check could otherwise silently
+// reactivate a deliberately disabled mode — with one bounded error report
+// per distinct content (see reportSidebarModeError). The flag carries no
+// tokens or pane data, and no daemon path (including --refresh hooks)
+// ever writes it.
+function readSidebarMode() {
+  let stat;
+  try {
+    stat = fs.statSync(SIDEBAR_MODE_FILE());
+    if (stat.size > SIDEBAR_MODE_MAX_BYTES) return { enabled: false, malformed: true, raw: '<oversize>' };
+  } catch {
+    return { enabled: true, malformed: false, raw: null };
+  }
+  let raw;
+  try {
+    raw = fs.readFileSync(SIDEBAR_MODE_FILE(), 'utf8');
+  } catch {
+    return { enabled: true, malformed: false, raw: null };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { enabled: false, malformed: true, raw };
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { enabled: false, malformed: true, raw };
+  }
+  if (parsed.version !== 1 || typeof parsed.enabled !== 'boolean') {
+    return { enabled: false, malformed: true, raw };
+  }
+  return { enabled: parsed.enabled, malformed: false, raw: null };
+}
+
+// Bounded malformed-flag report: one stderr line plus one err-file entry
+// per distinct flag content. Never throws; never spams per pane/frame.
+function reportSidebarModeError(state, raw) {
+  const key = `${String(raw).length}:${String(raw).slice(0, 1024)}`;
+  if (state && state.sidebarModeErrorReported === key) return;
+  if (state) state.sidebarModeErrorReported = key;
+  const message = 'gentle-status: sidebar mode flag unreadable; sidebar publishing disabled';
+  try {
+    console.error(message);
+  } catch {
+    // stderr is best-effort; the err file below is the durable record.
+  }
+  logError(new Error(`${message} (raw: ${String(raw).slice(0, 200)})`));
+}
 const LEDGER_FILE = () => path.join(stateRoot(), 'gentle-status-notified.json');
 const ERR_FILE = () => path.join(stateRoot(), 'gentle-status.err');
 
@@ -315,7 +381,11 @@ async function agentsAsync() {
 async function panesAsync() {
   const reply = await socketCall('pane.list', {});
   if (reply && !reply.error && Array.isArray(reply.result?.panes)) return reply.result.panes;
-  return cliJson('pane', 'list')?.result?.panes ?? [];
+  const viaCli = cliJson('pane', 'list')?.result?.panes;
+  // Null on failure, never an empty list: a failed pane read is unknown
+  // presence, not confirmed absence (interruption + sweep decisions must
+  // tell the two apart). Malformed payloads fail closed the same way.
+  return Array.isArray(viaCli) ? viaCli : null;
 }
 
 function tokenPatch(tokens) {
@@ -380,7 +450,7 @@ async function clearOwnedFamily(paneId) {
   return reportChunked(SOURCE, paneId, ownedClearPatch());
 }
 
-async function frame(state) {
+async function frame(state, opts = {}) {
   const now = Date.now();
   if (state.pollObserved) {
     state.pollObserved.askActivity = false;
@@ -391,7 +461,13 @@ async function frame(state) {
     debug('snapshot failed; skipping frame');
     return;
   }
+  // S7 gate: read every frame so a sidebar toggle applies on the next
+  // poll/event refresh without a daemon restart. Malformed fails closed.
+  const sidebar = readSidebarMode();
+  if (sidebar.malformed) reportSidebarModeError(state, sidebar.raw);
   const live = new Set();
+  const liveOwned = []; // owned pane ids (disabled-mode clear-once)
+  const sightings = {}; // paneId -> {entry, reduced} (ledger, daemon only)
   const publishJobs = [];
   for (const entry of agents) {
     const paneId = entry?.pane_id;
@@ -400,6 +476,13 @@ async function frame(state) {
     const reduced = contract.reducePane(entry, now);
     if (!reduced.owned) {
       debug(`pane ${paneId}: pi-tree owns; yielding`);
+      continue;
+    }
+    sightings[paneId] = { entry, reduced };
+    if (!sidebar.enabled) {
+      // Native sidebar selected (or malformed flag): never compose a
+      // publish; the clear-once phase below handles owned leftovers.
+      liveOwned.push(paneId);
       continue;
     }
     // Behind-upstream marker, resolved per cwd with TTL dedupe (no storm
@@ -416,14 +499,42 @@ async function frame(state) {
     publishJobs.push({ paneId, patch, signature });
   }
   // Publishes land every frame; with no notification path nothing gates them.
-  const publishResults = await Promise.all(
-    publishJobs.map(async (job) => ({ job, ok: await reportChunked(SOURCE, job.paneId, job.patch) })),
-  );
-  for (const { job, ok } of publishResults) {
-    if (ok) lastSent.set(job.paneId, job.signature);
-    else {
-      if (state.pollObserved) state.pollObserved.failure = true;
-      debug(`publish failed for pane ${job.paneId}; will retry next frame`);
+  // Suppressed entirely while the native sidebar is selected (S7 gate).
+  if (sidebar.enabled) {
+    const publishResults = await Promise.all(
+      publishJobs.map(async (job) => ({ job, ok: await reportChunked(SOURCE, job.paneId, job.patch) })),
+    );
+    for (const { job, ok } of publishResults) {
+      if (ok) lastSent.set(job.paneId, job.signature);
+      else {
+        if (state.pollObserved) state.pollObserved.failure = true;
+        debug(`publish failed for pane ${job.paneId}; will retry next frame`);
+      }
+    }
+  } else {
+    // Disabled clear-once: remove ONLY the owned family from live panes
+    // so native selection leaves no gentle_* residue, then stop — one
+    // successful clear per pane per tracking window. Transport failure
+    // leaves the pane unmarked for retry on the next frame (and arms the
+    // fast poll cycle via pollObserved.failure). Producer and foreign
+    // tokens are never touched: clearOwnedFamily is the single scoped
+    // sweeper. clearOwnedFamily drops lastSent, so re-enable republishes.
+    if (!state.clearedWhileDisabled || !(state.clearedWhileDisabled instanceof Set)) {
+      state.clearedWhileDisabled = new Set();
+    }
+    // Bounded tracking: on overflow forget and re-clear once (harmless —
+    // clears are idempotent and scoped to the owned family).
+    if (state.clearedWhileDisabled.size > 512) state.clearedWhileDisabled.clear();
+    for (const paneId of liveOwned) {
+      if (state.clearedWhileDisabled.has(paneId)) continue;
+      let ok = false;
+      try {
+        ok = await clearOwnedFamily(paneId);
+      } catch (error) {
+        logError(error);
+      }
+      if (ok) state.clearedWhileDisabled.add(paneId);
+      else if (state.pollObserved) state.pollObserved.failure = true;
     }
   }
 
@@ -439,6 +550,43 @@ async function frame(state) {
     }
   }
   state.live = live;
+  // Diagnostic-only interruption ledger (daemon loop only): --once must
+  // never become a second ledger writer, so it skips this entirely.
+  if (opts.persistInterruptions === true) {
+    try {
+      await trackInterruptions(state, sightings, now);
+    } catch (error) {
+      logError(error);
+    }
+  }
+}
+
+// Daemon-side ledger update: needs pane presence to tell disappearance
+// (pane listed, agent gone) from closure (pane gone). A failed pane read
+// is unknown — callers pass null and updateInterruptions records nothing.
+// Pane presence is fetched only when a previously fresh pane is missing
+// from the snapshot, so steady-state frames cost no extra Herdr call.
+async function trackInterruptions(state, sightings, now) {
+  const prior = state.interruptionsPrior ?? {};
+  const stored = state.interruptions ?? interruptions.blankInterruptions();
+  const missing = Object.keys(prior).filter((id) => !(id in sightings));
+  let paneIds = new Set();
+  if (missing.length > 0) {
+    const panes = await panesAsync();
+    paneIds =
+      panes === null
+        ? null
+        : new Set(panes.map((p) => p?.pane_id).filter((id) => typeof id === 'string'));
+  }
+  const next = interruptions.updateInterruptions({ prior, stored, live: sightings, paneIds, now });
+  state.interruptionsPrior = next.prior;
+  state.interruptions = next.stored;
+  // Persist only ledger (record) changes: prior churn (last_fresh_ts per
+  // frame) stays memory-only and rebuilds from fresh frames after a
+  // restart, so steady-state frames cost no disk write.
+  if (JSON.stringify(next.stored) !== JSON.stringify(stored)) {
+    interruptions.saveInterruptions(stateRoot(), next.stored);
+  }
 }
 
 // Scoped orphan sweep (DESIGN §3 O5): clear ONLY owned gentle_* names, only
@@ -446,6 +594,12 @@ async function frame(state) {
 // are never touched; the clear runs under this daemon's own source tag.
 async function sweepOrphans(live) {
   const panes = await panesAsync();
+  if (panes === null) {
+    // Unknown presence, never empty: claiming a complete sweep over an
+    // unread list would be a lie (callers report incomplete instead).
+    debug('pane list failed; skipping sweep');
+    return false;
+  }
   const jobs = [];
   for (const pane of panes) {
     const id = pane?.pane_id;
@@ -460,14 +614,64 @@ async function sweepOrphans(live) {
 
 /* ------------------------------------------------------------ lifecycle */
 
+// PID-reuse guard: a stale pidfile pointing at a recycled PID must never
+// be signalled or reported as live. On Linux the daemon cmdline still
+// names this script; a mismatch means the pidfile is stale (removed
+// best-effort). Where /proc is unavailable the kill(0) liveness check is
+// the fallback.
+function pidIsOurs(pid) {
+  try {
+    const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    return cmdline.includes('gentle-status.js');
+  } catch {
+    return true;
+  }
+}
+
 function daemonAlive() {
   try {
     const pid = Number(fs.readFileSync(PID_FILE(), 'utf8').trim());
     if (!Number.isSafeInteger(pid) || pid <= 0) return null;
     process.kill(pid, 0);
+    if (!pidIsOurs(pid)) {
+      try {
+        fs.rmSync(PID_FILE(), { force: true });
+      } catch {
+        // Already gone.
+      }
+      return null;
+    }
     return pid;
   } catch {
     return null;
+  }
+}
+
+const REFRESH_FILE = () => path.join(stateRoot(), 'gentle-status.refresh');
+
+// Coalesced immediate-refresh request: event hooks (and operators) touch
+// this file; the daemon loop consumes it (delete) and runs one extra
+// frame. N concurrent requests collapse to one frame. The file carries
+// only a timestamp — never tokens, pane data, or sidebar mode — so an
+// event-triggered wake cannot self-feedback: this daemon's own metadata
+// writes emit no agent lifecycle events, --refresh itself publishes
+// nothing, and the sidebar flag is never written here.
+function requestRefresh() {
+  try {
+    fs.writeFileSync(REFRESH_FILE(), String(Date.now()), 'utf8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function takeRefresh() {
+  try {
+    if (!fs.existsSync(REFRESH_FILE())) return false;
+    fs.rmSync(REFRESH_FILE(), { force: true });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -505,7 +709,14 @@ async function run() {
     console.error(`gentle-status: cannot write pidfile: ${error.message}`);
     process.exit(1);
   }
-  const state = { live: new Set(), pollObserved: createPollStateObserved() };
+  const state = {
+    live: new Set(),
+    pollObserved: createPollStateObserved(),
+    interruptionsPrior: {},
+    interruptions: interruptions.loadInterruptions(stateRoot()),
+    clearedWhileDisabled: new Set(),
+    sidebarModeErrorReported: null,
+  };
   const pollConfig = resolvePollConfig();
   const pollState = createPollState();
   let stopped = false;
@@ -536,16 +747,25 @@ async function run() {
   for (;;) {
     if (stopped) break;
     try {
-      await frame(state);
+      await frame(state, { persistInterruptions: true });
     } catch (error) {
       logError(error);
     }
     if (stopped) break;
     // Single-loop dynamic delay: fast cycle while recent ask activity or
     // failures were observed, baseline otherwise. No setInterval, no busy
-    // loop (delays floored at POLL_MIN_MS via resolvePollConfig).
+    // loop (delays floored at POLL_MIN_MS via resolvePollConfig). The
+    // sleep is interruptible: a coalesced --refresh request breaks the
+    // wait early for one immediate frame. Sequential — the next frame
+    // never overlaps the current one; concurrent requests collapse to one.
     const delay = nextPollDelay(pollState, Date.now(), state.pollObserved, pollConfig);
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    const sliceMs = 250;
+    let remaining = delay;
+    while (remaining > 0 && !stopped) {
+      if (takeRefresh()) break;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(sliceMs, remaining)));
+      remaining -= sliceMs;
+    }
   }
 }
 
@@ -558,6 +778,24 @@ async function main() {
   if (mode === '--once') {
     const state = { live: new Set(), pollObserved: createPollStateObserved() };
     await frame(state);
+    return;
+  }
+  if (mode === '--refresh') {
+    // Recovery + acceleration: ensure exactly one daemon, then request a
+    // coalesced immediate refresh. Never renders a frame here, so this
+    // path can never become a second interruption-ledger writer; never
+    // touches the S7 sidebar flag, so hooks cannot silently reactivate it.
+    const live = daemonAlive();
+    if (live !== null) {
+      console.log(`gentle-status: already running (pid ${live})`);
+    } else {
+      ensureRunning();
+    }
+    if (requestRefresh()) console.log('gentle-status: refresh requested');
+    else {
+      console.error('gentle-status: cannot request refresh');
+      process.exit(1);
+    }
     return;
   }
   if (mode === '--stop') {
@@ -623,5 +861,6 @@ if (require.main === module) {
     createPollState,
     createPollStateObserved,
     nextPollDelay,
+    readSidebarMode,
   };
 }
