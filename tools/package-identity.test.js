@@ -33,9 +33,13 @@ describe('Pi package identity', () => {
     assert.ok(PKG.keywords.includes('pi-package'), `keywords: ${PKG.keywords.join(', ')}`);
   });
 
-  it('declares exactly one Pi extension and that file exists', () => {
-    assert.deepEqual(PKG.pi?.extensions, ['./extensions/gentle-herdr-state.ts']);
-    for (const rel of PKG.pi.extensions) {
+  it('declares the Pi extensions and every declared file exists', () => {
+    const declared = PKG.pi?.extensions ?? [];
+    // The package ships more than one extension now (the state producer and
+    // the worktree tools), so this pins membership rather than a closed list.
+    assert.ok(declared.includes('./extensions/gentle-herdr-state.ts'), `declared: ${declared.join(', ')}`);
+    assert.ok(declared.includes('./extensions/gentle-worktree-tools.ts'), `declared: ${declared.join(', ')}`);
+    for (const rel of declared) {
       assert.ok(fs.existsSync(path.join(REPO_ROOT, rel)), `missing extension ${rel}`);
     }
   });
