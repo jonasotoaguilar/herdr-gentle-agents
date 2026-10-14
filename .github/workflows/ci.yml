@@ -91,4 +91,4 @@ jobs:
             echo "::notice::Skipping TOML validation - herdr-plugin/herdr-plugin.toml not found"
             exit 0
           fi
-          python3 -c 'import tomllib; tomllib.load(open("herdr-plugin/herdr-plugin.toml", "rb")); print("herdr-plugin/herdr-plugin.toml OK")'
+          python3 -c 'import tomllib; m=tomllib.load(open("herdr-plugin/herdr-plugin.toml", "rb")); assert m.get("min_herdr_version"), "min_herdr_version is required"; print("herdr-plugin/herdr-plugin.toml OK")'

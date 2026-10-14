@@ -1,14 +1,29 @@
 #!/bin/sh
-# release-verify: confirm the GitHub Release for RELEASE_TAG exists and is
-# sane after publish. Read-only; makes no changes.
+# release-verify: confirm the per-package release for RELEASE_TAG exists and
+# is sane after publish. Read-only; makes no changes.
+#
+# Tag series (exactly two, strict semver, no prerelease or build metadata):
+#   pi-vX.Y.Z     verifies the GitHub Release plus the installer asset (same
+#                 as the herdr series) and additionally verifies the published
+#                 npm version resolves: npm view
+#                 @jonasotoaguilar/herdr-gentle-agents@<version> version
+#                 equals <version>. Fail-closed when the registry has no such
+#                 version.
+#   herdr-vX.Y.Z  verifies the GitHub Release plus the installer asset only;
+#                 never contacts npm. The bare v* series is rejected.
 #
 # Fails when the release is a draft or a prerelease (the stable
 # releases/latest/download/install.sh entrypoint cannot resolve to it), then
 # downloads the install.sh release asset and fails unless its sha256 equals
-# the tagged ./install.sh.
+# the tagged ./install.sh. The shared gate for both series is the GitHub
+# Release plus the installer asset; the pi series additionally gates on the
+# npm version above. (The workflow's pi-series npm publish step needs the
+# NPM_TOKEN repository secret via NODE_AUTH_TOKEN and fails closed when it
+# is absent; this script's npm view check itself needs no token.)
 #
 # Environment (set by release.yml):
-#   RELEASE_TAG         tag to verify, e.g. v0.1.0 (required, strict vSemVer)
+#   RELEASE_TAG         tag to verify, e.g. pi-v0.1.0 or herdr-v0.1.0
+#                         (required, strict pi-vX.Y.Z / herdr-vX.Y.Z)
 #   RELEASE_REPOSITORY  owner/repo (optional; defaults to the gh-resolved repo)
 #   GH_TOKEN            auth token for gh (required, via environment only)
 
@@ -24,10 +39,10 @@ pass() {
 }
 
 TAG="${RELEASE_TAG:-}"
-[ -n "$TAG" ] || fail "RELEASE_TAG is required (e.g. RELEASE_TAG=v0.1.0)"
+[ -n "$TAG" ] || fail "RELEASE_TAG is required (e.g. RELEASE_TAG=pi-v0.1.0)"
 
-if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-  fail "RELEASE_TAG must be strict vSemVer (vX.Y.Z), got '$TAG'"
+if ! printf '%s' "$TAG" | grep -Eq '^(pi-v|herdr-v)[0-9]+\.[0-9]+\.[0-9]+$'; then
+  fail "RELEASE_TAG must be pi-vX.Y.Z or herdr-vX.Y.Z (strict semver, no prerelease or build metadata), got '$TAG'"
 fi
 
 command -v gh >/dev/null 2>&1 || fail "gh CLI is required"
@@ -96,6 +111,19 @@ fi
 EXPECTED="$(sha256sum install.sh | cut -d ' ' -f1)"
 ACTUAL="$(sha256sum "$VERIFY_TMPDIR/install.sh" | cut -d ' ' -f1)"
 [ "$EXPECTED" = "$ACTUAL" ] || fail "install.sh asset sha256 mismatch for $TAG"
+
+case "$TAG" in
+  pi-v*)
+    command -v npm >/dev/null 2>&1 || fail "npm is required"
+    NPM_VERSION="$(printf '%s' "$TAG" | sed 's/^pi-v//')"
+    PUBLISHED="$(npm view "@jonasotoaguilar/herdr-gentle-agents@$NPM_VERSION" version)" \
+      || fail "npm view @jonasotoaguilar/herdr-gentle-agents@$NPM_VERSION version failed"
+    PUBLISHED_TRIMMED="$(printf '%s' "$PUBLISHED" | tr -d '[:space:]')"
+    [ "$PUBLISHED_TRIMMED" = "$NPM_VERSION" ] \
+      || fail "npm version mismatch for $TAG: registry has '$PUBLISHED_TRIMMED', expected '$NPM_VERSION'"
+    pass "npm version OK: @jonasotoaguilar/herdr-gentle-agents@$PUBLISHED_TRIMMED"
+    ;;
+esac
 
 rm -rf "$VERIFY_TMPDIR"
 trap - EXIT INT TERM

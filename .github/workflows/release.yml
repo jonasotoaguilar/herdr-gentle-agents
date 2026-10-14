@@ -1,21 +1,32 @@
 name: Release
 
-# Tag-only release. No PR required.
-# Flow: git tag -a vX.Y.Z + git push origin vX.Y.Z -> preflight -> release -> verify.
+# Per-package tag releases. No PR required.
+# Flow: git tag -a pi-vX.Y.Z (or herdr-vX.Y.Z) + git push origin <tag>
+#   -> preflight -> release -> verify.
+#
+# Tag series (exactly two, strict semver, no prerelease or build metadata):
+#   pi-vX.Y.Z     the Pi package (package.json, npm name
+#                 @jonasotoaguilar/herdr-gentle-agents). Runs the shared gate,
+#                 publishes the npm package (needs the NPM_TOKEN repository
+#                 secret via NODE_AUTH_TOKEN; fails closed when absent), AND
+#                 creates the GitHub Release with the installer assets.
+#   herdr-vX.Y.Z  the Herdr plugin (herdr-plugin/herdr-plugin.toml). Runs the
+#                 same shared gate and creates the GitHub Release with the
+#                 installer assets only; never touches npm. The bare v* series
+#                 is rejected.
+# Either series attaches install.sh + install.sh.sha256 so the stable
+# releases/latest/download/install.sh entrypoint keeps resolving.
 # The base GitHub Release (with automatic notes) is created at release time by
 # scripts/release-publish (gh release create --generate-notes). Curation of the
 # title and notes happens afterwards by editing the published release in place.
-# This repo ships install.sh and install.sh.sha256 as release assets and
-# publishes no packages: the release target is the GitHub Release itself (the
-# stable releases/latest/download/install.sh entrypoint resolves to the newest
-# non-draft, non-prerelease release, and each release freezes its asset bytes).
-# No npm publishing is wired.
 
 on:
   push:
     tags:
-      - "v*"
-      - "!v*-*"
+      - "pi-v*"
+      - "herdr-v*"
+      - "!pi-v*-*"
+      - "!herdr-v*-*"
 
 permissions:
   contents: read
@@ -58,9 +69,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: release
-    # Base authority creates/updates the GitHub release. No package registry
-    # or container publisher is wired for this repo, so no additional
-    # permissions (id-token, packages) are granted here.
+    # Base authority creates/updates the GitHub release. The pi-v series also
+    # publishes the npm package below; no container publisher is wired, so no
+    # additional permissions (id-token, packages) are granted here (no
+    # provenance is used).
     permissions:
       contents: write
     env:
@@ -73,9 +85,32 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
+      - name: Setup Node for npm publish
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Pi series only: publish the npm package. Fails closed when NPM_TOKEN
+      # is absent; skipped entirely on herdr-v tags. Example:
+      #   npm publish --access public
+      # with NODE_AUTH_TOKEN from the NPM_TOKEN repository secret.
+      - name: Publish Pi package to npm
+        if: startsWith(github.ref_name, 'pi-v')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "::error::NPM_TOKEN is required to publish the Pi package (pi-v series)"
+            exit 1
+          fi
+          npm publish --access public
+
       # Creates the GitHub Release with automatic base notes and the
       # install.sh assets in one call, so a failed upload leaves a draft
-      # instead of a live asset-less release. Example:
+      # instead of a live asset-less release. Runs for BOTH series (pi-v and
+      # herdr-v). Example:
       #   sha256sum install.sh > install.sh.sha256
       #   gh release create "$RELEASE_TAG" install.sh install.sh.sha256 \
       #     --target "$RELEASE_COMMIT" --title "$RELEASE_TAG" --generate-notes
