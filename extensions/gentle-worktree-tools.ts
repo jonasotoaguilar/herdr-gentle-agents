@@ -14,6 +14,7 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { createRequire } from "node:module";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -766,10 +767,378 @@ const worktreeCloseTool = defineTool({
   },
 });
 
+// ---------------------------------------------------------------------------
+// Automatic odd/ capture (S5, D7).
+//
+// The extension observes the Pi tool pipeline for the `read`, `edit` and
+// `write` tools. For each call it decides whether the touched path is a
+// `.md` document inside the principal checkout's `odd/` directory and, when
+// it is, associates that document with the worktree of the AGENT'S CONTEXT
+// (resolved from the invoking context's working directory and matched
+// against the registry entries) — never from the file path identity,
+// because `odd/` is a symlink into the principal checkout so one real path
+// is shared by every worktree. A call running in the principal checkout
+// itself associates nothing.
+//
+// `bash` commands touching `odd/` are NOT reliably parseable (arbitrary
+// shell text, redirections, and quoting cannot be reduced to a file list),
+// so the per-call capture is complemented by a bounded re-scan of the
+// worktree's own `odd/` directory (`.md` only) on EVERY pipeline event on
+// this hook — including `bash` calls, which carry no parseable path at
+// all. Anything the registry does not know about yet is recorded there.
+//
+// The hook never throws and never blocks the pipeline: any failure
+// (unreadable registry, lock timeout, unknown context) is swallowed after
+// a best-effort attempt, and the handler returns nothing.
+// ---------------------------------------------------------------------------
+
+// Only these three tools carry a single document path worth capturing.
+const ODD_CAPTURE_TOOLS = new Set(["read", "edit", "write"]);
+
+// Bounds for the complementary re-scan: at most this many `.md` documents
+// are recorded per hook invocation, the walk descends at most this deep,
+// and gives up after this many directory entries so a huge `odd/` tree can
+// never stall the tool pipeline.
+const ODD_SCAN_MAX_FILES = 500;
+const ODD_SCAN_MAX_DEPTH = 10;
+const ODD_SCAN_MAX_ENTRIES = 5000;
+
+function oddToolNameOf(event) {
+  if (!event || typeof event !== "object") return undefined;
+  const name = event.toolName ?? event.tool ?? event.name;
+  return typeof name === "string" ? name : undefined;
+}
+
+function oddArgsOf(event) {
+  if (!event || typeof event !== "object") return undefined;
+  return event.args ?? event.input ?? event.params ?? event.arguments;
+}
+
+// Path arguments across the tool_call / tool_result shapes: the file tools
+// carry the document under `path` (accepted aliases cover older shapes).
+function oddTouchedPaths(args) {
+  const out = [];
+  const push = (value) => {
+    if (typeof value === "string" && value.length > 0) out.push(value);
+  };
+  if (typeof args === "string") {
+    push(args);
+    return out;
+  }
+  if (!args || typeof args !== "object") return out;
+  const direct = args.path ?? args.file ?? args.filePath ?? args.filename ?? args.target;
+  if (Array.isArray(direct)) direct.forEach(push);
+  else push(direct);
+  const plural = args.paths ?? args.files;
+  if (Array.isArray(plural)) plural.forEach(push);
+  return out;
+}
+
+function oddEventCwd(event, ctx) {
+  if (ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0) return ctx.cwd;
+  if (event && typeof event.cwd === "string" && event.cwd.length > 0) return event.cwd;
+  return process.cwd();
+}
+
+// The registry entry owning `cwd`: the entry whose worktree root is `cwd`
+// itself or its longest enclosing prefix. Anything else — the principal
+// checkout, an unregistered directory — yields null and captures nothing.
+function oddEntryForCwd(worktrees, cwd) {
+  const resolved = path.resolve(cwd);
+  let best = null;
+  let bestLen = -1;
+  for (const entry of worktrees) {
+    if (!entry || typeof entry.path !== "string") continue;
+    let candidate;
+    try {
+      candidate = path.resolve(entry.path);
+    } catch {
+      continue;
+    }
+    if (resolved !== candidate && !resolved.startsWith(candidate + path.sep)) continue;
+    if (candidate.length > bestLen) {
+      best = entry;
+      bestLen = candidate.length;
+    }
+  }
+  return best;
+}
+
+// Best-effort real path: the file itself when it exists (resolving the
+// worktree `odd/` symlink into the principal checkout), else its parent
+// directory plus the basename (covers `write` of a not-yet-created doc),
+// else the lexical path.
+function oddRealPath(absPath) {
+  try {
+    return fs.realpathSync(absPath);
+  } catch {
+    // The file may not exist yet; resolve through its parent instead.
+  }
+  try {
+    return path.join(fs.realpathSync(path.dirname(absPath)), path.basename(absPath));
+  } catch {
+    return absPath;
+  }
+}
+
+// `odd/<rel>` for a touched absolute path, or null when the path is not a
+// `.md` document inside either the worktree's own `odd/` (lexical, through
+// the symlink) or the principal checkout's `odd/` (real path). The returned
+// rel is always relative to the shared `odd/` root so every worktree
+// records the same document under the same name.
+function oddRelFor(absPath, worktreePath, principalRoot) {
+  if (typeof absPath !== "string" || absPath.length === 0) return null;
+  const lexical = path.resolve(absPath);
+  if (!lexical.endsWith(".md")) return null;
+  const candidates = [lexical, path.resolve(oddRealPath(lexical))];
+  const oddRoots = [path.join(worktreePath, "odd"), path.join(principalRoot, "odd")];
+  const bases = [];
+  for (const base of oddRoots) {
+    bases.push(path.resolve(base));
+    try {
+      bases.push(path.resolve(fs.realpathSync(base)));
+    } catch {
+      // An absent `odd/` simply contributes no real base.
+    }
+  }
+  for (const candidate of candidates) {
+    for (const base of bases) {
+      if (candidate === base) continue;
+      if (!candidate.startsWith(base + path.sep)) continue;
+      const rel = path.relative(base, candidate).split(path.sep).join("/");
+      if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
+      return `odd/${rel}`;
+    }
+  }
+  return null;
+}
+
+// Bounded (`.md` only) listing of the worktree's own `odd/` directory,
+// relative to it (`tasks/plan.md`). Never throws: any unreadable directory
+// contributes nothing.
+function scanOddMarkdowns(oddDir) {
+  const rels = [];
+  const visited = new Set();
+  let entriesSeen = 0;
+  const stack = [{ dir: oddDir, depth: 0, prefix: "" }];
+  while (stack.length > 0
+    && rels.length < ODD_SCAN_MAX_FILES
+    && entriesSeen < ODD_SCAN_MAX_ENTRIES) {
+    const { dir, depth, prefix } = stack.pop();
+    let real;
+    try {
+      real = fs.realpathSync(dir);
+    } catch {
+      continue;
+    }
+    if (visited.has(real)) continue;
+    visited.add(real);
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      if (rels.length >= ODD_SCAN_MAX_FILES || entriesSeen >= ODD_SCAN_MAX_ENTRIES) break;
+      entriesSeen += 1;
+      const name = entry.name;
+      if (!name || name === "." || name === "..") continue;
+      const rel = prefix ? `${prefix}/${name}` : name;
+      let isDir = false;
+      let isFile = false;
+      try {
+        isDir = entry.isDirectory();
+        isFile = entry.isFile();
+      } catch {
+        continue;
+      }
+      if (isDir) {
+        if (depth + 1 <= ODD_SCAN_MAX_DEPTH) {
+          stack.push({ dir: path.join(dir, name), depth: depth + 1, prefix: rel });
+        }
+      } else if (isFile && name.endsWith(".md")) {
+        rels.push(rel);
+      }
+    }
+  }
+  return rels;
+}
+
+function captureOddFromToolEvent(event, ctx) {
+  const cwd = oddEventCwd(event, ctx);
+  const git = libRequire("worktree-git.js");
+  const registry = libRequire("worktree-registry.js");
+  let repo;
+  try {
+    repo = git.repoIdentity(cwd);
+  } catch {
+    return; // Unknown context: not a repository, nothing to associate.
+  }
+  const principalRoot = path.basename(repo.commonDir) === ".git"
+    ? path.dirname(repo.commonDir)
+    : repo.root;
+  const read = registry.readRegistry(repo.root);
+  if (!read || read.ok !== true || !Array.isArray(read.worktrees)) return;
+  const entry = oddEntryForCwd(read.worktrees, cwd);
+  if (!entry) return; // Principal checkout itself associates nothing.
+  const key = entry.branch;
+  const known = new Set(Array.isArray(entry.odd) ? entry.odd : []);
+  const candidates = [];
+  // Per-call capture applies to the read/edit/write tools, which carry a
+  // single document path. Every other tool (notably `bash`) carries no
+  // reliably parseable path and skips this leg entirely.
+  if (ODD_CAPTURE_TOOLS.has(oddToolNameOf(event))) {
+    for (const raw of oddTouchedPaths(oddArgsOf(event))) {
+      const abs = path.isAbsolute(raw) ? raw : path.join(cwd, raw);
+      const rel = oddRelFor(abs, entry.path, principalRoot);
+      if (rel && !known.has(rel)) {
+        known.add(rel);
+        candidates.push(rel);
+      }
+    }
+  }
+  // Complement: record anything the per-call capture never observed.
+  // Runs on every pipeline event so opaque calls (e.g. `bash`) still
+  // converge the registry towards the worktree's `odd/` contents.
+  try {
+    for (const rel of scanOddMarkdowns(path.join(entry.path, "odd"))) {
+      const full = `odd/${rel}`;
+      if (!known.has(full)) {
+        known.add(full);
+        candidates.push(full);
+      }
+    }
+  } catch {
+    // Best effort: the observed paths above are still recorded.
+  }
+  for (const rel of candidates) {
+    try {
+      registry.addOddDoc(repo.root, key, rel);
+    } catch {
+      // Unreadable registry or lock timeout: swallow, keep the pipeline.
+    }
+  }
+}
+
+// The subscribed pipeline handler: never throws, never blocks, returns
+// nothing (a `tool_call` return value would mutate or block the call).
+function handleWorktreeOddEvent(event, ctx) {
+  try {
+    captureOddFromToolEvent(event, ctx);
+  } catch {
+    // Any failure is swallowed after the best-effort attempt above.
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// `/herdr-gentle:worktree` mode command (S10, D9).
+//
+// Follows the `/herdr-gentle:sidebar` pattern with the shared mode file in
+// lib/worktree-mode.js (default enabled): `enabled`/`disabled` write the
+// file (with `enable`/`disable` accepted as aliases), `status` never
+// writes. An unknown or missing verb prints a usage line naming the three
+// verbs and mutates nothing.
+// ---------------------------------------------------------------------------
+
+function worktreeStatusMessage(modeState, toolsRegistered) {
+  const state = !modeState || typeof modeState.state !== "string"
+    ? "unknown (mode file unreadable)"
+    : modeState.state === "missing"
+      ? "enabled (default; no mode file)"
+      : modeState.state === "malformed"
+        ? "unknown (mode file malformed)"
+        : modeState.state;
+  const registered = toolsRegistered ? "yes" : "no";
+  let reload = "unknown";
+  try {
+    reload = (modeState && modeState.enabled === true) !== toolsRegistered ? "yes" : "no";
+  } catch {
+    reload = "unknown";
+  }
+  return `Worktree tools are ${state} (tools registered: ${registered}; /reload needed: ${reload}). Use /herdr-gentle:worktree enabled|disabled|status.`;
+}
+
+// Registered before any gate on purpose (like the sidebar toggle): the
+// switch belongs to the Pi session, so it must exist even while the tools
+// themselves are unregistered. Hosts without commands simply skip it.
+function registerWorktreeCommand(pi, toolsRegistered) {
+  if (typeof pi?.registerCommand !== "function") return;
+  pi.registerCommand("herdr-gentle:worktree", {
+    description: "Turn the agent worktree tools (worktree_create/list/close) on or off",
+    handler: async (args, ctx) => {
+      const notify = ctx?.ui?.notify;
+      const raw = String(args ?? "").trim().toLowerCase();
+      let verb = raw;
+      if (verb === "enable") verb = "enabled";
+      if (verb === "disable") verb = "disabled";
+      if (verb !== "enabled" && verb !== "disabled" && verb !== "status") {
+        notify?.(`Unknown option "${raw}". Use /herdr-gentle:worktree enabled|disabled|status.`, "error");
+        return;
+      }
+      const mode = libRequire("worktree-mode.js");
+      if (verb === "status") {
+        let state;
+        try {
+          state = mode.readMode();
+        } catch {
+          state = { state: "malformed", enabled: false };
+        }
+        notify?.(worktreeStatusMessage(state, toolsRegistered), "info");
+        return;
+      }
+      const enabled = verb === "enabled";
+      try {
+        mode.writeMode(enabled, process.env);
+      } catch (err) {
+        notify?.(`Could not write ${mode.modePath(process.env)}: ${(err && err.message) || err}`, "error");
+        return;
+      }
+      // Registration changes apply on `/reload`: enabling a session that
+      // loaded while disabled (or vice versa) only takes full effect after
+      // one, while repeating the already-loaded state needs none.
+      const needsReload = enabled !== toolsRegistered;
+      notify?.(
+        enabled
+          ? (needsReload
+            ? "Worktree tools enabled. Sessions already running need /reload to register the tools."
+            : "Worktree tools enabled (already registered in this session; no /reload needed).")
+          : (needsReload
+            ? "Worktree tools disabled. Sessions already running need /reload to unload the tools (calls stay blocked until then)."
+            : "Worktree tools disabled (already unregistered in this session; no /reload needed)."),
+        "info",
+      );
+    },
+  });
+}
+
 export default function (pi) {
-  pi.registerTool(worktreeCreateTool);
-  pi.registerTool(worktreeListTool);
-  pi.registerTool(worktreeCloseTool);
+  // Load-time gate (D9): missing means enabled, malformed never enables.
+  // The toggle command below always stays registered so the mode can be
+  // flipped back; the current registration state is reported through its
+  // `status` verb in the same style the `/herdr-gentle:sidebar` command
+  // uses (mode state, what is active, whether `/reload` is needed).
+  let toolsRegistered = false;
+  try {
+    toolsRegistered = libRequire("worktree-mode.js").readMode().enabled === true;
+  } catch {
+    toolsRegistered = false;
+  }
+  registerWorktreeCommand(pi, toolsRegistered);
+  if (toolsRegistered) {
+    pi.registerTool(worktreeCreateTool);
+    pi.registerTool(worktreeListTool);
+    pi.registerTool(worktreeCloseTool);
+  }
+  // Automatic odd/ capture (S5, D7): observe the tool pipeline for the
+  // read/edit/write tools. Guarded so hosts (and the older unit-test
+  // doubles) without `pi.on` still load the tools above.
+  if (typeof pi?.on === "function") {
+    pi.on("tool_call", handleWorktreeOddEvent);
+    pi.on("tool_result", handleWorktreeOddEvent);
+  }
 }
 
 export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread };
