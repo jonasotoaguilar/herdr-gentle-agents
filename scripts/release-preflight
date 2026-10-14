@@ -46,16 +46,16 @@ TAG_VERSION="$(printf '%s' "$TAG" | cut -c2-)"
 pass "tag matches package.json version $PKG_VERSION"
 
 # Manifest must parse and agree on the same version.
-TOML_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('herdr-plugin.toml','rb'))['version'])")"
+TOML_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('herdr-plugin/herdr-plugin.toml','rb'))['version'])")"
 [ "$TOML_VERSION" = "$PKG_VERSION" ] \
-  || fail "herdr-plugin.toml version $TOML_VERSION does not match package.json version $PKG_VERSION"
-pass "herdr-plugin.toml parses, version $TOML_VERSION"
+  || fail "herdr-plugin/herdr-plugin.toml version $TOML_VERSION does not match package.json version $PKG_VERSION"
+pass "herdr-plugin/herdr-plugin.toml parses, version $TOML_VERSION"
 
 pass "running: node --test tools/*.test.js"
 node --test tools/*.test.js
 
-pass "running: node --check on bin/ and lib/"
-for f in bin/*.js lib/*.js; do
+pass "running: node --check on bin/, lib/ and herdr-plugin/"
+for f in bin/*.js lib/*.js herdr-plugin/bin/*.js herdr-plugin/lib/*.js; do
   node --check "$f"
 done
 

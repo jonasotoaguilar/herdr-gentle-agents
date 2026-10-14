@@ -7,7 +7,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
-const tokens = require('../lib/gentle-tokens.js');
+const tokens = require('../herdr-plugin/lib/gentle-tokens.js');
 
 const NOW = 1700000000000;
 const EXPIRY = NOW + 10000;
@@ -557,7 +557,7 @@ describe('row value identity', () => {
 describe('sidebar row layout (bin/configure.js)', () => {
   const fs = require('node:fs');
   const path = require('node:path');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'configure.js'), 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'herdr-plugin', 'bin', 'configure.js'), 'utf8');
   function rowBlock(name) {
     const start = src.indexOf('const ' + name + ' = [');
     assert.ok(start >= 0, name + ' defined');
@@ -656,7 +656,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
 describe('README managed example matches generated config exactly', () => {
   const fsReadme = require('node:fs');
   const pathReadme = require('node:path');
-  const configure = require('../bin/configure.js');
+  const configure = require('../herdr-plugin/bin/configure.js');
   const readme = fsReadme.readFileSync(pathReadme.join(__dirname, '..', 'README.md'), 'utf8');
 
   it('README embeds the exact generated pi row (row 1 native, row 2 title + changes)', () => {

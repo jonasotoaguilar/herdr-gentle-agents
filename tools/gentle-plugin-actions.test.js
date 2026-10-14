@@ -3,7 +3,9 @@
 // manifest surface plus the public help contracts of the read-only
 // diagnostics CLIs, tested through public entrypoints only.
 //
-// Isolation contract: manifest assertions read herdr-plugin.toml as text.
+// Isolation contract: manifest assertions read herdr-plugin/herdr-plugin.toml
+// as text, and every command path the manifest names is resolved against the
+// plugin root Herdr installs, not against the repository root.
 // CLI assertions drive the real bins via fixed-argv HERDR_BIN_PATH against
 // a temp fake `herdr` replaying canned `agent list` JSON. Rejected input
 // must cause zero Herdr calls and zero filesystem writes. Never invoke
@@ -18,10 +20,11 @@ const os = require('node:os');
 const path = require('node:path');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
-const MANIFEST = path.join(REPO_ROOT, 'herdr-plugin.toml');
-const DOCTOR = path.join(REPO_ROOT, 'bin', 'gentle-doctor.js');
-const TRACE = path.join(REPO_ROOT, 'bin', 'gentle-trace.js');
-const WHOIS = path.join(REPO_ROOT, 'bin', 'gentle-whois.js');
+const PLUGIN_ROOT = path.join(REPO_ROOT, 'herdr-plugin');
+const MANIFEST = path.join(PLUGIN_ROOT, 'herdr-plugin.toml');
+const DOCTOR = path.join(PLUGIN_ROOT, 'bin', 'gentle-doctor.js');
+const TRACE = path.join(PLUGIN_ROOT, 'bin', 'gentle-trace.js');
+const WHOIS = path.join(PLUGIN_ROOT, 'bin', 'gentle-whois.js');
 
 // Minimal strict TOML reader for this manifest's shape only: top-level
 // `key = "value"` scalars plus [[startup]]/[[events]]/[[actions]] tables
@@ -209,7 +212,9 @@ describe('manifest read-only diagnostic actions (S2/S5)', () => {
     const hit = readManifest().actions.find((a) => a.id === 'sidebar');
     if (hit !== undefined) {
       assert.ok(
-        (hit.command ?? []).every((part) => part !== 'bin/gentle-sidebar.js' || fs.existsSync(part)),
+        (hit.command ?? []).every(
+          (part) => part !== 'bin/gentle-sidebar.js' || fs.existsSync(path.join(PLUGIN_ROOT, part)),
+        ),
         'no sidebar action pointing at a helper that does not exist',
       );
     }

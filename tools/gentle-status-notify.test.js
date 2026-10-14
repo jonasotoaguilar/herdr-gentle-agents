@@ -17,8 +17,8 @@ const os = require('node:os');
 const path = require('node:path');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
-const DAEMON = path.join(REPO_ROOT, 'bin', 'gentle-status.js');
-const contract = require('../lib/gentle-tokens.js');
+const DAEMON = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-status.js');
+const contract = require('../herdr-plugin/lib/gentle-tokens.js');
 
 // No daemon toast copy remains: the daemon emits no desktop notification
 // for any display (native Herdr attention owns ask + finish); the tests
@@ -248,7 +248,7 @@ describe('clear intervention copy', () => {
 });
 
 describe('adaptive poll (P1)', () => {
-  const daemon = require('../bin/gentle-status.js');
+  const daemon = require('../herdr-plugin/bin/gentle-status.js');
 
   it('baseline defaults to 10s with 2s fast cycle; env overrides honored', () => {
     const defaults = daemon.resolvePollConfig({});

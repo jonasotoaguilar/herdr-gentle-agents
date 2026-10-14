@@ -77,7 +77,7 @@ fs.writeFileSync(
 // production script against the isolated HERDR_CONFIG_PATH.
 const pluginRoot = path.join(root, 'plugin');
 fs.mkdirSync(path.join(pluginRoot, 'bin'), { recursive: true });
-fs.copyFileSync(path.resolve(__dirname, '../bin/configure.js'), path.join(pluginRoot, 'bin', 'configure.js'));
+fs.copyFileSync(path.resolve(__dirname, '../herdr-plugin/bin/configure.js'), path.join(pluginRoot, 'bin', 'configure.js'));
 process.env.HERDR_SHIM_PLUGIN_ROOT = pluginRoot;
 
 const COMMAND = 'herdr-gentle:sidebar';

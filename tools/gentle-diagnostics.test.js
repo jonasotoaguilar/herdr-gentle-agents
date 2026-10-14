@@ -14,9 +14,9 @@ const os = require('node:os');
 const path = require('node:path');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
-const DOCTOR = path.join(REPO_ROOT, 'bin', 'gentle-doctor.js');
-const TRACE = path.join(REPO_ROOT, 'bin', 'gentle-trace.js');
-const WHOIS = path.join(REPO_ROOT, 'bin', 'gentle-whois.js');
+const DOCTOR = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-doctor.js');
+const TRACE = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-trace.js');
+const WHOIS = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-whois.js');
 
 const FAKE_HERDR = `#!/bin/sh
 # Fake herdr: replays canned agent/pane JSON, logs every argv with framing.

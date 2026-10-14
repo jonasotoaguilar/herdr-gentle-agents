@@ -31,8 +31,8 @@ const os = require('node:os');
 const path = require('node:path');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
-const DAEMON = path.join(REPO_ROOT, 'bin', 'gentle-status.js');
-const contract = require('../lib/gentle-tokens.js');
+const DAEMON = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-status.js');
+const contract = require('../herdr-plugin/lib/gentle-tokens.js');
 
 const FAKE_HERDR = `#!/bin/sh
 # Fake herdr for lifecycle tests: replays canned agent/pane JSON, logs
