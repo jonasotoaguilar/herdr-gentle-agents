@@ -25,7 +25,10 @@ Structured `details` on success:
   is `false` when the call returned the thread's existing checkout (see
   per-thread ownership); `hooks` is the creation-hook report (`{ok,
   steps, warnings}`), so a failed hook step stays visible there and never
-  turns success into an error.
+  turns success into an error. When the write replaced a malformed
+  registry, the sibling backup path travels as `registryBackup`; when no
+  backup could be written, the failure travels as `registryBackupError`
+  (best-effort, never fatal).
 - list: `{worktrees: [{path, branch, thread, issues, status}], count,
   all}` — `status` is `live`, `missing` (registered but no live checkout),
   or `unregistered` (only with `all: true`).
@@ -60,13 +63,19 @@ createdAt, updatedAt}`.
 Reads tolerate damage: a missing file reads as empty, malformed content is
 reported (`{ok: false, error}`) instead of thrown, and the file is left
 untouched — malformed never silently enables anything. Writes are atomic
-(sibling temp file plus rename) and serialized by `withRegistryLock`, an
+(a sibling temp file created exclusively with an unpredictable suffix
+plus rename, retrying a new name a bounded number of times and refusing
+with a clear error rather than following or reusing anything) and
+serialized by `withRegistryLock`, an
 exclusive lock file beside the registry with a bounded wait and
 stale-lock recovery. A malformed file is replaced on the next upsert,
 never merged — and before the replacement the previous bytes are copied
-to a sibling backup named `<registry>.corrupt-<timestamp>` in the same
-directory (best-effort, never fatal), whose path is reported in the
-upsert result and in the `worktree_create` details as `registryBackup` so
+to a sibling backup named `<registry>.corrupt-<timestamp>-<random>` in the same
+directory (best-effort, never fatal, never clobbering: created exclusively
+with an unpredictable suffix, retrying a new name a bounded number of
+times, and continuing without a backup when none can be written), whose path is reported in the
+upsert result and in the `worktree_create` details as `registryBackup` (or
+`registryBackupError` when no backup could be written) so
 the caller can name it. A valid registry is never backed up.
 
 Registry entry paths must be absolute. A `worktree_close` whose entry
@@ -77,7 +86,19 @@ the same absolute value derived from the entry, and `worktree_list`'s
 live cross-check likewise never resolves a registry path against the
 process cwd (a non-absolute entry is reported `missing`, never live).
 Entry lookup matches by exact branch equality or exact absolute path
-equality only.
+equality only. The close drops its entry by that same absolute path
+(`removeWorktreeByPath`): one path identity end to end from resolve
+through verify and remove to drop, so duplicate branches or a branch that
+equals another entry's path can never divert the drop; `removeWorktree`'s
+branch-first behaviour is kept for any other caller and is unreachable in
+the close flow. A Herdr workspace id is used only when its list entry's
+path resolves to exactly that same absolute target: absolute entries
+compare directly, relative entries resolve against the repository root
+derived from the caller's checkout (never the process cwd) for the
+comparison only and are never used as a removal base. When no entry
+matches, Herdr is skipped entirely and the close falls back to `git
+worktree remove` with fixed argv; no removal argv ever names a workspace
+that is not the verified target.
 
 ## Creation path
 
@@ -145,7 +166,10 @@ aliases; anything else (including a missing verb) prints `Unknown option
 "<raw>". Use /herdr-gentle:worktree enabled|disabled|status.` and mutates
 nothing. `status` never writes. Writing the mode refuses a symlinked or
 non-regular mode path with a clear error and touches nothing (the normal
-path stays atomic: a sibling temp file renamed into place), and the
+path stays atomic: a sibling temp file created exclusively with an
+unpredictable suffix and renamed into place, retrying a new name a
+bounded number of times and refusing with a clear message rather than
+following or reusing anything), and the
 command surfaces that refusal instead of claiming success. The shared mode file is
 `gentle-worktree-mode.json` (`{version: 1, enabled: boolean}`) in the
 plugin state directory — `GENTLE_STATUS_STATE_DIR`, else

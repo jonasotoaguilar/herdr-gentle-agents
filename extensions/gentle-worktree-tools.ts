@@ -188,8 +188,12 @@ async function executeWorktreeCreate(params, ctx) {
       );
     }
     // Stale entry (checkout gone): drop it best-effort and create fresh.
+    // Drop by this entry's own path when it is absolute: with a hand-edited
+    // registry holding two entries that share a branch, dropping by branch
+    // could delete the live entry instead of the stale one.
     try {
-      registry.removeWorktree(repo.root, owned.branch);
+      if (ownedAbsolute !== null) registry.removeWorktreeByPath(repo.root, ownedAbsolute);
+      else registry.removeWorktree(repo.root, owned.branch);
     } catch {
       // Creation below still produces a correct checkout + entry.
     }
@@ -355,8 +359,11 @@ async function executeWorktreeCreate(params, ctx) {
   // Hook steps and warnings travel inside details; a failed step is
   // visible there and never becomes an error result. When the write
   // replaced a malformed registry, the sibling backup path travels along
-  // so the caller can name it.
-  const backupDetails = stored.backup ? { registryBackup: stored.backup } : {};
+  // so the caller can name it. When no backup could be written the
+  // failure travels as registryBackupError (best-effort, never fatal).
+  const backupDetails = {};
+  if (stored.backup) backupDetails.registryBackup = stored.backup;
+  if (stored.backupError) backupDetails.registryBackupError = stored.backupError;
   return textResult(
     successText(target),
     { path: target, branch, issues: issueNumbers, created: true, hooks, warnings: (hooks && hooks.warnings) || [], ...backupDetails },
@@ -509,9 +516,13 @@ function rankCandidates(query, entries) {
 
 // Resolve the Herdr workspace id for a checkout path from `herdr worktree
 // list` JSON (`{result: {worktrees: [{path, open_workspace_id, ...}]}}`,
-// with tolerant fallbacks). Returns null when herdr is unusable or the
-// checkout has no workspace id — the caller then falls back to git.
-function herdrWorkspaceId(stdout, resolvedTarget) {
+// with tolerant fallbacks). A workspace id is returned only when the list
+// entry's path resolves to exactly the close target: absolute entries
+// compare directly, relative entries resolve against the repository root
+// (never the process cwd) for the comparison only. Returns null when
+// herdr is unusable, no entry matches, or the checkout has no workspace
+// id — the caller then skips herdr entirely and falls back to git.
+function herdrWorkspaceId(stdout, resolvedTarget, repoRoot) {
   let list = null;
   try {
     const doc = JSON.parse(stdout);
@@ -526,11 +537,14 @@ function herdrWorkspaceId(stdout, resolvedTarget) {
     return null;
   }
   if (!list) return null;
+  const base = typeof repoRoot === "string" && repoRoot.length > 0 ? repoRoot : null;
   for (const item of list) {
-    if (!item || typeof item.path !== "string") continue;
+    if (!item || typeof item.path !== "string" || item.path.length === 0) continue;
     let resolved;
     try {
-      resolved = path.resolve(item.path);
+      if (path.isAbsolute(item.path)) resolved = path.resolve(item.path);
+      else if (base === null) continue;
+      else resolved = path.resolve(base, item.path);
     } catch {
       continue;
     }
@@ -702,7 +716,7 @@ async function executeWorktreeClose(params, ctx) {
     timeoutMs: 60000,
   });
   if (listed.status === 0) {
-    workspace = herdrWorkspaceId(listed.stdout, resolvedTarget);
+    workspace = herdrWorkspaceId(listed.stdout, resolvedTarget, repo.root);
   }
   if (workspace) {
     const removeParams = { workspace };
@@ -760,7 +774,7 @@ async function executeWorktreeClose(params, ctx) {
   }
   let dropped;
   try {
-    dropped = registry.removeWorktree(repo.root, branch);
+    dropped = registry.removeWorktreeByPath(repo.root, resolvedTarget);
   } catch (err) {
     dropped = { ok: false, error: (err && err.message) || String(err) };
   }
