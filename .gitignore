@@ -1,6 +1,12 @@
 # Local Pi runtime state
 .atl/
 
+# Local runtime artifacts: package installs and Herdr UI state are produced by
+# running the tools, never tracked. The creation hooks install dependencies
+# inside a checkout, so this must not depend on a global ignore rule.
+node_modules/
+.ui/
+
 # Local override: the Pi package ships helper CLIs in bin/
 # (bin/gentle-sidebar.js). The global gitignore excludes bin/ (Go builds);
 # re-include it here, for the Pi helpers and for the Herdr plugin's bin/.

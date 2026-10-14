@@ -25,7 +25,10 @@ Structured `details` on success:
   is `false` when the call returned the thread's existing checkout (see
   per-thread ownership); `hooks` is the creation-hook report (`{ok,
   steps, warnings}`), so a failed hook step stays visible there and never
-  turns success into an error.
+  turns success into an error. When the write replaced a malformed
+  registry, the sibling backup path travels as `registryBackup`; when no
+  backup could be written, the failure travels as `registryBackupError`
+  (best-effort, never fatal).
 - list: `{worktrees: [{path, branch, thread, issues, status}], count,
   all}` — `status` is `live`, `missing` (registered but no live checkout),
   or `unregistered` (only with `all: true`).
@@ -60,10 +63,56 @@ createdAt, updatedAt}`.
 Reads tolerate damage: a missing file reads as empty, malformed content is
 reported (`{ok: false, error}`) instead of thrown, and the file is left
 untouched — malformed never silently enables anything. Writes are atomic
-(sibling temp file plus rename) and serialized by `withRegistryLock`, an
+(a sibling temp file created exclusively with an unpredictable suffix
+plus rename, retrying a new name a bounded number of times and refusing
+with a clear error rather than following or reusing anything; a write that
+fails after the temp file was created unlinks it best-effort before
+rethrowing, so a failed write never leaves a temp file behind and never
+reports success) and
+serialized by `withRegistryLock`, an
 exclusive lock file beside the registry with a bounded wait and
 stale-lock recovery. A malformed file is replaced on the next upsert,
-never merged.
+never merged — and before the replacement the previous bytes are copied
+to a sibling backup named `<registry>.corrupt-<timestamp>-<random>` in the same
+directory (best-effort, never fatal, never clobbering: created exclusively
+with an unpredictable suffix, retrying a new name a bounded number of
+times, and continuing without a backup when none can be written), whose path is reported in the
+upsert result and in the `worktree_create` details as `registryBackup` (or
+`registryBackupError` when no backup could be written) so
+the caller can name it. A valid registry is never backed up.
+
+Registry entry paths must be absolute. A `worktree_close` whose entry
+path is not absolute is refused with an error naming the entry and the
+reason, with no mutation of any checkout and no registry change; the
+pre-removal check, any removal, and the post-removal verification all use
+the same absolute value derived from the entry, and `worktree_list`'s
+live cross-check likewise never resolves a registry path against the
+process cwd (a non-absolute entry is reported `missing`, never live).
+Entry lookup matches by exact branch equality or exact absolute path
+equality only. The close drops its entry by that same absolute path
+(`removeWorktreeByPath`), which drops every row whose path resolves to
+that value so no stale duplicate survives the close: one path identity
+end to end from resolve
+through verify and remove to drop, so duplicate branches or a branch that
+equals another entry's path can never divert the drop; `removeWorktree`'s
+branch-first behaviour is kept for any other caller and is unreachable in
+the close flow. A Herdr workspace id is used only when its list entry's
+path resolves to exactly that same absolute target: absolute entries
+compare directly, relative entries resolve against the repository root
+derived from the caller's checkout (never the process cwd) for the
+comparison only and are never used as a removal base. When more than one
+list entry resolves to the target with different workspace ids, that is
+ambiguity: no id is returned, Herdr is skipped entirely, and the close
+uses the git path instead. One entry, or several entries carrying the
+same id, still resolves. When no entry
+matches, Herdr is skipped entirely and the close falls back to `git
+worktree remove` with fixed argv; no removal argv ever names a workspace
+that is not the verified target. After a removal completes, on both the
+herdr and the git paths, the close compares the live checkouts against
+the pre-removal snapshot: when a checkout other than the target
+disappeared, the close fails naming the vanished path, refuses to treat
+the close as successful, and leaves the registry entry in place.
+Removing only the target never trips this check.
 
 ## Creation path
 
@@ -129,7 +178,15 @@ from the caller's checkout.
 `/herdr-gentle:sidebar` pattern. `enable`/`disable` are accepted as
 aliases; anything else (including a missing verb) prints `Unknown option
 "<raw>". Use /herdr-gentle:worktree enabled|disabled|status.` and mutates
-nothing. `status` never writes. The shared mode file is
+nothing. `status` never writes. Writing the mode refuses a symlinked or
+non-regular mode path with a clear error and touches nothing (the normal
+path stays atomic: a sibling temp file created exclusively with an
+unpredictable suffix and renamed into place, retrying a new name a
+bounded number of times and refusing with a clear message rather than
+following or reusing anything; a write that fails after the temp file was
+created unlinks it best-effort before rethrowing, so a failed write never
+leaves a temp file behind and never reports success), and the
+command surfaces that refusal instead of claiming success. The shared mode file is
 `gentle-worktree-mode.json` (`{version: 1, enabled: boolean}`) in the
 plugin state directory — `GENTLE_STATUS_STATE_DIR`, else
 `HERDR_PLUGIN_STATE_DIR`, else
@@ -156,6 +213,11 @@ another thread's checkout. A thread that already owns a registered,
 still-live worktree gets that checkout back — `worktree create: <path>`
 again with `created: false` — never a second checkout. A stale entry
 (checkout gone) is dropped best-effort and creation proceeds fresh.
+The cleanup drops the one row it identified as the thread's own by row
+identity — the (branch, path) pair of the selected entry
+(`removeWorktreeExact`) — never by branch alone and never by a path-key
+lookup that can match a different row, so a live entry sharing the branch
+survives whether the stale path is absolute or relative.
 `worktree_list` shows each entry's owning thread; `worktree_close`
 reports it (`details.thread`, plus `This checkout is owned by thread
 '…'.` in the approval prompt, or `This checkout has no recorded owning
@@ -165,7 +227,10 @@ from a later session.
 ## Odd-document capture
 
 The extension observes the Pi tool pipeline (`pi.on("tool_call")` and
-`pi.on("tool_result")`) for the `read`, `edit`, and `write` tools. For
+`pi.on("tool_result")`) for the `read`, `edit`, and `write` tools. The
+capture is gated by the worktree mode, read fresh from
+`lib/worktree-mode.js` on every event: a disabled or malformed mode
+records nothing and performs no registry write at all. For
 each call it resolves the touched `.md` path against the principal
 checkout's `odd/` directory and associates it with the worktree of the
 **agent's context** — the invoking context's working directory matched to
