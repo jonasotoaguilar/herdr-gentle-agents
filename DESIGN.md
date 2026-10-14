@@ -766,3 +766,81 @@ confirming each criterion has a normative section:
 Task closes when V1–V6 are all traceable above and the file re-read reports
 path + line count. Any untraceable cell → `status: partial` with the gap
 list, not silent.
+
+## 12. Agent worktree tools (`worktree_*`)
+
+Agent-callable worktrees: `worktree_create` / `worktree_list` /
+`worktree_close` as Pi extension tools (`extensions/gentle-worktree-tools.ts`,
+listed in the Pi package's `pi.extensions`), plus the
+`/herdr-gentle:worktree enabled|disabled|status` mode command. Surface is
+extension tools via `pi.registerTool()` — codemode is a QuickJS sandbox
+with no filesystem, network, or timers and adds no tools, so it cannot
+implement this; it may call these tools. Normative detail (parameters,
+output contract, hook table, capture bounds) lives in
+[docs/worktree-tools.md](docs/worktree-tools.md); this section records the
+design decisions.
+
+### Ownership rule
+
+The worktree belongs to the THREAD, not to the feature or task: one
+thread maps to one worktree, the same rule as `~/.pi/agent/AGENTS.md`.
+The registry entry records the owning thread (`thread`, resolved from
+`GENTLE_WORKTREE_THREAD` else the Pi session id, failing closed when
+neither exists); `worktree_list` shows which thread owns each checkout;
+`worktree_close` reports the owner instead of refusing, because a
+delivered thread is routinely closed from a later session; and
+`worktree_create` from a thread that already owns a live registered
+worktree returns that checkout (`created: false`) instead of creating a
+second. A second thread never adopts another thread's checkout.
+
+### Registry
+
+`<git-common-dir>/pi-worktrees.json` — inside `.git`, never in a working
+tree, never committed, shared by every checkout of the repository.
+Entries `{branch, path, thread, issues[], odd[], createdAt, updatedAt}`.
+Reads tolerate malformed content (reported, never thrown, file left
+untouched, never silently enabling); writes are atomic (temp file plus
+rename) under an exclusive lock file with bounded wait and stale-lock
+recovery. The tools verify against `git worktree list --porcelain -z`
+before and after instead of trusting Herdr JSON, and every external
+process uses fixed argv (values as separate elements — herdr rejects
+`--flag=value`), so branch names and paths cannot inject commands.
+`--trust-repository` is deliberately absent from the herdr allowlist:
+trusting a repository is a human decision these tools never take.
+
+### Hook policy
+
+Creation hooks make a fresh checkout usable without silently destroying
+anything: copy unversioned env files only when present, untracked, and
+absent at the target (never overwrite, never copy a tracked file);
+install dependencies for every lockfile-detected stack (a missing binary
+is `skipped`, a non-zero exit is `failed` plus a warning, never fatal);
+symlink `odd/` always (created in the principal first when absent) and
+`.agents/` / `.claude/` only when present, never `.codegraph/`; run
+`codegraph init` when the CLI is available. Hook outcomes travel inside
+the success `details`, never turning a verified creation into an error.
+The pre-existing `~/.config/herdr` `worktree-hooks` plugin stays
+untouched by this feature; its double-run hazard is resolved when it is
+replaced.
+
+### Mode gate
+
+The `/herdr-gentle:worktree` command follows the `/herdr-gentle:sidebar`
+pattern: a shared mode file (`gentle-worktree-mode.json`,
+`{version:1,enabled:boolean}`) in the plugin state directory, default
+enabled, malformed failing closed. Gating is two-level — load-time
+registration plus per-execution re-read — and the command itself always
+stays registered so the mode can be flipped back. Registration changes
+apply on `/reload`, which the `status` verb reports. Create and close
+prompt for approval when the host offers dialog UI; list is read-only
+and never prompts.
+
+### Known limitations (stated, not solved here)
+
+A normally-created worktree is dirty from git's point of view from day
+one (the hooks deliberately create untracked files and never delete
+them silently), so closing normally requires `force: true`; the issue
+check requires `gh` plus a GitHub remote and fails closed otherwise;
+`odd/` capture from `bash` converges only through the bounded re-scan,
+never through argv parsing; `.codegraph/` is never shared and the tools
+index nothing beyond `codegraph init`.
