@@ -28,10 +28,12 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 
 Structured `details` on success:
 
-- create: `{path, branch, issues, created, hooks, warnings, pruned}` — `created`
+- create: `{path, branch, issues, created, hooks, warnings, pruned, replacedRows}` — `created`
   is `false` when the call returned the thread's existing checkout (see
   per-thread ownership); `pruned` lists the stale git records a
   `git worktree prune` recovery dropped (empty when nothing was stale);
+  `replacedRows` lists the stale registry rows dropped by the one-owner-per-path
+  rule below (`[{branch, path}]`, empty when nothing shared the target path);
   when the recovery itself fails, the create fails with the row intact and
   `pruneError` carries the cause; `hooks` is the creation-hook report (`{ok,
   steps, warnings}`), so a failed hook step stays visible there and never
@@ -144,6 +146,20 @@ same-branch row is examined, so the warning names the live checkout
 regardless of row order — even when a dead row comes first. Replacement by
 branch still applies to every other row.
 
+One owner per path: when a create lands on its target path, that path ends
+with exactly ONE registry row — the one just created. Any other row whose
+path resolves to the same path (whatever its branch or thread: the same
+absolute spelling, the same spelling with a trailing slash, or a symlink to
+the target) is stale by definition and is dropped as part of the create, in
+addition to the thread-owned stale row dropped after verification. A row for
+a different path is never dropped, and relative rows never match. The dropped
+rows travel in `details.replacedRows` (`[{branch, path}]`) and in a warning
+line naming each dropped branch (for example `replaced 1 stale registry
+row(s) at the same path <target>: branch 'feat/foo' at <path>; one path has
+one owner ...`). Without this rule a slug collision (`feat/foo` deleted by
+hand, then `feat-foo` created on the same flattened path) left two rows for
+one path, and closing the old branch deleted the new checkout.
+
 Registry entry paths must be absolute. A `worktree_close` whose entry
 path is not absolute is refused with an error naming the entry and the
 reason, with no mutation of any checkout and no registry change; the
@@ -239,6 +255,24 @@ worktree list --porcelain -z` before anything is claimed, never trusted
 from Herdr JSON. Every external process uses a fixed argv array — no
 shell string is ever built. Issues are verified to exist through `gh
 issue view <n> --json number,title,state` (see limitations).
+
+A non-directory occupant (a file, a FIFO, a dangling symlink) at the target
+path is refused before any backend runs: `target path <path> is occupied by
+a <file|symlink|FIFO|non-directory> (not a directory): remove it by hand and
+retry; the registry was left untouched`. Git's raw `fatal: '<path>' already
+exists` never surfaces, and no registry row is written, so removing the
+occupant lets the next create at the same path succeed.
+
+The remaining path decisions share the one predicate (exists AND is a
+directory, realpath identity where identity is the question):
+`isPathInAnyCheckout` (`lib/worktree-git.js`) skips non-directory records and
+compares both spellings and realpaths (resolving non-existent tails through
+their parents), so a symlink spelling of a checkout gives the same
+inside-verdict as the real spelling; `vanishedCheckouts` excludes the close
+target by absolute-or-realpath identity (never lexical spelling alone) and
+names only paths where nothing exists on both legs, so a FILE reads `missing`
+and is never reported vanished — list, create and close cannot disagree about
+the same path in any shape.
 
 ## Creation hooks
 

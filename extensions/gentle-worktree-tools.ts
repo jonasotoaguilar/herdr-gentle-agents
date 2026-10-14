@@ -378,6 +378,45 @@ async function executeWorktreeCreate(params, ctx) {
       { branch, issues: issueNumbers, path: target, pruned: prunedStale },
     );
   }
+  // (e2) Non-directory occupant (I3): a file, FIFO, or dangling symlink at
+  // the target path would otherwise surface git's raw
+  // `fatal: '<path>' already exists` and leave the caller with no action.
+  // Judge through the one predicate (exists AND is-a-directory): when
+  // something is present via lstat but it is not a directory via stat
+  // (stat follows symlinks, so a dangling link counts as an occupant),
+  // refuse with an actionable message and no registry mutation, so removing
+  // the occupant lets the next create succeed.
+  try {
+    let occupant = null;
+    try {
+      fs.lstatSync(resolvedTarget);
+      occupant = true;
+    } catch {
+      occupant = null;
+    }
+    if (occupant) {
+      const st = checkoutState(resolvedTarget, repo.root);
+      if (!(st.exists && st.isDirectory)) {
+        let kind = "non-directory";
+        try {
+          const lst = fs.lstatSync(resolvedTarget);
+          if (lst.isSymbolicLink()) kind = "symlink";
+          else if (lst.isFile()) kind = "file";
+          else if (lst.isFIFO()) kind = "FIFO";
+          else if (lst.isDirectory()) kind = "non-directory";
+          else kind = "non-directory";
+        } catch {
+          kind = "non-directory";
+        }
+        return errorResult(
+          `target path ${target} is occupied by a ${kind} (not a directory): remove it by hand and retry; the registry was left untouched`,
+          { branch, issues: issueNumbers, path: target, pruned: prunedStale },
+        );
+      }
+    }
+  } catch {
+    // A failed probe never blocks: the backends report their own error.
+  }
 
   // (f) Approval when the host offers dialog UI; non-interactive modes
   // proceed without it. A refusal mutates nothing and writes no entry.
@@ -491,6 +530,43 @@ async function executeWorktreeCreate(params, ctx) {
     }
   }
 
+  // I1 one-owner-per-path: when a create lands on its target path, that
+  // path ends with exactly ONE registry row — the one just created. Any
+  // other row whose path resolves to the same path (whatever its branch or
+  // thread, absolute spelling, trailing-slash spelling, or a symlink to the
+  // target) is stale by definition and is dropped as part of the create.
+  // Never drops a row for a different path; relative rows never match.
+  let replacedRows = [];
+  try {
+    const reread = registry.readRegistry(repo.root);
+    const rows = reread && reread.ok === true && Array.isArray(reread.worktrees) ? reread.worktrees : [];
+    const targetState = checkoutState(target, repo.root);
+    for (const row of rows) {
+      if (!row || typeof row.path !== "string" || !path.isAbsolute(row.path)) continue;
+      // Skip the stale-owned row already dropped above (same identity).
+      if (staleOwned && row.branch === staleOwned.branch && row.path === staleOwned.path) continue;
+      let same = false;
+      try {
+        const rowState = checkoutState(row.path, repo.root);
+        if (rowState.absolute !== null && targetState.absolute !== null && rowState.absolute === targetState.absolute) same = true;
+        else if (rowState.real !== null && targetState.real !== null && rowState.real === targetState.real) same = true;
+      } catch {
+        same = false;
+      }
+      if (same) replacedRows.push(row);
+    }
+    for (const row of replacedRows) {
+      try {
+        if (typeof registry.removeWorktreeExact === "function") registry.removeWorktreeExact(repo.root, row.branch, row.path);
+        else registry.removeWorktree(repo.root, row.branch);
+      } catch {
+        // Best effort: the upsert below still records the new checkout.
+      }
+    }
+  } catch {
+    replacedRows = [];
+  }
+
   // (i) Registry: upsert the entry owned by this thread. A hand-written
   // row that carries this branch but points at a DIFFERENT live checkout
   // is never replaced: that checkout keeps its registration, the new
@@ -597,10 +673,13 @@ async function executeWorktreeCreate(params, ctx) {
   const pruneWarnings = prunedStale.length > 0
     ? [`pruned ${prunedStale.length} stale worktree record(s) via 'git worktree prune': ${prunedStale.join(", ")}; git no longer records the missing checkout`]
     : [];
-  const warnings = [...((hooks && hooks.warnings) || []), ...conflictWarnings, ...pruneWarnings];
+  const replacedWarnings = replacedRows.length > 0
+    ? [`replaced ${replacedRows.length} stale registry row(s) at the same path ${target}: ${replacedRows.map((r) => `branch '${r.branch}' at ${r.path}`).join(", ")}; one path has one owner, so the row just created is the only registration`]
+    : [];
+  const warnings = [...((hooks && hooks.warnings) || []), ...conflictWarnings, ...pruneWarnings, ...replacedWarnings];
   return textResult(
     successText(target),
-    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings, pruned: prunedStale, ...backupDetails },
+    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings, pruned: prunedStale, replacedRows: replacedRows.map((r) => ({ branch: r.branch, path: r.path })), ...backupDetails },
     false,
   );
 }
@@ -919,14 +998,29 @@ function vanishedCheckouts(git, repoRoot, live, resolvedTarget, after) {
   // Identity through the consolidated predicate: compare resolved
   // realpaths (absolute fallback), never bare spellings, so a symlink
   // spelling of a surviving checkout is not misreported as vanished. The
-  // existence fallback names only paths where NOTHING exists — a path
-  // replaced by a FILE reads `missing` in the list and is not reported
-  // vanished here either, so both legs agree on files.
+  // target itself is excluded by the same resolved identity (absolute OR
+  // realpath), never by lexical spelling alone. Both legs name only paths
+  // where NOTHING exists — a path replaced by a FILE reads `missing` in
+  // the list and is not reported vanished here either, so list, create and
+  // close agree that exists AND is-a-directory is the rule.
+  let targetReal = null;
+  try {
+    targetReal = checkoutState(resolvedTarget, repoRoot).real;
+  } catch {
+    targetReal = null;
+  }
+  const isTarget = (st) => {
+    if (st.absolute === null) return true;
+    if (st.absolute === resolvedTarget) return true;
+    if (st.real !== null && targetReal !== null && st.real === targetReal) return true;
+    return false;
+  };
   const identityOf = (item) => {
     if (!item || typeof item.path !== "string" || item.path.length === 0) return null;
     const st = checkoutState(item.path, repoRoot);
-    if (st.absolute === null || st.absolute === resolvedTarget) return null;
-    return { id: st.real !== null ? st.real : st.absolute, absolute: st.absolute, exists: st.exists };
+    if (st.absolute === null) return null;
+    if (isTarget(st)) return null;
+    return { id: st.real !== null ? st.real : st.absolute, absolute: st.absolute, exists: st.exists, isDirectory: st.isDirectory };
   };
   let current = after;
   if (!current) {
@@ -942,15 +1036,18 @@ function vanishedCheckouts(git, repoRoot, live, resolvedTarget, after) {
       for (const item of current) {
         const seen = identityOf(item);
         // The target itself is excluded by identityOf; every other listed
-        // record counts as present even when it is not a directory (a
-        // FILE git still records is `missing`, never vanished).
+        // record counts as present by resolved identity.
         if (seen !== null) afterSet.add(seen.id);
       }
       const vanished = [];
       for (const item of live || []) {
         const before = identityOf(item);
         if (before === null) continue;
-        if (!afterSet.has(before.id)) vanished.push(before.absolute);
+        if (!afterSet.has(before.id)) {
+          // Same rule as the fallback: only a path where NOTHING exists
+          // has vanished; a FILE reads missing, never vanished.
+          if (!before.exists) vanished.push(before.absolute);
+        }
       }
       return vanished;
     } catch {

@@ -1126,6 +1126,241 @@ describe('H1: a stale git record never blocks a create (prune + recover)', { con
   });
 });
 
+describe('I1: one owner per path (slug-collision stale row)', { concurrency: false }, () => {
+  test('exact reproduction ends with one row; close of the old branch refuses; checkout survives', async () => {
+    const root = makeRepo('i1-repro');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35, 7]);
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const target = expectedTarget(root, 'feat-foo');
+      // Thread t-owner creates feat/foo at the shared target path.
+      const first = await callCreate(tools, { branch: 'feat/foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-owner' }).ctx);
+      assert.equal(first.isError, undefined, `setup create failed: ${resultText(first)}`);
+      assert.equal(resultText(first), `worktree create: ${target}`);
+      // A keeper row for another path must survive untouched.
+      const keeper = await callCreate(tools, { branch: 'feat/keeper', issues: [7] }, makeCtx({ repoRoot: root, thread: 't-keeper' }).ctx);
+      assert.equal(keeper.isError, undefined);
+      const keeperPath = keeper.details.path;
+      assert.notEqual(path.resolve(keeperPath), path.resolve(target));
+      // The user deletes the feat/foo checkout by hand; git still records it.
+      fs.rmSync(target, { recursive: true, force: true });
+      assert.equal(fs.existsSync(target), false);
+      assert.ok(listWorktreePaths(root).includes(target), 'git still records the deleted checkout');
+      // Thread t-other creates feat-foo, landing on the SAME path.
+      const second = await callCreate(tools, { branch: 'feat-foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-other' }).ctx);
+      const text = resultText(second);
+      assert.equal(second.isError, undefined, `expected recovery, got: ${text}`);
+      assert.equal(text, `worktree create: ${target}`);
+      assert.ok(fs.existsSync(target), 'new checkout exists');
+      // Exactly ONE registry row at that path: the one just created.
+      const registryLib = require('../lib/worktree-registry.js');
+      const after = registryLib.readRegistry(root);
+      assert.equal(after.ok, true);
+      const atTarget = after.worktrees.filter((e) => { try { return path.resolve(e.path) === path.resolve(target); } catch { return false; } });
+      assert.equal(atTarget.length, 1, `one owner per path, got: ${JSON.stringify(after.worktrees)}`);
+      assert.equal(atTarget[0].branch, 'feat-foo');
+      // The keeper row survives untouched.
+      assert.ok(after.worktrees.some((e) => e.branch === 'feat/keeper' && path.resolve(e.path) === path.resolve(keeperPath)), `keeper survives: ${JSON.stringify(after.worktrees)}`);
+      // The replacement is reported in details and names the dropped branch.
+      const warnings = (second.details.warnings || []).join('\n');
+      assert.ok(warnings.includes('feat/foo'), `warning names dropped branch feat/foo: ${JSON.stringify(second.details.warnings)}`);
+      assert.ok(second.details.replacedRows !== undefined || (Array.isArray(second.details.pruned)), 'replacement travels in details');
+      // Closing the OLD branch refuses with no registered worktree and keeps the checkout.
+      const closed = await tools.get('worktree_close').execute('call-9', { branch: 'feat/foo' }, undefined, undefined, makeCtx({ repoRoot: root, thread: 't-owner' }).ctx);
+      assert.equal(closed.isError, true, `close of stale branch must refuse, got: ${resultText(closed)}`);
+      assert.match(resultText(closed), /no registered worktree/i);
+      assert.ok(fs.existsSync(target), 'new checkout still exists after refused close');
+      assert.ok(listWorktreePaths(root).includes(target), 'checkout still listed');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('symlink and trailing-slash spellings of the same path are also replaced', async () => {
+    for (const variant of ['symlink', 'slash']) {
+      const root = makeRepo(`i1-${variant}`);
+      const herdr = makeHerdrStub();
+      const gh = makeGhStub([35]);
+      const modeEnv = scratchModeEnv();
+      setEnv({
+        GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+        GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+        HERDR_BIN_PATH: herdr.bin,
+        HERDR_SHIM_LOG: herdr.log,
+        GH_BIN_PATH: gh,
+        GENTLE_WORKTREE_THREAD: undefined,
+      });
+      try {
+        const tools = await loadExtension();
+        const target = expectedTarget(root, 'feat-foo');
+        track(target);
+        git(root, ['worktree', 'add', '-b', 'feat/foo', target, 'HEAD']);
+        fs.rmSync(target, { recursive: true, force: true });
+        const registryLib = require('../lib/worktree-registry.js');
+        let stalePath;
+        if (variant === 'symlink') {
+          // Recreate the target so the symlink has a live referent, then
+          // point the stale row at a symlink to it.
+          git(root, ['worktree', 'remove', '--force', target].length ? ['worktree', 'prune'] : ['worktree', 'prune']);
+          git(root, ['worktree', 'add', '-b', 'feat/real', target, 'HEAD']);
+          const linkAbs = path.join(path.dirname(root), `${path.basename(root)}-i1-link`);
+          track(linkAbs);
+          try { fs.unlinkSync(linkAbs); } catch {}
+          fs.symlinkSync(target, linkAbs);
+          stalePath = linkAbs;
+          assert.equal(registryLib.upsertWorktree(root, { branch: 'feat/foo', path: stalePath, thread: 't-owner', issues: [35], odd: [] }).ok, true);
+          // Hand-delete the real target again so the create must recover it;
+          // the symlink row dangles at create time but resolves to the
+          // target once the create lands.
+          fs.rmSync(target, { recursive: true, force: true });
+        } else {
+          stalePath = target + path.sep;
+          assert.equal(registryLib.upsertWorktree(root, { branch: 'feat/foo', path: stalePath, thread: 't-owner', issues: [35], odd: [] }).ok, true);
+        }
+        const result = await callCreate(tools, { branch: 'feat-foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-other' }).ctx);
+        const text = resultText(result);
+        assert.equal(result.isError, undefined, `[${variant}] expected success, got: ${text}`);
+        const after = registryLib.readRegistry(root);
+        assert.equal(after.ok, true);
+        const atTarget = after.worktrees.filter((e) => {
+          try {
+            if (path.resolve(e.path) === path.resolve(target)) return true;
+            try { if (fs.realpathSync(e.path) === fs.realpathSync(target)) return true; } catch {}
+            return false;
+          } catch { return false; }
+        });
+        assert.equal(atTarget.length, 1, `[${variant}] one owner per path, got: ${JSON.stringify(after.worktrees)}`);
+        assert.equal(atTarget[0].branch, 'feat-foo');
+        assert.ok((result.details.warnings || []).join('\n').includes('feat/foo'), `[${variant}] warning names feat/foo`);
+      } finally {
+        restoreEnv();
+      }
+    }
+  });
+});
+
+describe('I2: one predicate at the remaining sites', { concurrency: false }, () => {
+  test('isPathInAnyCheckout agrees for a symlink spelling and the real spelling', async () => {
+    const root = makeRepo('i2-symlink');
+    const wtDir = path.join(path.dirname(root), `${path.basename(root)}-wt`);
+    track(wtDir);
+    git(root, ['worktree', 'add', '-b', 'feat/i2', wtDir, 'HEAD']);
+    const liveAbs = fs.realpathSync(wtDir);
+    const linkAbs = path.join(path.dirname(root), `${path.basename(root)}-i2-link`);
+    track(linkAbs);
+    try { fs.unlinkSync(linkAbs); } catch {}
+    fs.symlinkSync(liveAbs, linkAbs);
+    const gitLib = require('../lib/worktree-git.js');
+    const viaReal = gitLib.isPathInAnyCheckout(root, liveAbs);
+    const viaLink = gitLib.isPathInAnyCheckout(root, linkAbs);
+    assert.equal(viaReal, true, 'real spelling is inside a checkout');
+    assert.equal(viaLink, true, 'symlink spelling must not be treated as a different checkout');
+    const insideReal = gitLib.isPathInAnyCheckout(root, path.join(liveAbs, 'sub'));
+    const insideLink = gitLib.isPathInAnyCheckout(root, path.join(linkAbs, 'sub'));
+    assert.equal(insideReal, insideLink, 'inside-verdict agrees for both spellings');
+  });
+
+  test('a FILE occupant is judged not-live identically by list, create and close', async () => {
+    const root = makeRepo('i2-file');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    const gitLib = require('../lib/worktree-git.js');
+    const target = expectedTarget(root, 'feat-filed');
+    track(target);
+    git(root, ['worktree', 'add', '-b', 'feat/filed', target, 'HEAD']);
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.writeFileSync(target, 'not a checkout\n');
+    assert.ok(listWorktreePaths(root).includes(target), 'git still records the file path');
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.upsertWorktree(root, { branch: 'feat/filed', path: target, thread: 't-1', issues: [35], odd: [] }).ok, true);
+      // LIST: file reads missing, never live, never pruned, never vanished.
+      const listed = await tools.get('worktree_list').execute('c1', {}, undefined, undefined, makeCtx({ repoRoot: root, thread: 't-1' }).ctx);
+      assert.equal(listed.isError, undefined);
+      const row = listed.details.worktrees.find((i) => i.path === target);
+      assert.ok(row, 'file row listed');
+      assert.equal(row.status, 'missing', 'file is never live in the list');
+      assert.deepEqual(listed.details.pruned, [], 'file never pruned');
+      // CLOSE: file reads stale, entry kept.
+      const closed = await tools.get('worktree_close').execute('c2', { branch: 'feat/filed', force: true }, undefined, undefined, makeCtx({ repoRoot: root, thread: 't-1' }).ctx);
+      assert.equal(closed.isError, true);
+      assert.match(resultText(closed), /not a live checkout/i, 'close agrees: stale, never live');
+      // CREATE guard: the file path is never a live conflict.
+      // A different branch colliding on the same slug must report the
+      // occupant, never "already a live worktree".
+      const created = await callCreate(tools, { branch: 'feat/filed', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-2' }).ctx);
+      assert.equal(created.isError, true);
+      assert.ok(!/already.*live worktree/i.test(resultText(created)), `file must never read live in create: ${resultText(created)}`);
+      // isPathInAnyCheckout skips the file record itself.
+      assert.equal(gitLib.isPathInAnyCheckout(root, target), false, 'file record is not a live checkout');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('I3: non-directory occupant at the target', { concurrency: false }, () => {
+  test('a file at the target gives an actionable error and blocks no later create', async () => {
+    const root = makeRepo('i3-file');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const target = expectedTarget(root, 'feat-blocked');
+      track(target);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, 'occupant\n');
+      const before = listWorktreePaths(root);
+      const failed = await callCreate(tools, { branch: 'feat/blocked', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-1' }).ctx);
+      assert.equal(failed.isError, true);
+      const text = resultText(failed);
+      assert.ok(text.includes(target), `names the occupant path: ${text}`);
+      assert.match(text, /not a directory|occup|remove.*by hand|remove it/i, `actionable (name + what to do): ${text}`);
+      assert.ok(!/fatal.*already exists/i.test(text), `never git raw fatal: ${text}`);
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.deepEqual(registryLib.readRegistry(root).worktrees, [], 'no blocking registry state');
+      // Removing the file lets the next create succeed at the same path.
+      fs.unlinkSync(target);
+      const retry = await callCreate(tools, { branch: 'feat/blocked', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-1' }).ctx);
+      assert.equal(retry.isError, undefined, `retry succeeds, got: ${resultText(retry)}`);
+      assert.equal(resultText(retry), `worktree create: ${target}`);
+      assert.ok(fs.existsSync(target) && fs.statSync(target).isDirectory(), 'checkout on disk');
+      assert.deepEqual(listWorktreePaths(root).length, before.length + 1);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
 describe('H3: relative git listing paths never resolve against the process cwd', { concurrency: false }, () => {
   test('isPathInAnyCheckout gives the same verdict from a decoy cwd', async () => {
     const root = makeRepo('decoy-cwd');
