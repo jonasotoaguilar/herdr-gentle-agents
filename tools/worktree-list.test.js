@@ -345,3 +345,98 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
     }
   });
 });
+
+describe('consolidated checkout liveness: files + relative git listing', { concurrency: false }, () => {
+  test('FILE: a path that exists but is a FILE is never live, in either mode, and is not pruned', async () => {
+    const root = makeRepo('file-row');
+    setEnv(stdEnv());
+    try {
+      const filePath = path.join(path.dirname(root), `${path.basename(root)}-afile.txt`);
+      track(filePath);
+      fs.writeFileSync(filePath, 'not a checkout\n');
+      const realFile = fs.realpathSync(filePath);
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.upsertWorktree(root, {
+        branch: 'feat/filerow', path: realFile, thread: 'thread-1', issues: [35], odd: [],
+      }).ok, true);
+      const beforeBytes = fs.readFileSync(registryLib.registryPath(root));
+
+      const gitLib = require('../lib/worktree-git.js');
+      const origList = gitLib.listWorktrees;
+      const baseLive = origList(root);
+      // Unregistered FILE the lying git claims is a checkout: must never surface.
+      const extraFile = path.join(path.dirname(root), `${path.basename(root)}-extra-file.txt`);
+      track(extraFile);
+      fs.writeFileSync(extraFile, 'not a checkout\n');
+      gitLib.listWorktrees = () => [...baseLive, { path: extraFile, branch: 'feat/extra', head: null, detached: false, bare: false }];
+
+      const tools = await loadExtension();
+      try {
+      for (const params of [{}, { all: true }]) {
+        const result = await tools.get('worktree_list').execute('call-1', params, undefined, undefined, makeCtx(root));
+        const text = resultText(result);
+        assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+        assert.ok(text.includes('feat/filerow') && text.includes('missing'), `file row is missing, never live: ${text}`);
+        assert.ok(!text.split('\n').some((line) => line.includes('feat/filerow') && !line.endsWith(' missing')), 'never reported live');
+        assert.deepEqual(result.details.pruned, [], 'a file row is never pruned');
+        const row = result.details.worktrees.find((item) => item.path === realFile);
+        assert.ok(row, 'file row stays in details');
+        assert.equal(row.status, 'missing');
+        assert.ok(!text.includes('feat/extra'), `a file is never an unregistered checkout: ${text}`);
+        assert.ok(!result.details.worktrees.some((item) => item.path === extraFile), 'file extra absent from details');
+      }
+      } finally {
+        gitLib.listWorktrees = origList;
+      }
+      assert.deepEqual(fs.readFileSync(registryLib.registryPath(root)), beforeBytes, 'registry untouched');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('RELATIVE-GIT: a lying relative listing resolves against the repo root, never the process cwd', async () => {
+    const root = makeRepo('relative-git');
+    setEnv(stdEnv());
+    const savedCwd = process.cwd();
+    try {
+      const live = addRegistered(root, 'feat/live', { thread: 'thread-1', issues: [35] });
+      const relLive = path.relative(root, live);
+      assert.ok(!path.isAbsolute(relLive), 'relative form for the lying git');
+      // Decoy cwd: resolving the relative ghost against the DECOY would
+      // find a live directory there; resolving against the repo root finds
+      // nothing. The tool must use the repo root.
+      const decoyBase = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-decoy-')));
+      const decoy = path.join(decoyBase, 'sub', 'deep');
+      fs.mkdirSync(decoy, { recursive: true });
+      const decoyGhost = path.join(decoy, 'ghost-relative');
+      fs.mkdirSync(decoyGhost, { recursive: true });
+      const gitLib = require('../lib/worktree-git.js');
+      const origList = gitLib.listWorktrees;
+      gitLib.listWorktrees = (repoRoot) => [
+        { path: relLive, branch: 'feat/live', head: null, detached: false, bare: false },
+        { path: 'ghost-relative', branch: 'feat/ghost', head: null, detached: false, bare: false },
+      ];
+      process.chdir(decoy);
+      let result;
+      try {
+        const tools = await loadExtension();
+        result = await tools.get('worktree_list').execute('call-1', { all: true }, undefined, undefined, makeCtx(root));
+      } finally {
+        gitLib.listWorktrees = origList;
+        try { process.chdir(savedCwd); } catch {}
+      }
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.ok(text.includes(`${live} feat/live thread=thread-1 issues=35`), `live checkout stays live, not missing: ${text}`);
+      assert.ok(!text.split('\n').some((line) => line.includes('feat/live') && line.endsWith(' missing')), 'must not mislabel live as missing');
+      assert.ok(!text.includes('ghost-relative'), `non-existent extra never reported: ${text}`);
+      assert.ok(!result.details.worktrees.some((item) => item.path.includes('ghost-relative')), 'ghost absent from details');
+      for (const item of result.details.worktrees) {
+        assert.equal(fs.existsSync(item.path), true, `details carries no non-existent path: ${item.path}`);
+      }
+    } finally {
+      try { process.chdir(savedCwd); } catch {}
+      restoreEnv();
+    }
+  });
+});

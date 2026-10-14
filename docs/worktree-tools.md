@@ -65,9 +65,14 @@ closest registered candidates (common-prefix rank on branch, small bonus
 on path match) instead of removing anything; passing both `path` and
 `branch` that disagree is an error telling the caller to pass only one.
 
-`worktree_list` self-heals (S16): every absolute registered path is
-existence-checked on every call — a plain probe of that absolute path,
-never relative to the process cwd. A path that no longer exists (the user
+`worktree_list` self-heals (S16) through the one consolidated liveness
+definition (`checkoutState` in `extensions/gentle-worktree-tools.ts`): a
+live checkout is a path whose state exists AND is a directory, resolved
+without the process cwd (absolute inputs directly, relative inputs
+against the repository root). Every absolute registered path is checked
+on every call. A row is `live` only when its state exists, is a
+directory, and matches a live checkout — a FILE at the path is never
+`live`, even when git names it. A path where nothing exists (the user
 deleted the checkout by hand) is removed from the listing AND pruned from
 the registry in one atomic write, so the tool always exposes only real
 checkouts; the pruned paths travel in `details.pruned` and in a warning
@@ -119,11 +124,15 @@ already carries the branch being created but points at a DIFFERENT live
 checkout, that row is not replaced — it keeps its registration, the new
 checkout is recorded alongside it (`appendWorktree`, which always appends
 instead of replacing by branch), and the conflict is reported in the
-create `warnings` naming the kept checkout. Liveness is identity-based:
-the row's resolved realpath (falling back to the resolved absolute path
-when the filesystem cannot resolve it, never the process cwd) is compared
-against the realpaths of the live checkouts, so a row that reaches a live
-checkout through a symlink is live and is kept and warned about. Every
+create `warnings` naming the kept checkout. Liveness is one consolidated
+predicate (`checkoutState` in `extensions/gentle-worktree-tools.ts`): a
+path names a live checkout only when something exists there AND it is a
+directory (a FILE is never a checkout; a dangling symlink reads as
+absent) AND its resolved realpath matches a live checkout's realpath —
+relative inputs resolving against the repository root, never the process
+cwd — so a row that reaches a live checkout through a symlink is live
+and is kept and warned about, while a row whose path git still lists but
+which no longer exists is never a live conflict. Every
 same-branch row is examined, so the warning names the live checkout
 regardless of row order — even when a dead row comes first. Replacement by
 branch still applies to every other row.
@@ -173,8 +182,10 @@ in place in both cases.
 Removing only the target never trips this check. The comparison never
 depends on the post-removal listing alone: when that listing fails, the
 close falls back to an existence check on the pre-removal live paths
-(excluding the target) — a pre-removal live checkout whose directory no
-longer exists has vanished and is named, on both exit codes and both
+through the same consolidated predicate (`checkoutState`, relative
+entries resolving against the repository root) — a pre-removal live
+checkout whose state no longer exists as a directory has vanished and is
+named, on both exit codes and both
 removal paths, with the registry entry kept in every case.
 
 ## Creation path
@@ -274,10 +285,15 @@ One worktree per thread. Thread identity resolves from
 fails closed (`cannot resolve thread identity: …`) and never adopts
 another thread's checkout. A thread that already owns a registered,
 still-live worktree gets that checkout back — `worktree create: <path>`
-again with `created: false` — never a second checkout. Still-live is
-identity-based (the owned row's resolved realpath against the live
-checkouts' realpaths, never the process cwd), so an owned row that reaches
-a live checkout through a symlink is live and is returned, never dropped.
+again with `created: false` — never a second checkout. Still-live is the
+same consolidated predicate (`checkoutState`): the owned row's state must
+exist AND be a directory AND its realpath must match a live checkout
+(relative inputs resolving against the repository root, never the process
+cwd), so an owned row that reaches a live checkout through a symlink is
+live and is returned, never dropped. Idempotency consequence: a
+tool-created row whose checkout the user deleted by hand is stale even
+while git still lists it — the owned row is dropped and creation proceeds
+fresh instead of answering `created: false` at a missing path.
 A stale entry
 (checkout gone) is dropped best-effort and creation proceeds fresh.
 The cleanup drops the one row it identified as the thread's own by row

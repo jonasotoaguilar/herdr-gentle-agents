@@ -947,3 +947,85 @@ describe('worktree_create never unregisters a live checkout (S14)', { concurrenc
     }
   });
 });
+
+describe('consolidated checkout liveness: ghost idempotency + conflict guard', { concurrency: false }, () => {
+  test('GHOST: tool-created row hand-deleted but still listed is stale, same thread creates fresh', async () => {
+    const root = makeRepo('ghost-idem');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35, 7]);
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-ghost' });
+      const first = await callCreate(tools, { branch: 'feat/ghost-a', issues: [35] }, ctx);
+      assert.equal(first.isError, undefined);
+      const deadTarget = first.details.path;
+      // Hand-delete: git still records it, the path no longer exists.
+      fs.rmSync(deadTarget, { recursive: true, force: true });
+      assert.equal(fs.existsSync(deadTarget), false, 'checkout hand-deleted');
+      assert.ok(listWorktreePaths(root).includes(deadTarget), 'git still lists the deleted checkout');
+
+      // Same thread asks for a NEW branch: must not return the ghost.
+      const second = await callCreate(tools, { branch: 'feat/ghost-b', issues: [7] }, ctx);
+      const text = resultText(second);
+      assert.equal(second.isError, undefined, `expected fresh success, got: ${text}`);
+      assert.notEqual(second.details.path, deadTarget, 'must not answer the missing path');
+      assert.equal(second.details.created, true, 'must create fresh, not created:false at a ghost');
+      assert.ok(fs.existsSync(second.details.path), 'the new checkout exists on disk');
+      const registryLib = require('../lib/worktree-registry.js');
+      const owned = registryLib.findByThread(root, 'thread-ghost');
+      assert.ok(owned, 'registry holds a row for the thread');
+      assert.equal(owned.path, second.details.path, 'registry holds the NEW row');
+      assert.ok(fs.existsSync(owned.path), 'registry row points at a real checkout');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('CONFLICT: a git-listed-but-missing path is never a live conflict to keep', async () => {
+    const root = makeRepo('conflict-ghost');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    // Ghost checkout with its own branch, hand-deleted so git still lists it.
+    const ghostDir = path.join(path.dirname(root), `${path.basename(root)}-ghostdir`);
+    track(ghostDir);
+    git(root, ['worktree', 'add', '-b', 'feat-ghosted', ghostDir, 'HEAD']);
+    const ghostAbs = fs.realpathSync(ghostDir);
+    fs.rmSync(ghostAbs, { recursive: true, force: true });
+    assert.equal(fs.existsSync(ghostAbs), false);
+    assert.ok(listWorktreePaths(root).includes(ghostAbs), 'git still lists the deleted checkout');
+    // Hand-written row carrying the REQUESTED branch but pointing at the ghost.
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.equal(registryLib.upsertWorktree(root, {
+      branch: 'feat/new', path: ghostAbs, thread: 'other-thread', issues: [7], odd: [],
+    }).ok, true);
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    });
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-1' });
+      const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const warnings = (result.details.warnings || []).join('\n');
+      assert.ok(!warnings.includes(ghostAbs), `must not warn keeping ghost ${ghostAbs}: ${JSON.stringify(result.details.warnings)}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
