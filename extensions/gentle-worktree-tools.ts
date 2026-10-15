@@ -791,8 +791,9 @@ const worktreeCreateTool = defineTool({
 //   worktree list: <path> <branch> thread=<thread> issues=<n,n[,n...]>
 // A registered entry whose path is not a live checkout gains ` missing`:
 //   worktree list: <path> <branch> thread=<thread> issues=<n,n> missing
-// With `all: true`, a live checkout the registry does not know about
-// appends (the principal checkout is never listed as unregistered):
+// With `all: true`, live checkouts the registry does not know about are
+// listed (the principal checkout is never listed as unregistered); the
+// session's own one leads the listing and the rest stay path-sorted:
 //   worktree list: <path> <branch> unregistered
 // The principal checkout (S19) is always listed when git's listing names
 // it, and the session's own checkout is the FIRST line; `worktree list:

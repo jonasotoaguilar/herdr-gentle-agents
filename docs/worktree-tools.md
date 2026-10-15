@@ -23,7 +23,7 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 | Tool | Parameters | Approval | Success text |
 | --- | --- | --- | --- |
 | `worktree_create` | `branch: string` (required), `issues: number[]` (required, at least one) | Prompts via `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`); non-interactive sessions proceed without it, and a refusal mutates nothing | `worktree create: <path>` |
-| `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | The principal line first, then one `worktree list: …` line per agent entry (the session's own checkout first) |
+| `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | The session's own checkout first — the principal or a registered worktree — then the principal line when the session is not in it, then the remaining `worktree list: …` agent rows |
 | `worktree_close` | `path?: string`, `branch?: string` (at least one required), `force?: boolean` | Same `ctx.ui.confirm` gate as create; a refusal keeps checkout and entry | `worktree close: <path>` |
 
 Structured `details` on success:
@@ -85,14 +85,17 @@ principal or a registered worktree: the checkout containing or equal to
 the tool context's working directory, deepest match winning, the principal
 as a candidate. A session inside a registered worktree sees that worktree
 (with its `thread=`/`issues=`) first, then the principal, then the
-remaining agent rows in registry order; a session in the principal, in an
-unregistered checkout, or outside every checkout sees the principal first
-(an unregistered session checkout is still reported as `unregistered` with
-`all: true`). The agent-row text is unchanged.
+remaining agent rows in registry order. A session in the principal, or
+outside every checkout, sees the principal first. A session in an
+unregistered checkout sees the principal first too, unless `all: true`
+asks for unregistered checkouts: then that checkout leads the listing and
+the order of everything else is unchanged. The agent-row text is
+unchanged.
 
 `all: true` appends live checkouts the registry does not know about,
-sorted by path; the caller's own checkout is never listed as
-unregistered. Close refuses an unregistered target and names the three
+sorted by path — except the session's own unregistered checkout, which
+leads the listing instead, and is therefore listed as `unregistered`
+whenever the session runs inside one. Close refuses an unregistered target and names the three
 closest registered candidates (common-prefix rank on branch, small bonus
 on path match) instead of removing anything; passing both `path` and
 `branch` that disagree is an error telling the caller to pass only one.
@@ -300,9 +303,10 @@ A pre-existing entry of ANY kind at the target path — an empty or
 non-empty directory, a file, a FIFO, a socket, or a symlink — is refused
 before any backend runs: `target path <path> is occupied by a <kind>:
 remove it by hand or pick another branch; the registry was left
-untouched`. `<kind>` names what is actually there: a symlink reports
-`symlink to a file` or `symlink to a directory` when its referent
-resolves, and a bare `symlink` when it dangles. Git's raw `fatal: '<path>' already exists` never surfaces
+untouched` (the article follows the kind: `an empty directory`). `<kind>`
+names what is actually there: a symlink reports `symlink to a file` or
+`symlink to a directory` when its referent is one, and a bare `symlink`
+otherwise — dangling, or a referent that is neither. Git's raw `fatal: '<path>' already exists` never surfaces
 (and the empty directory is refused precisely because git would silently
 adopt it), and no registry row is written, so removing the occupant lets
 the next create at the same path succeed. The single exception is the
