@@ -1400,6 +1400,10 @@ function liveUnregisteredEntries(rows, live, repoRoot, principal) {
   for (const entry of live || []) {
     if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
     const st = checkoutState(entry.path, repoRoot);
+    // The same liveness the listing applies: a git record whose directory is
+    // gone (prunable) is not printed as an unregistered checkout, so it must
+    // not make a name ambiguous either.
+    if (!st.exists || !st.isDirectory) continue;
     const id = st.real !== null ? st.real : st.absolute;
     if (id === null || owned.has(id)) continue;
     if (principalId !== null && id === principalId) continue;

@@ -707,4 +707,29 @@ describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, ()
       restoreEnv();
     }
   });
+
+  test('a prunable git record does not make a unique name ambiguous', async () => {
+    const root = makeRepo('dead-unreg');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const registered = addRegistered(root, 'feat/mix', { thread: 'thread-1', issues: [35] });
+      // Git still lists this record, but its directory is gone: the listing
+      // never prints it as a live checkout, so it cannot collide either.
+      const dead = path.join(path.dirname(root), `${path.basename(root)}-dead-mix`);
+      track(dead);
+      git(root, ['worktree', 'add', '-b', 'feat-mix', dead, 'HEAD']);
+      fs.rmSync(dead, { recursive: true, force: true });
+      const sessionFile = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-dead-sess-'))), 'session.jsonl');
+      fs.writeFileSync(sessionFile, '{"type":"session"}\n');
+      const calls = [];
+      const { ctx, switches } = makeWarpCtx({ cwd: root, sessionFile, calls });
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('feat-mix', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: oscFake(true) });
+      assert.equal(out.isError, undefined, `a name the listing prints once still moves: ${out.text}`);
+      assert.equal(out.text, `worktree warp: feat-mix -> ${registered}`);
+      assert.equal(switches.length, 1, 'the session really switched');
+    } finally {
+      restoreEnv();
+    }
+  });
 });

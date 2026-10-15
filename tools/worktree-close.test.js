@@ -1209,4 +1209,33 @@ describe('S24: worktree_close accepts name (T33 RED)', { concurrency: false }, (
       restoreEnv();
     }
   });
+
+  test('a prunable git record is not a second live checkout', async () => {
+    const root = makeRepo('dead-unreg');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const registered = addRegistered(root, 'feat/mix', { thread: 'thread-1', issues: [35] });
+      // A git record whose directory was deleted by hand: git still lists it
+      // as prunable, and the listing does NOT print it as a live checkout.
+      const dead = path.join(path.dirname(root), `${path.basename(root)}-dead-mix`);
+      track(dead);
+      git(root, ['worktree', 'add', '-b', 'feat-mix', dead, 'HEAD']);
+      fs.rmSync(dead, { recursive: true, force: true });
+      const before = registryBytes(root);
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const listed = await callList(tools, { all: true }, ctx);
+      assert.equal((resultText(listed).match(/feat-mix/g) || []).length, 1, `printed once: ${resultText(listed)}`);
+      const result = await callClose(tools, { name: 'feat-mix' }, ctx);
+      assert.equal(result.isError, undefined, `a name the listing prints once still closes: ${resultText(result)}`);
+      assert.equal(resultText(result), `worktree close: ${registered}`);
+      assert.equal(fs.existsSync(dead), false, 'the dead path was never a checkout');
+      assert.notDeepEqual(registryBytes(root), before, 'the registered row was closed');
+    } finally {
+      restoreEnv();
+    }
+  });
 });
