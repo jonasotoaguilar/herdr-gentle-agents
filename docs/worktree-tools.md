@@ -558,8 +558,12 @@ finish inside it is impossible) and a 4 h maximum wait. The timer is cleared
 and unref'd when it ends.
 
 A finish is `agent_status` reading `idle` AFTER that same pane was observed
-`working` at least once. `blocked` is the delegate waiting for input and is
-not a finish. Exactly one of four outcomes is delivered:
+`working` at least once, and only for the session this tool opened: the
+session file the pane publishes must name that session. `blocked` is the
+delegate waiting for input and is not a finish. Exactly one of four outcomes
+is reported — and delivered, unless the host never accepts the message, in
+which case it is dropped when the maximum wait passes rather than retried
+forever:
 
 - `finished` — idle after working.
 - `never-started` — idle without ever reporting working.
@@ -580,7 +584,19 @@ outcome, seenWorking}`).
 Honest limits, recorded not hidden: the watched state is another process's
 published view, so "never started" and "never reported anything" are
 indistinguishable — the never-started message says so — and a vanished pane
-is reported as vanished, never as a finish.
+is reported as vanished, never as a finish. A finish is concluded only for
+the session this tool opened, matched against the session file the pane
+publishes, and that leaves three cases worth naming:
+
+- A pane whose agent publishes NO session binding at all leaves the
+  published status as the only fact, so a finish is concluded from it. This
+  is the pre-binding contract, and the one case where a pane holding
+  something other than the delegate could be reported as our finish.
+- Resuming with a PARTIAL session id (Pi resolves it to a file) cannot be
+  proven ours from the file name, so it reports `never-started` instead of
+  claiming a finish.
+- Resuming with a RELATIVE path has the same effect: the pane publishes an
+  absolute path, and the file name is compared against the id you passed.
 
 ## Per-thread ownership
 
