@@ -289,7 +289,7 @@ describe('worktree mode command', { concurrency: false }, () => {
     try {
       modeLib().writeMode(true, process.env);
       const { tools } = await loadExtension();
-      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_create', 'worktree_list']);
+      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open']);
     } finally {
       restoreEnv();
     }
