@@ -522,10 +522,12 @@ an EXISTING pane at a shell prompt):
    `--session <id>` when resuming or `--session-id <minted>` for a new
    session. The id is minted as a UUID (`crypto.randomUUID()`), valid in
    Pi's `[A-Za-z0-9._-]` session-id charset, so it is known immediately
-   and returned. The pane's cwd is checked to be the worktree, or inside
-it, before Pi starts, so Pi's own session directory is the worktree's: no
-`--session-dir` is ever passed. A pane whose shell moved elsewhere is
-refused, because a session started there would not be in the worktree.
+   and returned. The pane is checked to belong to the workspace Herdr
+reports for that worktree, and its cwd — when the pane reports one — is
+checked to be the worktree or inside it, before Pi starts, so Pi's own
+session directory is the worktree's: no `--session-dir` is ever passed. A
+pane whose shell moved elsewhere is refused, because a session started
+there would not be in the worktree.
 
 Success text is exactly `worktree session open: <worktree> <session-id>`.
 The `herdrArgv` allowlist (`lib/worktree-git.js`) gains exactly the
@@ -565,7 +567,9 @@ not a finish. Exactly one of four outcomes is delivered:
 - `timed-out` — the maximum wait passed with no finish.
 
 None of the last three claims a finish. Delivery is one custom message to
-the creating session — `customType` `herdr-agent-sessions.finished`, sent as
+the creating session — the next send waits for the previous one to settle,
+and a send that fails is retried rather than repeated, so the creating
+session is told once — `customType` `herdr-agent-sessions.finished`, sent as
 `{deliverAs: "followUp", triggerTurn: true}`, the route incoming session
 messages already use, because the orchestrator has to act on it (verify,
 merge, report). The content states which outcome was observed and names the

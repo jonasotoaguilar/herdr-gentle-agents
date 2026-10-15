@@ -1994,6 +1994,19 @@ function sessionWatchContent(outcome, { worktree, paneId, sessionId, maxWaitMs }
   }
 }
 
+// Is this published binding OUR session? The value is the session file
+// this plugin reports (`<timestamp>_<session-id>.jsonl`), so the id is
+// matched at the END of the file name, never as a substring: a substring
+// match calls another session ours — `session: "abc"` would accept
+// `..._xabc.jsonl`, and `session: "."` would accept any path at all.
+function bindingNamesSession(value, sessionId) {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (typeof sessionId !== "string" || sessionId.length === 0) return false;
+  if (value === sessionId) return true;
+  const base = path.basename(value);
+  return base.endsWith(`_${sessionId}.jsonl`) || base === `${sessionId}.jsonl`;
+}
+
 // Read one `herdr agent get` reply: `{status, vanished, bound, foreign}`.
 // The `agent_not_found` error is the vanished signal; `agent_session.value`
 // is the session BINDING this plugin publishes (the session file, whose
@@ -2020,9 +2033,7 @@ function sessionWatchReading(stdout, sessionId) {
   const boundValue = agent && agent.agent_session && typeof agent.agent_session.value === "string"
     ? agent.agent_session.value
     : null;
-  const bound = boundValue !== null && typeof sessionId === "string" && sessionId.length > 0
-    ? boundValue.includes(sessionId)
-    : false;
+  const bound = bindingNamesSession(boundValue, sessionId);
   const foreign = boundValue !== null && !bound;
   const status = agent && typeof agent.agent_status === "string"
     ? agent.agent_status
@@ -2097,6 +2108,7 @@ function startAgentSessionWatcher({ paneId, worktree, branch, sessionId, agentNa
   let pendingOutcome = null;
   let pendingAt = 0;
   let polling = false;
+  let delivering = false;
   const previous = SESSION_WATCHERS.get(paneId);
   if (previous) {
     try {
@@ -2115,6 +2127,9 @@ function startAgentSessionWatcher({ paneId, worktree, branch, sessionId, agentNa
     } catch {}
   };
   const attemptDelivery = () => {
+    // One send in flight at a time: a promise that settles after the next
+    // tick must not deliver the same outcome a second time.
+    if (delivering) return;
     const sender = sessionNotifyPi && typeof sessionNotifyPi.sendMessage === "function" ? sessionNotifyPi : null;
     if (!sender) {
       stop();
@@ -2123,9 +2138,11 @@ function startAgentSessionWatcher({ paneId, worktree, branch, sessionId, agentNa
     const content = sessionWatchContent(pendingOutcome, { worktree, paneId, sessionId, maxWaitMs });
     const details = { worktree, branch, path: targetPath, paneId, workspaceId, sessionId, agentName, outcome: pendingOutcome, seenWorking };
     const retry = () => {
+      delivering = false;
       if (Date.now() - pendingAt >= maxWaitMs) stop();
     };
     let sent;
+    delivering = true;
     try {
       sent = sender.sendMessage(
         { customType: "herdr-agent-sessions.finished", content, display: true, details },
@@ -2136,9 +2153,13 @@ function startAgentSessionWatcher({ paneId, worktree, branch, sessionId, agentNa
       return;
     }
     if (sent && typeof sent.then === "function") {
-      Promise.resolve(sent).then(() => stop(), retry);
+      Promise.resolve(sent).then(() => {
+        delivering = false;
+        stop();
+      }, retry);
       return;
     }
+    delivering = false;
     stop();
   };
   const finish = (outcome) => {
@@ -2330,7 +2351,11 @@ function rootPaneId(stdout, workspaceId) {
     // its prefix.
     if (typeof workspaceId === "string" && workspaceId.length > 0) {
       const owner = typeof pane.workspace_id === "string" && pane.workspace_id.length > 0 ? pane.workspace_id : null;
-      if (owner !== null ? owner !== workspaceId : !id.startsWith(`${workspaceId}:`)) continue;
+      // Both facts must agree: the owner the pane reports AND the workspace
+      // its id carries. Trusting either one alone lets through a pane that
+      // claims our workspace but belongs to another one.
+      if (owner !== null && owner !== workspaceId) continue;
+      if (!id.startsWith(`${workspaceId}:`)) continue;
     }
     const match = /:p(\d+)$/.exec(id);
     const n = match ? Number(match[1]) : Infinity;
@@ -2395,7 +2420,7 @@ function openedWorkspace(stdout) {
   try {
     doc = JSON.parse(stdout);
   } catch {
-    return { workspaceId: null, paneId: null };
+    return { workspaceId: null, paneId: null, paneCwd: null };
   }
   const result = doc && typeof doc === "object" ? (doc.result || doc) : null;
   const workspace = result && typeof result.workspace === "object" ? result.workspace : null;
@@ -2408,7 +2433,13 @@ function openedWorkspace(stdout) {
     : typeof result.pane_id === "string" && result.pane_id.length > 0
       ? result.pane_id
       : typeof result.root_pane_id === "string" && result.root_pane_id.length > 0 ? result.root_pane_id : null;
-  return { workspaceId, paneId };
+  // The cwd the reply reports for that pane, when it reports one: the same
+  // check the reuse path makes, so a pane that is not in the worktree is
+  // refused here too.
+  const paneCwd = rootPane && typeof rootPane.cwd === "string" && rootPane.cwd.length > 0
+    ? rootPane.cwd
+    : typeof result.cwd === "string" && result.cwd.length > 0 ? result.cwd : null;
+  return { workspaceId, paneId, paneCwd };
 }
 
 function herdrFailureText(call, status, reason) {
@@ -2443,8 +2474,12 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
   const rawSession = params && typeof params.session === "string" && params.session.length > 0
     ? params.session
     : undefined;
-  const rawName = params && typeof params.name === "string" && params.name.length > 0
-    ? params.name
+  // A name that was PROVIDED is used as given, empty included, so an
+  // explicit "" is refused by the guard below instead of silently
+  // falling back to the worktree name.
+  const nameProvided = params !== undefined && params !== null && params.name !== undefined && params.name !== null;
+  const rawName = nameProvided
+    ? typeof params.name === "string" ? params.name : String(params.name)
     : undefined;
   // T35 wires the behaviour; this tool only accepts and reports it.
   const notify = !(params && params.notify === false);
@@ -2526,7 +2561,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
     );
   }
   const branch = resolved.entry ? resolved.entry.branch : resolved.branch;
-  const agentName = rawName || resolved.name;
+  const agentName = nameProvided ? rawName : resolved.name;
   // Herdr reads the positional name as an option when it starts with a
   // dash: `herdr agent start --help` exits 0 and prints help without
   // starting anything, which would be reported as a successful open and
@@ -2631,6 +2666,28 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
           `worktree session open failed: 'herdr worktree open' for branch '${branch}' succeeded but its output named no workspace/pane; no session was started`,
           { worktree: resolved.name, branch, path: targetCwd },
         );
+      }
+      // The pane Herdr just opened must belong to the workspace it named
+      // (a pane id carries its workspace), and its cwd — when the reply
+      // reports one — must be the worktree or inside it, exactly as on the
+      // reuse path. Trusting the reply is what would start Pi somewhere
+      // else on a reply that names another pane.
+      if (!pair.paneId.startsWith(`${pair.workspaceId}:`)) {
+        return errorResult(
+          `worktree session open failed: 'herdr worktree open' named workspace '${pair.workspaceId}' but pane '${pair.paneId}', which does not belong to it; no session was started`,
+          { worktree: resolved.name, branch, path: targetCwd, workspaceId: pair.workspaceId, paneId: pair.paneId },
+        );
+      }
+      if (pair.paneCwd !== null) {
+        const openedState = checkoutState(pair.paneCwd, repo.root);
+        const openedReal = openedState.real !== null ? openedState.real : openedState.absolute;
+        const openedInside = openedReal !== null && (openedReal === targetCwd || openedReal.startsWith(targetCwd + path.sep));
+        if (!openedInside) {
+          return errorResult(
+            `worktree session open failed: the pane '${pair.paneId}' Herdr opened for branch '${branch}' has cwd ${pair.paneCwd}, outside the worktree ${targetCwd}; no session was started`,
+            { worktree: resolved.name, branch, path: targetCwd, workspaceId: pair.workspaceId, paneId: pair.paneId },
+          );
+        }
       }
       workspaceId = pair.workspaceId;
       paneId = pair.paneId;

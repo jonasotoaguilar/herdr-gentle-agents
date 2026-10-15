@@ -1662,3 +1662,209 @@ describe('worktree_session_open adversarial regressions', { concurrency: false }
       'the --focus sentence must state what the session tool actually passes');
   });
 });
+
+// Round 2 of the same verification: two defects stayed reachable through
+// the tool's own parameters (an explicit empty name, and a binding match
+// that accepted any file name CONTAINING the session id), plus three the
+// round could only reach with an instrumented reply.
+
+function createWorld(root, branch, target, openReply) {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sess-create-')));
+  const worktreeList = writeJson(dir, 'worktree-list.json', {
+    result: { worktrees: [{ path: target, branch }] },
+  });
+  const openFile = writeJson(dir, 'worktree-open.json', openReply);
+  return { dir, worktreeList, openFile };
+}
+
+describe('worktree_session_open adversarial regressions (round 2)', { concurrency: false }, () => {
+  test('an explicit empty agent name is refused, not replaced by the worktree name', async () => {
+    const root = makeRepo('adv2-empty');
+    const target = addRegistered(root, 'feat/adv2-empty');
+    const herdr = makeWatchHerdrStub();
+    const world = watchWorld(root, 'feat/adv2-empty', target, 'ws-adv2-empty');
+    const seq = writeAgentSequence('ws-adv2-empty:p1', [agentDoc('working', 'ws-adv2-empty:p1')]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const result = await callSessionOpen(loaded.tools, { worktree: 'feat-adv2-empty', name: '' }, makeCtx(root));
+      assert.equal(result.isError, true, `expected a refusal: ${resultText(result)}`);
+      assert.match(resultText(result), /invalid agent name/);
+      assert.equal(shimArgv(herdr.log).length, 0, 'a refused name runs no herdr command at all');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a binding whose file name merely CONTAINS the session id is not a finish', async () => {
+    const root = makeRepo('adv2-substr');
+    const target = addRegistered(root, 'feat/adv2-substr');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-adv2-substr:p1';
+    const world = watchWorld(root, 'feat/adv2-substr', target, 'ws-adv2-substr');
+    const seq = writeAgentSequence(paneId, [boundDoc('working', paneId, 'xabc'), boundDoc('idle', paneId, 'xabc')]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const result = await callSessionOpen(loaded.tools, { worktree: 'feat/adv2-substr', session: 'abc' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      await waitUntil(() => loaded.sent.length >= 1, 3000, 'the outcome');
+      assert.equal(loaded.sent.length, 1);
+      assert.notEqual(loaded.sent[0][0].details.outcome, 'finished',
+        'a file name that only contains the id is another session');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a session id that is a bare dot never claims any file as ours', async () => {
+    const root = makeRepo('adv2-dot');
+    const target = addRegistered(root, 'feat/adv2-dot');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-adv2-dot:p1';
+    const world = watchWorld(root, 'feat/adv2-dot', target, 'ws-adv2-dot');
+    const real = '9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f';
+    const seq = writeAgentSequence(paneId, [boundDoc('working', paneId, real), boundDoc('idle', paneId, real)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const result = await callSessionOpen(loaded.tools, { worktree: 'feat/adv2-dot', session: '.' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      await waitUntil(() => loaded.sent.length >= 1, 3000, 'the outcome');
+      assert.notEqual(loaded.sent[0][0].details.outcome, 'finished',
+        'every session file name contains a dot, so a dot id must not match');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('an open reply naming a pane of another workspace is refused', async () => {
+    const root = makeRepo('adv2-openpair');
+    const target = addRegistered(root, 'feat/adv2-openpair');
+    const herdr = makeWatchHerdrStub();
+    const world = createWorld(root, 'feat/adv2-openpair', target, {
+      result: { workspace: { workspace_id: 'ws-new' }, root_pane: { pane_id: 'other:p1', cwd: target } },
+    });
+    const seq = writeAgentSequence('ws-new:p1', [agentDoc('working', 'ws-new:p1')]);
+    const modeEnv = scratchModeEnv();
+    setEnv({ ...watchEnv(modeEnv, herdr, world, seq), HERDR_STUB_WORKTREE_OPEN: world.openFile });
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const result = await callSessionOpen(loaded.tools, { worktree: 'feat/adv2-openpair' }, makeCtx(root));
+      assert.equal(result.isError, true, `expected a refusal: ${resultText(result)}`);
+      assert.equal(startCount(herdr.log), 0, 'nothing is started in a pane of another workspace');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('an open reply whose pane cwd is outside the worktree is refused', async () => {
+    const root = makeRepo('adv2-opencwd');
+    const target = addRegistered(root, 'feat/adv2-opencwd');
+    const herdr = makeWatchHerdrStub();
+    const world = createWorld(root, 'feat/adv2-opencwd', target, {
+      result: { workspace: { workspace_id: 'ws-new2' }, root_pane: { pane_id: 'ws-new2:p1', cwd: '/tmp/not-the-worktree' } },
+    });
+    const seq = writeAgentSequence('ws-new2:p1', [agentDoc('working', 'ws-new2:p1')]);
+    const modeEnv = scratchModeEnv();
+    setEnv({ ...watchEnv(modeEnv, herdr, world, seq), HERDR_STUB_WORKTREE_OPEN: world.openFile });
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const result = await callSessionOpen(loaded.tools, { worktree: 'feat/adv2-opencwd' }, makeCtx(root));
+      assert.equal(result.isError, true, `expected a refusal: ${resultText(result)}`);
+      assert.match(resultText(result), /outside the worktree/);
+      assert.equal(startCount(herdr.log), 0, 'nothing is started outside the worktree');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a pane claiming our workspace with a foreign pane id is not chosen', async () => {
+    const root = makeRepo('adv2-owner');
+    const target = addRegistered(root, 'feat/adv2-owner');
+    const herdr = makeWatchHerdrStub();
+    const world = watchWorld(root, 'feat/adv2-owner', target, 'ws-adv2-owner');
+    fs.writeFileSync(world.paneList, JSON.stringify(paneListDoc([
+      { pane_id: 'other:p1', workspace_id: 'ws-adv2-owner', cwd: target },
+      { pane_id: 'ws-adv2-owner:p1', workspace_id: 'ws-adv2-owner', cwd: target },
+    ])));
+    const seq = writeAgentSequence('ws-adv2-owner:p1', [agentDoc('working', 'ws-adv2-owner:p1')]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const result = await callSessionOpen(loaded.tools, { worktree: 'feat/adv2-owner' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const start = shimArgv(herdr.log).find((line) => line.startsWith('agent start'));
+      assert.ok(start && start.includes('--pane ws-adv2-owner:p1'), `the pane id must carry its workspace: ${start}`);
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a slow host delivers the outcome once, not once per tick', async () => {
+    const root = makeRepo('adv2-slow');
+    const target = addRegistered(root, 'feat/adv2-slow');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-adv2-slow:p1';
+    const world = watchWorld(root, 'feat/adv2-slow', target, 'ws-adv2-slow');
+    const seq = writeAgentSequence(paneId, [agentDoc('working', paneId), agentDoc('idle', paneId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnvWith(modeEnv, herdr, world, seq, { intervalMs: 25, graceMs: 20, maxWaitMs: 3000 }));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender({
+        sendMessage: (message, options, sent) => new Promise((resolve) => {
+          setTimeout(() => {
+            sent.push([message, options]);
+            resolve('msg-slow');
+          }, 150);
+        }),
+      });
+      mod = loaded.mod;
+      const result = await callSessionOpen(loaded.tools, { worktree: 'feat/adv2-slow' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      await waitUntil(() => loaded.sent.length >= 1, 3000, 'the slow delivery');
+      await sleep(400);
+      assert.equal(loaded.sent.length, 1, 'a send still in flight is not repeated');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+});
