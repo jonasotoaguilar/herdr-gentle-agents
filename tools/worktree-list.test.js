@@ -157,7 +157,7 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       // The listing exposes only the real checkout, after the principal line.
       const branch = git(root, ['branch', '--show-current']);
-      assert.equal(text, `worktree list: ${root} ${branch} principal\nworktree list: ${live} feat/live thread=thread-1 issues=35`);
+      assert.equal(text, `worktree list: principal ${branch} principal\nworktree list: feat-live feat/live thread=thread-1 issues=35`);
       assert.deepEqual(result.details.worktrees.map((item) => item.path), [root, live]);
       // The pruned path travels in details and in the warning text.
       assert.deepEqual(result.details.pruned, [dead]);
@@ -194,7 +194,7 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       // S19 retires `worktree list: none`: with no agent worktrees left,
       // the output is exactly the principal line.
       const branch = git(root, ['branch', '--show-current']);
-      assert.equal(resultText(result), `worktree list: ${root} ${branch} principal`);
+      assert.equal(resultText(result), `worktree list: principal ${branch} principal`);
       assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal']);
       assert.equal(result.details.count, 1);
       assert.deepEqual([...result.details.pruned].sort(), [first, second].sort());
@@ -254,7 +254,7 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       const text = resultText(result);
       assert.equal(result.isError, undefined, `the listing still succeeds, got: ${text}`);
       const branch = git(root, ['branch', '--show-current']);
-      assert.equal(text, `worktree list: ${root} ${branch} principal\nworktree list: ${live} feat/live thread=thread-1 issues=35`);
+      assert.equal(text, `worktree list: principal ${branch} principal\nworktree list: feat-live feat/live thread=thread-1 issues=35`);
       assert.deepEqual(result.details.pruned, [], 'nothing was pruned');
       assert.ok(result.details.pruneError, 'the write failure travels in details');
       assert.ok(
@@ -288,7 +288,7 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const branch = git(root, ['branch', '--show-current']);
-      assert.equal(text, `worktree list: ${root} ${branch} principal\nworktree list: ${realPlain} feat/plain thread=thread-1 issues=35 missing`);
+      assert.equal(text, `worktree list: principal ${branch} principal\nworktree list: feat-plain feat/plain thread=thread-1 issues=35 missing`);
       assert.deepEqual(result.details.pruned, [], 'an existing path is never pruned');
       assert.deepEqual(fs.readFileSync(registryLib.registryPath(root)), beforeBytes, 'registry untouched');
     } finally {
@@ -310,9 +310,9 @@ describe('worktree_list prunes checkouts deleted out of band (S16)', { concurren
       const branch = git(root, ['branch', '--show-current']);
       assert.equal(
         resultText(result),
-        `worktree list: ${root} ${branch} principal\n`
-        + `worktree list: ${first} feat/one thread=thread-1 issues=35\n`
-        + `worktree list: ${second} feat/two thread=thread-2 issues=35,7`,
+        `worktree list: principal ${branch} principal\n`
+        + `worktree list: feat-one feat/one thread=thread-1 issues=35\n`
+        + `worktree list: feat-two feat/two thread=thread-2 issues=35,7`,
       );
       assert.deepEqual(result.details.pruned, []);
       assert.deepEqual(result.details.warnings, []);
@@ -435,7 +435,7 @@ describe('consolidated checkout liveness: files + relative git listing', { concu
       }
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.ok(text.includes(`${live} feat/live thread=thread-1 issues=35`), `live checkout stays live, not missing: ${text}`);
+      assert.ok(text.includes(`feat-live feat/live thread=thread-1 issues=35`), `live checkout stays live, not missing: ${text}`);
       assert.ok(!text.split('\n').some((line) => line.includes('feat/live') && line.endsWith(' missing')), 'must not mislabel live as missing');
       assert.ok(!text.includes('ghost-relative'), `non-existent extra never reported: ${text}`);
       assert.ok(!result.details.worktrees.some((item) => item.path.includes('ghost-relative')), 'ghost absent from details');
@@ -486,7 +486,7 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
   }
 
   function principalLine(root) {
-    return `worktree list: ${root} ${principalBranch(root)} principal`;
+    return `worktree list: principal ${principalBranch(root)} principal`;
   }
 
   function addUnregisteredWorktree(root, branch) {
@@ -508,7 +508,7 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       // The retired `worktree list: none` never appears: the principal line stands alone.
       assert.equal(text, principalLine(root));
       assert.deepEqual(result.details.worktrees, [
-        { path: root, branch: principalBranch(root), thread: null, issues: [], status: 'live', kind: 'principal' },
+        { name: 'principal', path: root, branch: principalBranch(root), thread: null, issues: [], status: 'live', kind: 'principal' },
       ]);
       assert.equal(result.details.count, 1);
     } finally {
@@ -530,8 +530,8 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       assert.equal(
         text,
         `${principalLine(root)}\n`
-        + `worktree list: ${first} feat/one thread=thread-1 issues=35\n`
-        + `worktree list: ${second} feat/two thread=thread-2 issues=35,7`,
+        + `worktree list: feat-one feat/one thread=thread-1 issues=35\n`
+        + `worktree list: feat-two feat/two thread=thread-2 issues=35,7`,
       );
       assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal', 'agent', 'agent']);
       assert.deepEqual(result.details.worktrees.map((item) => item.path), [root, first, second]);
@@ -553,9 +553,9 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       assert.equal(
         text,
-        `worktree list: ${second} feat/two thread=thread-2 issues=35,7\n`
+        `worktree list: feat-two feat/two thread=thread-2 issues=35,7\n`
         + `${principalLine(root)}\n`
-        + `worktree list: ${first} feat/one thread=thread-1 issues=35`,
+        + `worktree list: feat-one feat/one thread=thread-1 issues=35`,
       );
       assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['agent', 'principal', 'agent']);
       assert.deepEqual(result.details.worktrees.map((item) => item.path), [second, root, first]);
@@ -579,9 +579,9 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       // checkout too — it leads, the principal follows immediately.
       assert.equal(
         text,
-        `worktree list: ${ghost} feat/ghost unregistered\n`
+        `worktree list: feat-ghost feat/ghost unregistered\n`
         + `${principalLine(root)}\n`
-        + `worktree list: ${known} feat/known thread=thread-1 issues=35`,
+        + `worktree list: feat-known feat/known thread=thread-1 issues=35`,
       );
       const ghostItem = result.details.worktrees.find((item) => item.path === ghost);
       assert.ok(ghostItem, 'the session checkout is still reported');
@@ -613,7 +613,7 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       assert.equal(
         text,
-        `${principalLine(root)}\nworktree list: ${live} feat/live thread=thread-1 issues=35`,
+        `${principalLine(root)}\nworktree list: feat-live feat/live thread=thread-1 issues=35`,
       );
     } finally {
       gitLib.repoIdentity = origIdentity;
@@ -639,7 +639,7 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       assert.ok(principalItem, 'a principal entry is present');
       assert.equal(principalItem.path, root);
       assert.equal(principalItem.status, 'live');
-      assert.ok(!text.split('\n').some((line) => line.startsWith(`worktree list: ${root} `) && line.endsWith(' unregistered')), 'the principal is never unregistered');
+      assert.ok(!text.split('\n').some((line) => line === `worktree list: principal ${principalBranch(root)} unregistered`), 'the principal is never unregistered');
       for (const item of result.details.worktrees) {
         if (item.path === root) assert.equal(item.kind, 'principal');
         else if (item.path === live) assert.equal(item.kind, 'agent');
@@ -664,7 +664,7 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       assert.equal(
         text,
-        `${principalLine(root)}\nworktree list: ${live} feat/live thread=thread-1 issues=35`,
+        `${principalLine(root)}\nworktree list: feat-live feat/live thread=thread-1 issues=35`,
       );
       assert.deepEqual(result.details.pruned, [dead]);
     } finally {
@@ -712,7 +712,7 @@ describe('F1: symlink spellings resolve through the same identity rule', { concu
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(link));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.equal(text, `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.equal(text, `worktree list: principal ${principalBranch(root)} principal`);
       assert.equal(result.details.worktrees[0].kind, 'principal');
     } finally {
       restoreEnv();
@@ -733,8 +733,8 @@ describe('F1: symlink spellings resolve through the same identity rule', { concu
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const lines = text.split('\n');
-      assert.equal(lines[0], `worktree list: ${second} feat/two thread=thread-2 issues=7`);
-      assert.equal(lines[1], `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.equal(lines[0], `worktree list: feat-two feat/two thread=thread-2 issues=7`);
+      assert.equal(lines[1], `worktree list: principal ${principalBranch(root)} principal`);
       assert.ok(lines[2].includes('feat/one'), `remaining row follows: ${text}`);
       assert.deepEqual(result.details.worktrees.map((item) => item.path), [second, root, first]);
       assert.equal(result.details.worktrees[0].kind, 'agent');
@@ -759,8 +759,8 @@ describe('F1: symlink spellings resolve through the same identity rule', { concu
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const lines = text.split('\n');
-      assert.equal(lines[0], `worktree list: ${second} feat/two thread=thread-2 issues=7`);
-      assert.equal(lines[1], `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.equal(lines[0], `worktree list: feat-two feat/two thread=thread-2 issues=7`);
+      assert.equal(lines[1], `worktree list: principal ${principalBranch(root)} principal`);
       assert.deepEqual(result.details.worktrees.map((item) => item.path), [second, root, first]);
     } finally {
       restoreEnv();
@@ -777,7 +777,7 @@ describe('F1: symlink spellings resolve through the same identity rule', { concu
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(sub));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.equal(text, `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.equal(text, `worktree list: principal ${principalBranch(root)} principal`);
       assert.equal(result.details.worktrees[0].kind, 'principal');
     } finally {
       restoreEnv();
@@ -797,7 +797,7 @@ describe('F1: symlink spellings resolve through the same identity rule', { concu
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(link));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.equal(text, `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.equal(text, `worktree list: principal ${principalBranch(root)} principal`);
       assert.equal(result.details.worktrees[0].kind, 'principal');
     } finally {
       restoreEnv();
@@ -829,12 +829,98 @@ describe('F2: unregistered session checkout is first with all:true', { concurren
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const lines = text.split('\n');
-      assert.equal(lines[0], `worktree list: ${ghost} feat/ghost unregistered`);
-      assert.equal(lines[1], `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.equal(lines[0], `worktree list: feat-ghost feat/ghost unregistered`);
+      assert.equal(lines[1], `worktree list: principal ${principalBranch(root)} principal`);
       assert.ok(lines[2].includes('feat/known'), `registered row follows: ${text}`);
       assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['unregistered', 'principal', 'agent']);
       assert.deepEqual(result.details.worktrees.map((item) => item.path), [ghost, root, known]);
       assert.equal(result.details.worktrees[0].status, 'unregistered');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S24: the listing identifies checkouts by NAME (T33 RED)', { concurrency: false }, () => {
+  test('the principal line prints the name `principal` first, path kept in details', async () => {
+    const root = makeRepo('s24-principal');
+    setEnv(stdEnv());
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const branch = git(root, ['branch', '--show-current']);
+      assert.equal(text, `worktree list: principal ${branch} principal`);
+      assert.equal(result.details.worktrees[0].path, root);
+      assert.equal(result.details.worktrees[0].name, 'principal');
+      assert.equal(result.details.worktrees[0].kind, 'principal');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an agent row prints the flattened slug first, path kept in details', async () => {
+    const root = makeRepo('s24-agent');
+    setEnv(stdEnv());
+    try {
+      const live = addRegistered(root, 'feat/live', { thread: 'thread-1', issues: [35] });
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const branch = git(root, ['branch', '--show-current']);
+      assert.equal(text, `worktree list: principal ${branch} principal\nworktree list: feat-live feat/live thread=thread-1 issues=35`);
+      const agent = result.details.worktrees.find((item) => item.kind === 'agent');
+      assert.equal(agent.path, live);
+      assert.equal(agent.name, 'feat-live');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a missing row prints the name with the missing marker', async () => {
+    const root = makeRepo('s24-missing');
+    setEnv(stdEnv());
+    try {
+      addRegistered(root, 'feat/plain', { thread: 'thread-1', issues: [35] });
+      // `missing` means the path EXISTS but git names no live checkout
+      // there (a non-existent path would be pruned, never listed): point
+      // the row at a real directory outside every checkout.
+      const elsewhere = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-s24-elsewhere-')));
+      const registryLib = require('../lib/worktree-registry.js');
+      const file = registryLib.registryPath(root);
+      const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+      doc.worktrees[0].path = fs.realpathSync(elsewhere);
+      fs.writeFileSync(file, JSON.stringify(doc));
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const branch = git(root, ['branch', '--show-current']);
+      assert.equal(text, `worktree list: principal ${branch} principal\nworktree list: feat-plain feat/plain thread=thread-1 issues=35 missing`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an unregistered extra prints the name first', async () => {
+    const root = makeRepo('s24-unregistered');
+    setEnv(stdEnv());
+    try {
+      addRegistered(root, 'feat/known', { thread: 'thread-1', issues: [35] });
+      const ghost = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-s24-ghost-')));
+      fs.rmSync(ghost, { recursive: true, force: true });
+      git(root, ['worktree', 'add', '-b', 'feat/ghost', ghost, 'HEAD']);
+      const ghostReal = fs.realpathSync(ghost);
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', { all: true }, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.ok(text.split('\n').includes('worktree list: feat-ghost feat/ghost unregistered'), `unregistered names first: ${text}`);
+      const extra = result.details.worktrees.find((item) => item.kind === 'unregistered');
+      assert.equal(extra.name, 'feat-ghost');
+      assert.ok(path.isAbsolute(extra.path), 'details keeps the absolute path');
     } finally {
       restoreEnv();
     }

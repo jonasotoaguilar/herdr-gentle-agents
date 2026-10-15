@@ -785,16 +785,20 @@ const worktreeCreateTool = defineTool({
   },
 });
 
-// `worktree_list` output contract (S6, S9, S19) — terse, one line per
-// checkout, pinned in tools/worktree-list.test.js:
-//   worktree list: <path> <branch> principal
-//   worktree list: <path> <branch> thread=<thread> issues=<n,n[,n...]>
+// `worktree_list` output contract (S6, S9, S19, S24) — terse, one line per
+// checkout, pinned in tools/worktree-list.test.js. The FIRST column is the
+// NAME (S24): the flattened branch slug, or `principal` for the principal
+// checkout, so the printed identifier is exactly what `warp` accepts and
+// what `close` can take. The absolute path is not dropped: it stays in
+// `details.worktrees[].path` (plus `details.worktrees[].name`).
+//   worktree list: <name> <branch> principal
+//   worktree list: <name> <branch> thread=<thread> issues=<n,n[,n...]>
 // A registered entry whose path is not a live checkout gains ` missing`:
-//   worktree list: <path> <branch> thread=<thread> issues=<n,n> missing
+//   worktree list: <name> <branch> thread=<thread> issues=<n,n> missing
 // With `all: true`, live checkouts the registry does not know about are
 // listed (the principal checkout is never listed as unregistered); the
 // session's own one leads the listing and the rest stay path-sorted:
-//   worktree list: <path> <branch> unregistered
+//   worktree list: <name> <branch> unregistered
 // The principal checkout (S19) is always listed when git's listing names
 // it, and the session's own checkout is the FIRST line; `worktree list:
 // none` is retired and only survives as the degenerate fallback when the
@@ -909,8 +913,9 @@ async function executeWorktreeList(params, ctx) {
   let principalItem = null;
   if (principalEntry && principalPath !== null) {
     const principalBranch = principalEntry.branch || "(detached)";
-    principalLine = `worktree list: ${principalPath} ${principalBranch} principal`;
-    principalItem = { path: principalPath, branch: principalBranch, thread: null, issues: [], status: "live", kind: "principal" };
+    // S24: the first column is the NAME (`principal`), never the path.
+    principalLine = `worktree list: principal ${principalBranch} principal`;
+    principalItem = { name: "principal", path: principalPath, branch: principalBranch, thread: null, issues: [], status: "live", kind: "principal" };
   }
   const agentRows = [];
   const deadPaths = [];
@@ -938,10 +943,18 @@ async function executeWorktreeList(params, ctx) {
       ? entry.thread
       : "unknown";
     const status = liveHit ? "live" : "missing";
+    // S24: the first column is the NAME (flattened branch slug); the
+    // absolute path stays in details, never in the printed line.
+    let rowName = "worktree";
+    try {
+      rowName = git.slugifyBranch(typeof entry.branch === "string" ? entry.branch : "worktree");
+    } catch {
+      rowName = "worktree";
+    }
     agentRows.push({
-      line: `worktree list: ${entry.path} ${entry.branch} thread=${thread} issues=${issues.join(",")}`
+      line: `worktree list: ${rowName} ${entry.branch} thread=${thread} issues=${issues.join(",")}`
         + (liveHit ? "" : " missing"),
-      item: { path: entry.path, branch: entry.branch, thread, issues, status, kind: "agent" },
+      item: { name: rowName, path: entry.path, branch: entry.branch, thread, issues, status, kind: "agent" },
     });
   }
   // Prune exactly the dead rows in one atomic registry write, best
@@ -1121,9 +1134,16 @@ async function executeWorktreeList(params, ctx) {
       // Report the resolved absolute form so details.worktrees never
       // carries a relative spelling or a path that does not exist.
       const shown = checkoutState(entry.path, repo.root).absolute || entry.path;
+      // S24: the first column is the NAME, exactly what `warp` accepts.
+      let extraName = "worktree";
+      try {
+        extraName = git.slugifyBranch(branch);
+      } catch {
+        extraName = "worktree";
+      }
       extraLines.push({
-        line: `worktree list: ${shown} ${branch} unregistered`,
-        item: { path: shown, branch, thread: null, issues: [], status: "unregistered", kind: "unregistered" },
+        line: `worktree list: ${extraName} ${branch} unregistered`,
+        item: { name: extraName, path: shown, branch, thread: null, issues: [], status: "unregistered", kind: "unregistered" },
       });
     }
     if (sessionExtra >= 0) {
@@ -1318,6 +1338,131 @@ function vanishedCheckouts(git, repoRoot, live, resolvedTarget, after) {
   return vanished;
 }
 
+// S24 name resolution — the ONE place checkout names resolve to
+// checkouts. `worktree_close` (by `name`) and the `warp` command verb
+// both call this, never separate logic. A name is the flattened branch
+// slug (`slugifyBranch`, already exported by lib/worktree-git.js), or
+// `principal` for the principal checkout.
+//
+// `principal` is `{path, branch} | null` (null when git's listing names
+// no principal). Returns either:
+// - `{ok: true, kind: "principal", name, path, branch, entry: null}`, or
+// - `{ok: true, kind: "agent", name, path, branch, entry}`, or
+// - `{ok: false, error, candidates}` where candidates are the known names
+//   for the fail-closed message.
+// An unknown name fails closed; two registry rows flattening to one name
+// are AMBIGUOUS and fail closed naming every matching row, never picking
+// one.
+function resolveCheckoutByName(name, git, read, principal) {
+  const rows = read && Array.isArray(read.worktrees) ? read.worktrees : [];
+  const knownNames = [];
+  if (principal) knownNames.push("principal");
+  const seen = new Set();
+  for (const row of rows) {
+    if (!row || typeof row.branch !== "string") continue;
+    let slug = null;
+    try {
+      slug = git.slugifyBranch(row.branch);
+    } catch {
+      slug = null;
+    }
+    if (typeof slug !== "string" || slug.length === 0 || seen.has(slug)) continue;
+    seen.add(slug);
+    knownNames.push(slug);
+  }
+  if (name === "principal") {
+    if (principal) {
+      return {
+        ok: true, kind: "principal", name: "principal",
+        path: principal.path, branch: principal.branch, entry: null,
+      };
+    }
+    return {
+      ok: false,
+      error: `no registered worktree for "principal": the principal checkout could not be determined; known worktrees: ${knownNames.join(", ") || "(none)"}`,
+      candidates: knownNames,
+    };
+  }
+  const matches = [];
+  for (const row of rows) {
+    if (!row || typeof row.branch !== "string") continue;
+    let slug = null;
+    try {
+      slug = git.slugifyBranch(row.branch);
+    } catch {
+      slug = null;
+    }
+    if (slug === name) matches.push(row);
+  }
+  if (matches.length === 1) {
+    const row = matches[0];
+    return {
+      ok: true, kind: "agent", name,
+      path: row.path, branch: row.branch, entry: row,
+    };
+  }
+  if (matches.length > 1) {
+    const named = matches.map((row) => `'${row.branch}' at ${row.path}`).join(", ");
+    return {
+      ok: false,
+      error: `worktree name "${name}" is ambiguous: ${named}; pass the path or branch instead`,
+      candidates: knownNames,
+    };
+  }
+  // Unknown: fail closed in the style of the unknown-path error, naming
+  // the closest registered candidates by name.
+  const ranked = rows
+    .map((row) => {
+      let slug = "";
+      try {
+        slug = typeof row.branch === "string" ? git.slugifyBranch(row.branch) : "";
+      } catch {
+        slug = "";
+      }
+      const q = String(name);
+      const shared = Math.min(q.length, slug.length);
+      let score = 0;
+      while (score < shared && q[score] === slug[score]) score += 1;
+      return { row, slug, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+  const named = ranked.map((item) => `'${item.slug}' (branch '${item.row.branch}') at ${item.row.path}`).join(", ");
+  const suffix = ranked.length > 0 ? `: closest registered worktrees: ${named}` : ": no worktrees are registered";
+  return {
+    ok: false,
+    error: `no registered worktree for ${JSON.stringify(name)}${suffix}`,
+    candidates: knownNames,
+  };
+}
+
+// The principal checkout for name resolution: the live listing entry
+// whose resolved identity equals the main root recovered from the shared
+// common dir (the same recovery the list uses). Null when git's listing
+// names no such entry, so no principal line — and no `principal` name —
+// is invented.
+function principalForName(git, repoRoot, repo, live) {
+  try {
+    if (typeof repo.commonDir !== "string" || path.basename(repo.commonDir) !== ".git") return null;
+    const rawPrincipal = path.resolve(path.dirname(repo.commonDir));
+    const principalState = checkoutState(rawPrincipal, repoRoot);
+    const principalPath = principalState.real !== null ? principalState.real : principalState.absolute;
+    if (principalPath === null) return null;
+    for (const entry of live || []) {
+      if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
+      const st = checkoutState(entry.path, repoRoot);
+      if (st.absolute === null) continue;
+      const entryId = st.real !== null ? st.real : st.absolute;
+      if (entryId === principalPath) {
+        return { path: principalPath, branch: entry.branch || "(detached)" };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // Core of `worktree_close` (S7, D6): remove the checkout and its Herdr
 // workspace, keep the branch, drop the registry entry. Exported for unit
 // tests; the registered tool calls it with the live Pi context.
@@ -1352,13 +1497,24 @@ async function executeWorktreeClose(params, ctx) {
 
   const rawPath = params ? params.path : undefined;
   const rawBranch = params ? params.branch : undefined;
+  const rawName = params ? params.name : undefined;
   const force = !!params && params.force === true;
   const hasPath = typeof rawPath === "string" && rawPath.length > 0;
   const hasBranch = typeof rawBranch === "string" && rawBranch.length > 0;
-  if (!hasPath && !hasBranch) {
+  const hasName = typeof rawName === "string" && rawName.length > 0;
+  if (!hasPath && !hasBranch && !hasName) {
     return errorResult(
-      "worktree_close requires a path or a branch: pass the worktree path or branch name to close",
+      "worktree_close requires a path or a branch or a name: pass the worktree path, branch, or name to close",
       { force },
+    );
+  }
+  // S24: `name` is a third selector beside `path` and `branch` — at most
+  // one of the three. (The pre-existing path+branch pair keeps its
+  // agree-or-disagree behaviour below.)
+  if (hasName && (hasPath || hasBranch)) {
+    return errorResult(
+      "worktree_close accepts only one of path, branch, or name: pass only one",
+      { path: rawPath, branch: rawBranch, name: rawName, force },
     );
   }
 
@@ -1372,15 +1528,40 @@ async function executeWorktreeClose(params, ctx) {
   if (!read.ok) {
     return errorResult(`cannot read worktree registry: ${read.error}`, { force });
   }
-  const byPath = hasPath ? registry.findByPath(repo.root, rawPath) : null;
-  const byBranch = hasBranch ? registry.findByBranch(repo.root, rawBranch) : null;
+  const byPath = hasPath && !hasName ? registry.findByPath(repo.root, rawPath) : null;
+  const byBranch = hasBranch && !hasName ? registry.findByBranch(repo.root, rawBranch) : null;
   if (hasPath && hasBranch && byPath && byBranch && byPath.branch !== byBranch.branch) {
     return errorResult(
       `worktree_close path and branch disagree: path resolves to branch '${byPath.branch}' but branch '${rawBranch}' is registered elsewhere; pass only one`,
       { path: rawPath, branch: rawBranch, force },
     );
   }
-  const entry = byPath || byBranch || null;
+  // S24: resolve `name` through the shared resolver (the same one `warp`
+  // uses). An unknown or ambiguous name fails closed here, before
+  // anything is verified or removed.
+  let entry = byPath || byBranch || null;
+  if (hasName) {
+    let liveForName;
+    try {
+      liveForName = git.listWorktrees(repo.root);
+    } catch (err) {
+      return errorResult(
+        `cannot list worktrees: ${(err && err.message) || err}`,
+        { name: rawName, force },
+      );
+    }
+    const resolved = resolveCheckoutByName(rawName, git, read, principalForName(git, repo.root, repo, liveForName));
+    if (!resolved.ok) {
+      return errorResult(resolved.error, { query: rawName, candidates: resolved.candidates, force });
+    }
+    if (resolved.kind === "principal") {
+      return errorResult(
+        `cannot close the principal checkout at ${resolved.path}: worktree_close only closes registered agent worktrees; the checkout and the registry were left untouched`,
+        { name: rawName, path: resolved.path, branch: resolved.branch, force },
+      );
+    }
+    entry = resolved.entry;
+  }
   if (!entry) {
     // Never remove an unknown checkout: refuse and name the closest
     // registered candidates instead.
@@ -1613,8 +1794,9 @@ const worktreeListTool = defineTool({
 const worktreeCloseTool = defineTool({
   name: "worktree_close",
   label: "Worktree Close",
-  description: "Remove a registered agent worktree checkout and its Herdr workspace while keeping the branch. Pass the worktree path or branch, plus force:true to close a dirty checkout.",
+  description: "Remove a registered agent worktree checkout and its Herdr workspace while keeping the branch. Pass the worktree name, path, or branch (only one), plus force:true to close a dirty checkout.",
   parameters: Type.Object({
+    name: opt(Type.String({ description: "Name of the registered worktree to close (the flattened branch slug, or principal)" })),
     path: opt(Type.String({ description: "Path of the registered worktree to close" })),
     branch: opt(Type.String({ description: "Branch of the registered worktree to close" })),
     force: opt(Type.Boolean({ description: "Close even when the checkout is dirty" })),
@@ -1902,6 +2084,284 @@ function handleWorktreeOddEvent(event, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// `/herdr-gentle:worktree warp <name>` (S23): move the SESSION to another
+// checkout by NAME.
+//
+// The platform keeps session control (`waitForIdle`/`switchSession`) on
+// the extension COMMAND context, so the warp is a command verb — never a
+// `worktree_warp` tool, which the platform makes impossible. The name is
+// the flattened branch slug S24 prints (or `principal`), resolved through
+// the SAME `resolveCheckoutByName` the close-by-name path uses — one
+// place, never two.
+//
+// Measured scope of the move (nothing over-promised): the SESSION cwd
+// changes and the tools operate in the target, while the PROCESS cwd does
+// not (Pi never calls `process.chdir`); emitting OSC-7 tells the TERMINAL
+// the new cwd, and Herdr honours it natively (ghostty-vt parses OSC 7
+// into its pane pwd, so new panes/tabs/workspaces with
+// `new_cwd = "follow"` inherit it); the interactive bash shell in that
+// pane does NOT change directory, because a child process cannot change
+// its parent shell's cwd.
+// ---------------------------------------------------------------------------
+
+// Emit OSC-7 (`ESC ] 7 ; file://<cwd> ESC \`) announcing the session's
+// new cwd to the terminal — written ONLY when the stream is a TTY, so a
+// stream the TUI owns when it is not a TTY is never written to. The stream
+// is injectable so tests can assert the exact bytes.
+function emitOsc7(stream, cwd) {
+  try {
+    if (!stream || stream.isTTY !== true || typeof stream.write !== "function") return false;
+    if (typeof cwd !== "string" || cwd.length === 0) return false;
+    stream.write(`\x1b]7;file://${cwd}\x1b\\`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Resolve the SessionManager class for the warp without a static package
+// import (which would force every extension test double to stub a third
+// line): prefer the canonical package export when the loader resolves it
+// (the production Pi loader, which already resolves the sibling static
+// imports from the same package), else the session instance's own
+// constructor — the class that produced it, whose statics (`forkFrom`,
+// `create`, `open`) are the mechanism. Null when neither is available.
+async function sessionManagerClassFor(ctx) {
+  try {
+    const mod = await import("@earendil-works/pi-coding-agent");
+    if (mod && mod.SessionManager && typeof mod.SessionManager.forkFrom === "function") {
+      return mod.SessionManager;
+    }
+  } catch {
+    // Plain-node test copies cannot resolve the package: fall through to
+    // the instance constructor (the injected fake) below.
+  }
+  try {
+    const ctor = ctx && ctx.sessionManager ? ctx.sessionManager.constructor : null;
+    if (ctor && typeof ctor.forkFrom === "function") return ctor;
+  } catch {
+    // Unreachable: fall through to null.
+  }
+  return null;
+}
+
+function warpFail(text, details) {
+  return { text, details: details || {}, isError: true };
+}
+
+// Core of the `warp` verb. Exported for unit tests, which inject a fake
+// SessionManager class plus a fake OSC stream through `opts` and drive a
+// fake command context (`waitForIdle`, `sessionManager` with
+// `getSessionFile`/`getLeafId`/`getEntries`/`getSessionDir`,
+// `switchSession`, `ui.setStatus`, `cwd`); the registered command calls
+// it with the live Pi context and notifies the returned text.
+//
+// Mechanism (S23): `await ctx.waitForIdle()`; capture
+// `{file: getSessionFile(), leaf: getLeafId(), cwd: ctx.cwd, sessionDir}`
+// and refuse when there is no persisted session; `SessionManager.forkFrom`
+// (or, for a session Pi has not written to disk yet — brand-new, living
+// only in memory — clone the in-memory entries into a session allocated
+// for the target cwd via `SessionManager.create` + `open`); `branch(leaf)`
+// (or `resetLeaf()` when there is no leaf) plus one `appendCustomEntry`
+// transition record naming both cwds; then
+// `ctx.switchSession(targetFile, { withSession: r => r.ui.setStatus(...)
+// + r.sendMessage(..., {triggerTurn: false}) })`, whose message tells the
+// session to revalidate every path and cwd-dependent assumption.
+// `cancelled` is a real outcome: it removes the target session file,
+// reports it, and changes nothing else.
+async function executeWorktreeWarp(rawName, ctx, opts) {
+  const options = opts || {};
+  const git = libRequire("worktree-git.js");
+  const registry = libRequire("worktree-registry.js");
+  const name = typeof rawName === "string" ? rawName.trim() : "";
+  if (name === "") {
+    return warpFail(
+      "worktree warp needs a name: use /herdr-gentle:worktree warp <name> (the flattened branch slug, or principal)",
+      { name, alreadyThere: false, cancelled: false },
+    );
+  }
+  if (!ctx || typeof ctx.waitForIdle !== "function" || typeof ctx.switchSession !== "function") {
+    return warpFail(
+      "worktree warp is only available as a session command: run /herdr-gentle:worktree warp <name> from a Pi session",
+      { name, alreadyThere: false, cancelled: false },
+    );
+  }
+  await ctx.waitForIdle();
+  const fromCwd = typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+  let repo;
+  try {
+    repo = git.repoIdentity(fromCwd);
+  } catch (err) {
+    return warpFail(`worktree warp: not a git repository: ${fromCwd}`, { name, alreadyThere: false, cancelled: false });
+  }
+  const read = registry.readRegistry(repo.root);
+  if (!read.ok) {
+    return warpFail(`worktree warp: cannot read worktree registry: ${read.error}`, { name, alreadyThere: false, cancelled: false });
+  }
+  let live;
+  try {
+    live = git.listWorktrees(repo.root);
+  } catch (err) {
+    return warpFail(`worktree warp: cannot list worktrees: ${(err && err.message) || err}`, { name, alreadyThere: false, cancelled: false });
+  }
+  // The SAME resolver as close-by-name: unknown or ambiguous fails closed.
+  const resolved = resolveCheckoutByName(name, git, read, principalForName(git, repo.root, repo, live));
+  if (!resolved.ok) {
+    return warpFail(`worktree warp: ${resolved.error}`, { name, alreadyThere: false, cancelled: false, candidates: resolved.candidates });
+  }
+  // Normalize the target cwd through the one liveness predicate (a row
+  // reaching the checkout through a symlink warps to the real checkout).
+  const targetState = checkoutState(resolved.path, repo.root);
+  const targetCwd = targetState.real !== null ? targetState.real
+    : targetState.absolute !== null ? targetState.absolute
+    : path.resolve(resolved.path);
+  // Warping to the checkout the session already runs in reports that and
+  // changes nothing: no fork, no switch, no OSC-7.
+  const sessionState = checkoutState(fromCwd, repo.root);
+  const sessionId = sessionState.real !== null ? sessionState.real : sessionState.absolute;
+  if (sessionId !== null && (sessionId === targetCwd || sessionId.startsWith(targetCwd + path.sep))) {
+    return {
+      text: `worktree warp: ${name} (already there)`,
+      details: { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: true, cancelled: false },
+    };
+  }
+  const sm = ctx.sessionManager || {};
+  const safe = (fn) => {
+    try {
+      return fn();
+    } catch {
+      return undefined;
+    }
+  };
+  const file = typeof sm.getSessionFile === "function" ? safe(() => sm.getSessionFile()) : undefined;
+  const leaf = typeof sm.getLeafId === "function" ? safe(() => sm.getLeafId()) : null;
+  const sessionDir = typeof sm.getSessionDir === "function" ? safe(() => sm.getSessionDir()) : undefined;
+  let carried = [];
+  if (typeof file !== "string" || file.length === 0) {
+    const entries = typeof sm.getEntries === "function" ? safe(() => sm.getEntries()) : undefined;
+    carried = Array.isArray(entries) ? entries : [];
+    if (carried.length === 0) {
+      return warpFail(
+        "worktree warp: no persisted session for this session and nothing in memory to carry over; open or write the session first and retry",
+        { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+      );
+    }
+  }
+  const SM = options.sessionManagerClass || await sessionManagerClassFor(ctx);
+  if (!SM || typeof SM.forkFrom !== "function") {
+    return warpFail(
+      "worktree warp is unavailable here: the host SessionManager has no forkFrom",
+      { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+    );
+  }
+  let target = null;
+  let targetFile = null;
+  if (typeof file === "string" && file.length > 0) {
+    try {
+      target = SM.forkFrom(file, targetCwd, sessionDir);
+    } catch (err) {
+      return warpFail(
+        `worktree warp: could not fork the session into ${targetCwd}: ${(err && err.message) || err}`,
+        { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+      );
+    }
+    targetFile = target && typeof target.getSessionFile === "function" ? safe(() => target.getSessionFile()) : undefined;
+  } else {
+    // Pi has not written this session to disk yet: allocate a session for
+    // the target cwd and put the carried entries in its file ourselves,
+    // preserving order and ids so the history (and the leaf below)
+    // survives.
+    try {
+      const allocated = SM.create(targetCwd, sessionDir);
+      const allocatedFile = allocated && typeof allocated.getSessionFile === "function" ? allocated.getSessionFile() : undefined;
+      if (typeof allocatedFile !== "string" || allocatedFile.length === 0) {
+        throw new Error("the host allocated no session file for the target");
+      }
+      const header = typeof allocated.getHeader === "function" ? allocated.getHeader() : null;
+      if (!header) throw new Error("the allocated session has no header");
+      // Written rather than replayed through the manager's private append:
+      // a private append is not guaranteed to reach disk before the switch,
+      // and a target holding only its header would silently lose the whole
+      // conversation. `wx` never clobbers an existing file.
+      const lines = [header, ...carried].map((entry) => `${JSON.stringify(entry)}\n`).join("");
+      fs.writeFileSync(allocatedFile, lines, { flag: "wx" });
+      target = SM.open(allocatedFile, sessionDir, targetCwd);
+    } catch (err) {
+      return warpFail(
+        `worktree warp: could not carry this session into ${targetCwd}: ${(err && err.message) || err}`,
+        { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+      );
+    }
+    targetFile = target && typeof target.getSessionFile === "function" ? safe(() => target.getSessionFile()) : undefined;
+  }
+  if (typeof targetFile !== "string" || targetFile.length === 0) {
+    return warpFail(
+      `worktree warp: the forked session for ${targetCwd} has no session file`,
+      { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+    );
+  }
+  try {
+    if (leaf !== null && leaf !== undefined) target.branch(leaf);
+    else target.resetLeaf();
+  } catch (err) {
+    return warpFail(
+      `worktree warp: could not position the forked session at ${targetFile}: ${(err && err.message) || err}; the forked session file was kept for inspection`,
+      { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+    );
+  }
+  try {
+    target.appendCustomEntry("worktree-warp", { from: fromCwd, to: targetCwd, name, branch: resolved.branch });
+  } catch (err) {
+    return warpFail(
+      `worktree warp: could not record the transition into ${targetCwd}: ${(err && err.message) || err}; the forked session file was kept for inspection`,
+      { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+    );
+  }
+  let switched;
+  try {
+    switched = await ctx.switchSession(targetFile, {
+      withSession: async (r) => {
+        try {
+          r.ui.setStatus("worktree", `${name} (${targetCwd})`);
+        } catch {
+          // Status is cosmetic; the revalidation message below is not.
+        }
+        await r.sendMessage({
+          customType: "worktree-warp",
+          content: `Worktree warp: this session moved from ${fromCwd} to ${targetCwd} (branch '${resolved.branch}'). Revalidate every path and cwd-dependent assumption: the working directory, the git root, the worktree registry, and any cached absolute paths now refer to ${targetCwd}.`,
+          display: true,
+        }, { triggerTurn: false });
+      },
+    });
+  } catch (err) {
+    return warpFail(
+      `worktree warp: the session switch to ${targetCwd} failed: ${(err && err.message) || err}; the forked session file was kept at ${targetFile}`,
+      { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+    );
+  }
+  if (switched && switched.cancelled === true) {
+    // `cancelled` is a real outcome, not a success: remove the target
+    // session file, report it, change nothing else.
+    try {
+      fs.unlinkSync(targetFile);
+    } catch {
+      // Best effort: the report below is what matters.
+    }
+    return warpFail(
+      `worktree warp: ${name} cancelled (the session stays in ${fromCwd}; the forked session file was removed)`,
+      { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: true },
+    );
+  }
+  // After a successful switch only: tell the terminal the new cwd. The
+  // helper writes nothing unless the stream is a TTY.
+  emitOsc7(options.oscStream || process.stdout, targetCwd);
+  return {
+    text: `worktree warp: ${name} -> ${targetCwd}`,
+    details: { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // `/herdr-gentle:worktree` mode command (S10, D9).
 //
 // Follows the `/herdr-gentle:sidebar` pattern with the shared mode file in
@@ -1926,7 +2386,7 @@ function worktreeStatusMessage(modeState, toolsRegistered) {
   } catch {
     reload = "unknown";
   }
-  return `Worktree tools are ${state} (tools registered: ${registered}; /reload needed: ${reload}). Use /herdr-gentle:worktree enabled|disabled|status.`;
+  return `Worktree tools are ${state} (tools registered: ${registered}; /reload needed: ${reload}). Use /herdr-gentle:worktree enabled|disabled|status|warp <name>.`;
 }
 
 // Registered before any gate on purpose (like the sidebar toggle): the
@@ -1935,15 +2395,30 @@ function worktreeStatusMessage(modeState, toolsRegistered) {
 function registerWorktreeCommand(pi, toolsRegistered) {
   if (typeof pi?.registerCommand !== "function") return;
   pi.registerCommand("herdr-gentle:worktree", {
-    description: "Turn the agent worktree tools (worktree_create/list/close) on or off",
+    description: "Manage agent worktrees: turn the worktree tools on or off, check their status, or warp this session to a named checkout",
     handler: async (args, ctx) => {
       const notify = ctx?.ui?.notify;
-      const raw = String(args ?? "").trim().toLowerCase();
-      let verb = raw;
+      const raw = String(args ?? "").trim();
+      const parts = raw.split(/\s+/).filter((part) => part.length > 0);
+      const head = (parts[0] || "").toLowerCase();
+      // S23: the warp verb moves the SESSION to the named checkout. It
+      // resolves through the same name resolver as the listing and the
+      // close-by-name path, and reports the outcome as a notification.
+      if (head === "warp") {
+        const target = parts[1] || "";
+        if (!target || parts.length > 2) {
+          notify?.("worktree warp needs exactly one name: use /herdr-gentle:worktree warp <name> (the flattened branch slug, or principal).", "error");
+          return;
+        }
+        const out = await executeWorktreeWarp(target, ctx);
+        notify?.(out.text, out.isError ? "error" : "info");
+        return;
+      }
+      let verb = head;
       if (verb === "enable") verb = "enabled";
       if (verb === "disable") verb = "disabled";
       if (verb !== "enabled" && verb !== "disabled" && verb !== "status") {
-        notify?.(`Unknown option "${raw}". Use /herdr-gentle:worktree enabled|disabled|status.`, "error");
+        notify?.(`Unknown option "${raw}". Use /herdr-gentle:worktree enabled|disabled|status|warp <name>.`, "error");
         return;
       }
       const mode = libRequire("worktree-mode.js");
@@ -2009,4 +2484,4 @@ export default function (pi) {
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, emitOsc7 };

@@ -24,7 +24,9 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 | --- | --- | --- | --- |
 | `worktree_create` | `branch: string` (required), `issues: number[]` (required, at least one) | Prompts via `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`); non-interactive sessions proceed without it, and a refusal mutates nothing | `worktree create: <path>` |
 | `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | The session's own checkout first — the principal or a registered worktree — then the principal line when the session is not in it, then the remaining `worktree list: …` agent rows |
-| `worktree_close` | `path?: string`, `branch?: string` (at least one required), `force?: boolean` | Same `ctx.ui.confirm` gate as create; a refusal keeps checkout and entry | `worktree close: <path>` |
+| `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector), `force?: boolean` | Same `ctx.ui.confirm` gate as create; a refusal keeps checkout and entry | `worktree close: <path>` |
+
+The session moves between checkouts through the mode command's `warp` verb (`/herdr-gentle:worktree warp <name>`, never a tool — the platform keeps session control on the command context). Success text is `worktree warp: <name> -> <path>`; warping to the checkout the session already runs in reports `worktree warp: <name> (already there)` and changes nothing.
 
 Structured `details` on success:
 
@@ -49,8 +51,8 @@ Structured `details` on success:
   the conflict line naming that checkout; on the adopt path, the adoption
   line naming the adopted branch (plus the Herdr-association outcome when
   it failed).
-- list: `{worktrees: [{path, branch, thread, issues, status, kind}], count,
-  all, pruned, warnings, pruneError}` — `status` is `live`, `missing`
+- list: `{worktrees: [{name, path, branch, thread, issues, status, kind}], count,
+  all, pruned, warnings, pruneError}` — `name` is the printed first column (slug or `principal`); `path` is the absolute checkout path; `status` is `live`, `missing`
   (registered and still on disk but no live checkout, or a non-absolute
   path that can never name one), or `unregistered` (only with `all:
   true`); `kind` is `principal` for the principal checkout, `agent` for a
@@ -59,16 +61,34 @@ Structured `details` on success:
   then `pruneError` carries the cause); `warnings` carries the one line
   naming them (see below) and is empty otherwise.
 - close: `{path, branch, removed: true, branchKept: true, thread}` —
-  `thread` is the owning thread, or `null` when none was recorded.
+  `thread` is the owning thread, or `null` when none was recorded. The
+  checkout is selected by `name`, `path`, or `branch` (at most one): a
+  `name` is the flattened branch slug the listing prints (or `principal`)
+  resolved through the same resolver the warp uses; an unknown name fails
+  closed like an unknown path, naming the closest names, and two registry
+  rows flattening to one name are ambiguous and fail closed naming both,
+  never picking one. `principal` cannot be closed — it is not a registered
+  agent worktree.
+- warp (command verb, not a tool): `{name, path, branch, kind, alreadyThere,
+  cancelled}` — `kind` is `principal` or `agent`; `alreadyThere` is `true`
+  only for the `worktree warp: <name> (already there)` no-op; `cancelled`
+  is `true` only when the session switch was cancelled, in which case the
+  forked target session file was removed and nothing else changed.
 
 List line format (pinned by the tool tests):
 
 ```text
-worktree list: <principal-path> <branch> principal
-worktree list: <path> <branch> thread=<thread> issues=<n,n[,n...]>
-worktree list: <path> <branch> thread=<thread> issues=<n,n> missing
-worktree list: <path> <branch> unregistered        # only with all: true
+worktree list: <name> <branch> principal
+worktree list: <name> <branch> thread=<thread> issues=<n,n[,n...]>
+worktree list: <name> <branch> thread=<thread> issues=<n,n> missing
+worktree list: <name> <branch> unregistered        # only with all: true
 ```
+
+The FIRST column is the NAME (S24): the flattened branch slug
+(`feat/worktree-warp` → `feat-worktree-warp`), or `principal` for the
+principal checkout — exactly the identifier the warp verb accepts and the
+close `name` selector takes. The absolute path is not dropped: it stays in
+`details.worktrees[].path` (alongside `details.worktrees[].name`).
 
 The principal checkout (S19) is the main worktree of git's listing — the
 entry whose resolved path equals the main root recovered from the shared
@@ -369,10 +389,10 @@ from the caller's checkout.
 
 ## Mode command
 
-`/herdr-gentle:worktree enabled|disabled|status` follows the
+`/herdr-gentle:worktree enabled|disabled|status|warp <name>` follows the
 `/herdr-gentle:sidebar` pattern. `enable`/`disable` are accepted as
 aliases; anything else (including a missing verb) prints `Unknown option
-"<raw>". Use /herdr-gentle:worktree enabled|disabled|status.` and mutates
+"<raw>". Use /herdr-gentle:worktree enabled|disabled|status|warp <name>.` and mutates
 nothing. `status` never writes. Writing the mode refuses a symlinked or
 non-regular mode path with a clear error and touches nothing (the normal
 path stays atomic: a sibling temp file created exclusively with an
@@ -396,7 +416,43 @@ enable them` when disabled. Registration changes need **`/reload`**: the
 `status` verb reports mode state, whether the tools are registered in this
 session, and whether `/reload` is needed, e.g. `Worktree tools are
 enabled (default; no mode file) (tools registered: yes; /reload needed:
-no). Use /herdr-gentle:worktree enabled|disabled|status.`
+no). Use /herdr-gentle:worktree enabled|disabled|status|warp <name>.`
+
+### Warp verb (S23)
+
+`/herdr-gentle:worktree warp <name>` moves the session to the named
+checkout, where `<name>` is the flattened branch slug the listing prints
+(`feat/worktree-warp` → `feat-worktree-warp`), or `principal`. It is a
+command verb, never a `worktree_warp` tool: session control
+(`waitForIdle`/`switchSession`) lives on the extension command context, so
+a tool context cannot do this. The name resolves through the same resolver
+as close-by-name — one place, never two: an unknown name fails closed
+naming the known ones, and two rows flattening to one name are ambiguous
+and fail closed naming both.
+
+Success text is `worktree warp: <name> -> <path>`; warping to the checkout
+the session already runs in reports `worktree warp: <name> (already there)`
+and changes nothing (no fork, no switch, no OSC-7). The mechanism is
+`await ctx.waitForIdle()`, capture the session file/leaf/cwd, refuse when
+there is no persisted session, `SessionManager.forkFrom` (or, for a session
+Pi has not written to disk yet — brand-new, living only in memory — clone
+the in-memory entries into a session allocated for the target cwd via
+`SessionManager.create` + `open`), `branch(leaf)` (or `resetLeaf()` when
+there is no leaf) plus one `appendCustomEntry` transition record naming both
+cwds, then `ctx.switchSession` with a status update and a revalidation
+message (triggering no turn) that tells the session to revalidate every path
+and cwd-dependent assumption. `cancelled` is a real outcome, not a success:
+it removes the target session file, reports it, and changes nothing else.
+
+Honest scope of the move: the SESSION cwd changes and the tools operate in
+the target, while the PROCESS cwd does not (Pi never calls `process.chdir`).
+After a successful switch the command emits OSC-7
+(`ESC ] 7 ; file://<cwd> ESC \`, only when the output stream is a TTY) so
+the TERMINAL learns the new cwd, and Herdr follows it natively — it embeds
+ghostty-vt, which parses OSC 7 into its pane pwd, so new panes, tabs and
+workspaces with `new_cwd = "follow"` inherit it; no cmux-style socket protocol
+is needed. The open interactive shell never changes directory: a child process
+cannot change its parent shell's cwd.
 
 ## Per-thread ownership
 

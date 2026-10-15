@@ -368,7 +368,7 @@ describe('worktree_list registration', { concurrency: false }, () => {
       assert.deepEqual(Object.keys(listParams.properties), ['all']);
       assert.equal(listParams.properties.all.type, 'boolean');
       const closeParams = tools.get('worktree_close').parameters;
-      assert.deepEqual(Object.keys(closeParams.properties).sort(), ['branch', 'force', 'path']);
+      assert.deepEqual(Object.keys(closeParams.properties).sort(), ['branch', 'force', 'name', 'path']);
     } finally {
       restoreEnv();
     }
@@ -388,7 +388,7 @@ describe('worktree_list output', { concurrency: false }, () => {
       // S19 retires `worktree list: none`: with no agent worktrees the
       // output is exactly the principal line.
       const branch = git(root, ['branch', '--show-current']);
-      const expected = `worktree list: ${root} ${branch} principal`;
+      const expected = `worktree list: principal ${branch} principal`;
       const plain = await callList(tools, {}, ctx);
       assert.equal(plain.isError, undefined);
       assert.equal(resultText(plain), expected);
@@ -421,9 +421,9 @@ describe('worktree_list output', { concurrency: false }, () => {
       const branch = git(root, ['branch', '--show-current']);
       assert.equal(
         resultText(result),
-        `worktree list: ${root} ${branch} principal\n`
-        + `worktree list: ${first} feat/one thread=thread-1 issues=35\n`
-        + `worktree list: ${second} feat/two thread=thread-2 issues=35,7`,
+        `worktree list: principal ${branch} principal\n`
+        + `worktree list: feat-one feat/one thread=thread-1 issues=35\n`
+        + `worktree list: feat-two feat/two thread=thread-2 issues=35,7`,
       );
       // The list never mutates the registry file and leaves no lock behind.
       assert.deepEqual(registryBytes(root), before);
@@ -453,7 +453,7 @@ describe('worktree_list output', { concurrency: false }, () => {
       // registry, named in details.pruned and in the warning (which also
       // says git may still record the checkout until `git worktree prune`).
       const branch = git(root, ['branch', '--show-current']);
-      assert.equal(resultText(result), `worktree list: ${root} ${branch} principal`);
+      assert.equal(resultText(result), `worktree list: principal ${branch} principal`);
       assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal']);
       assert.deepEqual(result.details.pruned, [target]);
       assert.ok(
@@ -485,15 +485,15 @@ describe('worktree_list output', { concurrency: false }, () => {
       const plain = await callList(tools, {}, ctx);
       assert.equal(
         resultText(plain),
-        `worktree list: ${root} ${branch} principal\n`
-        + `worktree list: ${known} feat/known thread=thread-1 issues=35`,
+        `worktree list: principal ${branch} principal\n`
+        + `worktree list: feat-known feat/known thread=thread-1 issues=35`,
       );
       const all = await callList(tools, { all: true }, ctx);
       assert.equal(
         resultText(all),
-        `worktree list: ${root} ${branch} principal\n`
-        + `worktree list: ${known} feat/known thread=thread-1 issues=35\n`
-        + `worktree list: ${ghost} feat/ghost unregistered`,
+        `worktree list: principal ${branch} principal\n`
+        + `worktree list: feat-known feat/known thread=thread-1 issues=35\n`
+        + `worktree list: feat-ghost feat/ghost unregistered`,
       );
       assert.deepEqual(registryBytes(root), before, 'listing never mutates the registry');
     } finally {
@@ -1012,6 +1012,114 @@ describe('H2: a file at a path is never a live checkout in the close', { concurr
       assert.match(text, /not a live checkout.*stale registry entry/i, `the stale entry is named and kept: ${text}`);
       assert.deepEqual(registryBytes(root), beforeRegistry, 'registry untouched: the row stays for inspection');
       assert.ok(fs.existsSync(target), 'the file is left alone');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S24: worktree_close accepts name (T33 RED)', { concurrency: false }, () => {
+  test('closing by name removes the checkout, keeps the branch, drops the entry', async () => {
+    const root = makeRepo('close-name');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const target = addRegistered(root, 'feat/by-name', { thread: 'thread-1', issues: [35] });
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { name: 'feat-by-name' }, ctx);
+      assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
+      assert.equal(resultText(result), `worktree close: ${target}`);
+      assert.ok(!livePaths(root).includes(target), 'checkout removed');
+      assert.equal(branchExists(root, 'feat/by-name'), true, 'the branch is kept');
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.findByBranch(root, 'feat/by-name'), null);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an unknown name fails closed naming the closest names, nothing moves', async () => {
+    const root = makeRepo('close-unknown-name');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const target = addRegistered(root, 'feat/known-target', { thread: 'thread-1', issues: [35] });
+      const beforeLive = livePaths(root);
+      const beforeRegistry = registryBytes(root);
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const refused = await callClose(tools, { name: 'feat-nope' }, ctx);
+      assert.equal(refused.isError, true, 'unknown name is an error');
+      assert.match(resultText(refused), /no registered worktree for "feat-nope"/);
+      assert.ok(resultText(refused).includes('feat-known-target'), `names the closest names: ${resultText(refused)}`);
+      assert.deepEqual(livePaths(root), beforeLive, 'no checkout touched');
+      assert.deepEqual(registryBytes(root), beforeRegistry, 'registry untouched');
+      assert.deepEqual(shimArgv(herdr.log), [], 'herdr never invoked');
+      assert.ok(livePaths(root).includes(target));
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('two rows flattening to one name are ambiguous and fail closed naming both', async () => {
+    const root = makeRepo('close-ambiguous');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const first = addRegistered(root, 'feat/amb', { thread: 'thread-1', issues: [35] });
+      // A second branch flattening to the same slug, registered by hand.
+      const slug = 'feat-amb';
+      const other = path.join(path.dirname(root), `${path.basename(root)}-wt-${slug}-other`);
+      track(other);
+      git(root, ['worktree', 'add', '-b', 'feat-amb', other, 'HEAD']);
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.appendWorktree(root, {
+        branch: 'feat-amb', path: fs.realpathSync(other), thread: 'thread-2', issues: [7], odd: [],
+      }).ok, true);
+      const beforeLive = livePaths(root);
+      const beforeRegistry = registryBytes(root);
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const refused = await callClose(tools, { name: 'feat-amb' }, ctx);
+      assert.equal(refused.isError, true, 'ambiguous name never picks one');
+      assert.match(resultText(refused), /ambiguous/i);
+      assert.ok(resultText(refused).includes('feat/amb'), `names the first row: ${resultText(refused)}`);
+      assert.ok(resultText(refused).includes('feat-amb'), `names the second row: ${resultText(refused)}`);
+      assert.deepEqual(livePaths(root), beforeLive, 'no checkout touched');
+      assert.deepEqual(registryBytes(root), beforeRegistry, 'registry untouched');
+      assert.deepEqual(shimArgv(herdr.log), [], 'herdr never invoked');
+      assert.ok(livePaths(root).includes(first));
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('name combined with path or branch is rejected: pass only one', async () => {
+    const root = makeRepo('close-name-exclusive');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      addRegistered(root, 'feat/solo', { thread: 'thread-1', issues: [35] });
+      const beforeLive = livePaths(root);
+      const beforeRegistry = registryBytes(root);
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      for (const params of [{ name: 'feat-solo', path: 'x' }, { name: 'feat-solo', branch: 'feat/solo' }]) {
+        const refused = await callClose(tools, params, ctx);
+        assert.equal(refused.isError, true, `expected rejection: ${JSON.stringify(params)}`);
+        assert.match(resultText(refused), /only one/i);
+      }
+      assert.deepEqual(livePaths(root), beforeLive, 'no checkout touched');
+      assert.deepEqual(registryBytes(root), beforeRegistry, 'registry untouched');
     } finally {
       restoreEnv();
     }

@@ -95,7 +95,8 @@ async function loadExtension() {
   };
   const factory = (await import(pathToFileURL(copy).href)).default;
   factory(pi);
-  return { tools, commands, handlers };
+  const mod = await import(pathToFileURL(copy).href);
+  return { tools, commands, handlers, mod };
 }
 
 function commandDef(commands) {
@@ -308,6 +309,333 @@ describe('worktree mode command', { concurrency: false }, () => {
       await commandDef(commands).handler('status', ctx);
       assert.match(lastMessage(notes), /enabled/, 'status sees the new mode');
       assert.match(lastMessage(notes), /\/reload/, 'status says a reload is needed to register');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, () => {
+  const { spawnSync } = require('node:child_process');
+
+  function git(cwd, args) {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+    assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.stderr}`);
+    return (result.stdout || '').trim();
+  }
+
+  function makeRepo(tag) {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-warp-${tag}-`)));
+    git(dir, ['init']);
+    git(dir, ['config', 'user.email', 'test@example.com']);
+    git(dir, ['config', 'user.name', 'Test']);
+    git(dir, ['commit', '--allow-empty', '-m', 'init']);
+    return fs.realpathSync(dir);
+  }
+
+  function addRegistered(root, branch, { thread = 'thread-1', issues = [35] } = {}) {
+    const slug = branch.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'worktree';
+    const target = path.join(path.dirname(root), `${path.basename(root)}-warp-${slug}`);
+    track(target);
+    git(root, ['worktree', 'add', '-b', branch, target, 'HEAD']);
+    const registryLib = require('../lib/worktree-registry.js');
+    assert.equal(registryLib.upsertWorktree(root, {
+      branch, path: target, thread, issues, odd: [],
+    }).ok, true);
+    return fs.realpathSync(target);
+  }
+
+  // Fake SessionManager class (forkFrom/create/open) injected through the
+  // warp options, so no real Pi runtime is needed.
+  function makeFakeSM(calls, { entries = [] } = {}) {
+    class FakeTarget {
+      constructor(cwd, dir, file) {
+        this.cwd = cwd;
+        this.dir = dir;
+        this.file = file;
+        this.appended = [];
+      }
+      getSessionFile() { return this.file; }
+      branch(id) { calls.push(['branch', id]); this.leaf = id; }
+      resetLeaf() { calls.push(['resetLeaf']); this.leaf = null; }
+      appendCustomEntry(type, data) { calls.push(['appendCustomEntry', type, data]); return 'entry-1'; }
+      _appendEntry(entry) { calls.push(['_appendEntry', entry.id]); this.appended.push(entry); }
+    }
+    return class FakeSM {
+      static forkFrom(sourcePath, targetCwd, sessionDir) {
+        calls.push(['forkFrom', sourcePath, targetCwd, sessionDir]);
+        const file = path.join(targetCwd, 'forked-session.jsonl');
+        fs.writeFileSync(file, '{"type":"session"}\n');
+        return new FakeTarget(targetCwd, sessionDir, file);
+      }
+      static create(cwd, sessionDir) {
+        calls.push(['create', cwd, sessionDir]);
+        const file = path.join(cwd, 'created-session.jsonl');
+        // The real `create` allocates the file without writing it; the warp
+        // writes the header and the carried entries itself.
+        return { getSessionFile: () => file, getHeader: () => ({ type: 'session', cwd }) };
+      }
+      static open(file, sessionDir, cwdOverride) {
+        calls.push(['open', file, sessionDir, cwdOverride]);
+        return new FakeTarget(cwdOverride, sessionDir, file);
+      }
+    };
+  }
+
+  function makeWarpCtx({ cwd, sessionFile, leaf = 'leaf-1', entries = [], sessionDir, switchResult = { cancelled: false }, calls }) {
+    const notes = [];
+    const statuses = [];
+    const sent = [];
+    const waited = [];
+    const switches = [];
+    const session = {
+      getSessionFile: () => sessionFile,
+      getLeafId: () => leaf,
+      getEntries: () => entries,
+      getSessionDir: () => sessionDir,
+    };
+    let replaced = null;
+    const ctx = {
+      cwd,
+      ui: {
+        notify: (message, level) => { notes.push([message, level]); },
+        setStatus: (key, text) => { statuses.push([key, text]); },
+      },
+      sessionManager: session,
+      waitForIdle: async () => { waited.push(true); },
+      switchSession: async (file, options) => {
+        switches.push([file, typeof options?.withSession]);
+        if (typeof options?.withSession === 'function') {
+          replaced = {
+            ui: { setStatus: (key, text) => { statuses.push([`replaced:${key}`, text]); } },
+            sendMessage: async (message, sendOptions) => { sent.push([message, sendOptions]); },
+          };
+          await options.withSession(replaced);
+        }
+        return switchResult;
+      },
+    };
+    return { ctx, notes, statuses, sent, waited, switches };
+  }
+
+  function oscFake(isTTY) {
+    return { isTTY, chunks: [], write(chunk) { this.chunks.push(String(chunk)); return true; } };
+  }
+
+  test('warp moves the session: fork, branch, transition record, switch, exact text', async () => {
+    const root = makeRepo('warp-ok');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const target = addRegistered(root, 'feat/warp-target', { thread: 'thread-1', issues: [35] });
+      const sessionFile = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-sess-'))), 'session.jsonl');
+      fs.writeFileSync(sessionFile, '{"type":"session"}\n');
+      const sessionDir = path.dirname(sessionFile);
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const { ctx, notes, statuses, sent, waited, switches } = makeWarpCtx({
+        cwd: root, sessionFile, leaf: 'leaf-1', entries: [], sessionDir, calls,
+      });
+      const osc = oscFake(true);
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('feat-warp-target', ctx, { sessionManagerClass: FakeSM, oscStream: osc });
+      assert.equal(out.isError, undefined, `expected success: ${out.text}`);
+      assert.equal(out.text, `worktree warp: feat-warp-target -> ${target}`);
+      assert.deepEqual(out.details, {
+        name: 'feat-warp-target', path: target, branch: 'feat/warp-target',
+        kind: 'agent', alreadyThere: false, cancelled: false,
+      });
+      assert.equal(waited.length, 1, 'waitForIdle ran');
+      assert.deepEqual(calls[0], ['forkFrom', sessionFile, target, sessionDir]);
+      assert.deepEqual(calls[1], ['branch', 'leaf-1']);
+      assert.equal(calls[2][0], 'appendCustomEntry');
+      assert.ok(String(JSON.stringify(calls[2][2])).includes(root), 'transition names the old cwd');
+      assert.ok(String(JSON.stringify(calls[2][2])).includes(target), 'transition names the new cwd');
+      assert.equal(switches.length, 1, 'switchSession ran once');
+      assert.equal(switches[0][1], 'function', 'withSession callback passed');
+      assert.ok(statuses.length >= 1, 'status set on the replacement session');
+      assert.equal(sent.length, 1, 'one revalidation message sent');
+      assert.equal(sent[0][1].triggerTurn, false, 'no turn triggered');
+      assert.match(String(sent[0][0].content || JSON.stringify(sent[0][0])), /revalidat/i);
+      assert.deepEqual(osc.chunks, [`\x1b]7;file://${target}\x1b\\`], 'OSC-7 exact bytes');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('warping to the current checkout reports already-there and changes nothing', async () => {
+    const root = makeRepo('warp-there');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const target = addRegistered(root, 'feat/here', { thread: 'thread-1', issues: [35] });
+      const sessionFile = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-sess-'))), 'session.jsonl');
+      fs.writeFileSync(sessionFile, '{"type":"session"}\n');
+      const calls = [];
+      const { ctx, switches } = makeWarpCtx({
+        cwd: target, sessionFile, leaf: 'leaf-1', entries: [], sessionDir: path.dirname(sessionFile), calls,
+      });
+      const osc = oscFake(true);
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('feat-here', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: osc });
+      assert.equal(out.text, 'worktree warp: feat-here (already there)');
+      assert.equal(out.details.alreadyThere, true);
+      assert.deepEqual(calls, [], 'no fork');
+      assert.deepEqual(switches, [], 'no switch');
+      assert.deepEqual(osc.chunks, [], 'no OSC-7 when nothing changes');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an unknown name fails closed naming the known ones', async () => {
+    const root = makeRepo('warp-unknown');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/known', { thread: 'thread-1', issues: [35] });
+      const calls = [];
+      const { ctx, switches, waited } = makeWarpCtx({
+        cwd: root, sessionFile: '/tmp/nope.jsonl', leaf: 'leaf-1', entries: [], sessionDir: '/tmp', calls,
+      });
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('feat-nope', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: oscFake(true) });
+      assert.equal(out.isError, true);
+      assert.match(out.text, /no registered worktree for "feat-nope"/);
+      assert.ok(out.text.includes('feat-known'), `names the known ones: ${out.text}`);
+      assert.deepEqual(calls, [], 'no fork');
+      assert.deepEqual(switches, [], 'no switch');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an ambiguous name fails closed naming both, never picking one', async () => {
+    const root = makeRepo('warp-ambiguous');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/amb', { thread: 'thread-1', issues: [35] });
+      const other = path.join(path.dirname(root), `${path.basename(root)}-warp-feat-amb-other`);
+      track(other);
+      git(root, ['worktree', 'add', '-b', 'feat-amb', other, 'HEAD']);
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.appendWorktree(root, {
+        branch: 'feat-amb', path: fs.realpathSync(other), thread: 'thread-2', issues: [7], odd: [],
+      }).ok, true);
+      const calls = [];
+      const { ctx, switches } = makeWarpCtx({
+        cwd: root, sessionFile: '/tmp/nope.jsonl', leaf: 'leaf-1', entries: [], sessionDir: '/tmp', calls,
+      });
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('feat-amb', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: oscFake(true) });
+      assert.equal(out.isError, true);
+      assert.match(out.text, /ambiguous/i);
+      assert.ok(out.text.includes('feat/amb') && out.text.includes('feat-amb'), `names both: ${out.text}`);
+      assert.deepEqual(calls, [], 'no fork');
+      assert.deepEqual(switches, [], 'no switch');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('no persisted session and nothing in memory is refused', async () => {
+    const root = makeRepo('warp-nofile');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/target', { thread: 'thread-1', issues: [35] });
+      const calls = [];
+      const { ctx, switches } = makeWarpCtx({
+        cwd: root, sessionFile: undefined, leaf: null, entries: [], sessionDir: undefined, calls,
+      });
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('feat-target', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: oscFake(true) });
+      assert.equal(out.isError, true);
+      assert.match(out.text, /no persisted session|no session file/i);
+      assert.deepEqual(calls, [], 'no fork');
+      assert.deepEqual(switches, [], 'no switch');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an unwritten session clones its in-memory entries via create + open', async () => {
+    const root = makeRepo('warp-memory');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const target = addRegistered(root, 'feat/mem-target', { thread: 'thread-1', issues: [35] });
+      const memEntries = [{ id: 'e1', parentId: null, type: 'message' }, { id: 'e2', parentId: 'e1', type: 'message' }];
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const { ctx, switches } = makeWarpCtx({
+        cwd: root, sessionFile: undefined, leaf: null, entries: memEntries, sessionDir: undefined, calls,
+      });
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('feat-mem-target', ctx, { sessionManagerClass: FakeSM, oscStream: oscFake(false) });
+      assert.equal(out.isError, undefined, `expected success: ${out.text}`);
+      assert.equal(out.text, `worktree warp: feat-mem-target -> ${target}`);
+      const kinds = calls.map((call) => call[0]);
+      assert.ok(kinds.includes('create'), `create ran: ${JSON.stringify(kinds)}`);
+      assert.ok(kinds.includes('open'), `open ran: ${JSON.stringify(kinds)}`);
+      assert.ok(!kinds.includes('forkFrom'), 'no forkFrom for an unwritten session');
+      const written = fs.readFileSync(path.join(target, 'created-session.jsonl'), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line));
+      assert.equal(written.length, 3, `the header and both entries reached the file: ${JSON.stringify(written)}`);
+      assert.equal(written[0].cwd, target, 'the header names the target cwd');
+      assert.deepEqual(written.slice(1).map((entry) => entry.id), ['e1', 'e2'], 'both entries carried, in order');
+      assert.equal(switches.length, 1);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('cancelled removes the target session file, reports it, changes nothing else', async () => {
+    const root = makeRepo('warp-cancelled');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const target = addRegistered(root, 'feat/cancel-target', { thread: 'thread-1', issues: [35] });
+      const sessionFile = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-sess-'))), 'session.jsonl');
+      fs.writeFileSync(sessionFile, '{"type":"session"}\n');
+      const calls = [];
+      const { ctx } = makeWarpCtx({
+        cwd: root, sessionFile, leaf: 'leaf-1', entries: [], sessionDir: path.dirname(sessionFile),
+        switchResult: { cancelled: true }, calls,
+      });
+      const osc = oscFake(true);
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('feat-cancel-target', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: osc });
+      assert.match(out.text, /cancelled/i);
+      assert.equal(out.details.cancelled, true);
+      assert.equal(fs.existsSync(path.join(target, 'forked-session.jsonl')), false, 'target session file removed');
+      assert.equal(fs.existsSync(sessionFile), true, 'source session untouched');
+      assert.deepEqual(osc.chunks, [], 'no OSC-7 on cancel');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('emitOsc7 writes the exact bytes only on a TTY', async () => {
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const { mod } = await loadExtension();
+      const tty = oscFake(true);
+      assert.equal(mod.emitOsc7(tty, '/tmp/some-dir'), true);
+      assert.deepEqual(tty.chunks, ['\x1b]7;file:///tmp/some-dir\x1b\\']);
+      const notty = oscFake(false);
+      assert.equal(mod.emitOsc7(notty, '/tmp/some-dir'), false);
+      assert.deepEqual(notty.chunks, []);
+      assert.equal(mod.emitOsc7(undefined, '/tmp/some-dir'), false);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the command exposes warp alongside the existing verbs', async () => {
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const { commands } = await loadExtension();
+      const def = commands.get('herdr-gentle:worktree');
+      assert.ok(def, 'command registered');
+      const notes = [];
+      const ctx = { ui: { notify: (message, level) => { notes.push([message, level]); } }, cwd: process.cwd() };
+      await def.handler('warp', ctx);
+      assert.match(notes[notes.length - 1][0], /warp.*needs a name|warp <name>/i, 'missing name is a usage error');
     } finally {
       restoreEnv();
     }
