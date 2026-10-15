@@ -492,8 +492,9 @@ value resolves through the S24 name resolver (`resolveCheckoutByName` in
 one) against THIS repository's registered live worktrees only. A branch
 spelling resolves through its flattened slug; an absolute or relative
 PATH is refused before any backend runs with `pass the worktree NAME
-'worktree list' prints, not a path`, so no command can ever run outside a
-worktree of this repo. The principal checkout is refused (a session there
+'worktree list' prints, not a path`, so every command it runs is about a
+worktree of THIS repository and never about another checkout. The
+principal checkout is refused (a session there
 delegates nothing), an unknown name fails closed naming the known ones,
 and a registered row whose checkout is gone is refused as stale — only a
 registered, live worktree proceeds.
@@ -521,16 +522,21 @@ an EXISTING pane at a shell prompt):
    `--session <id>` when resuming or `--session-id <minted>` for a new
    session. The id is minted as a UUID (`crypto.randomUUID()`), valid in
    Pi's `[A-Za-z0-9._-]` session-id charset, so it is known immediately
-   and returned. The pane's cwd is the worktree, so Pi's own session
-directory is the worktree's: no `--session-dir` is ever passed.
+   and returned. The pane's cwd is checked to be the worktree, or inside
+it, before Pi starts, so Pi's own session directory is the worktree's: no
+`--session-dir` is ever passed. A pane whose shell moved elsewhere is
+refused, because a session started there would not be in the worktree.
 
 Success text is exactly `worktree session open: <worktree> <session-id>`.
 The `herdrArgv` allowlist (`lib/worktree-git.js`) gains exactly the
 commands and flags this uses — `worktree open` (`--branch`, `--cwd`,
 `--no-focus`), `pane list` (`--workspace`), `agent start` (positional
 name, `--kind`, `--pane`, `--timeout`, `--` plus the Pi argv), `agent get`
-(positional target) and `agent list` (no flags) — and keeps its two
-refusals: never `--trust-repository`, never `--focus`. The version floor
+(positional target) and `agent list` (no flags) — and keeps its refusal
+of `--trust-repository`, because trusting a repository is a human
+decision these tools never take. The session tool itself only ever passes
+`--no-focus`; the allowlist still accepts `--focus` for the `worktree
+create`/`open` calls that predate it. The version floor
 stays `0.9.4`: every one of those flags was run against the installed
 binary before the spec was written.
 

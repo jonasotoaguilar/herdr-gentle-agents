@@ -987,6 +987,7 @@ function makeWatchHerdrStub() {
       '  echo "{}"; exit 0',
       'fi',
       'if [ "$1" = "agent" ] && [ "$2" = "get" ]; then',
+      '  if [ "${HERDR_SHIM_AGENT_GET_SLEEP:-0}" != "0" ]; then sleep "$HERDR_SHIM_AGENT_GET_SLEEP"; fi',
       '  n=$(cat "$HERDR_STUB_AGENT_GET_COUNT" 2>/dev/null || echo 0)',
       '  n=$((n + 1)); echo "$n" > "$HERDR_STUB_AGENT_GET_COUNT"',
       '  f="$HERDR_STUB_AGENT_GET_DIR/$n.json"',
@@ -1002,7 +1003,7 @@ function makeWatchHerdrStub() {
   return { bin, log };
 }
 
-async function loadExtensionWithSender() {
+async function loadExtensionWithSender(overrides = {}) {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sess-watch-ext-')));
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
@@ -1013,7 +1014,9 @@ async function loadExtensionWithSender() {
     registerTool: (tool) => { tools.set(tool.name, tool); },
     registerCommand: (name, def) => { commands.set(name, def); },
     on: () => () => {},
-    sendMessage: async (message, options) => { sent.push([message, options]); return 'msg-1'; },
+    sendMessage: overrides.sendMessage
+      ? (message, options) => overrides.sendMessage(message, options, sent)
+      : async (message, options) => { sent.push([message, options]); return 'msg-1'; },
   };
   const mod = await import(pathToFileURL(copy).href);
   mod.default(pi);
@@ -1351,5 +1354,311 @@ describe('worktree_session_open finish subscription (S26)', { concurrency: false
       } catch {}
       restoreEnv();
     }
+  });
+});
+
+// Adversarial regressions (the verification round)
+//
+// Each case below is a counterexample an independent verification round
+// found on a NORMAL run, or an invariant measured against the installed
+// herdr: a name herdr reads as an option, an observation attributed to
+// whoever holds the pane, a synchronous poll that freezes the session, a
+// delivery failure that became silence, a pane list believed without
+// checking it belongs to the worktree's workspace, and a root pane whose
+// shell moved elsewhere.
+
+function watchEnvWith(modeEnv, herdr, world, seq, timing = {}) {
+  return {
+    ...watchEnv(modeEnv, herdr, world, seq),
+    GENTLE_WORKTREE_WATCH_INTERVAL_MS: String(timing.intervalMs ?? 15),
+    GENTLE_WORKTREE_WATCH_GRACE_MS: String(timing.graceMs ?? 20),
+    GENTLE_WORKTREE_WATCH_MAX_MS: String(timing.maxWaitMs ?? 600),
+  };
+}
+
+function paneListDoc(panes) {
+  return { result: { panes } };
+}
+
+function boundDoc(status, paneId, sessionId) {
+  return {
+    result: {
+      agent: {
+        agent: 'pi',
+        agent_status: status,
+        pane_id: paneId,
+        agent_session: {
+          agent: 'pi',
+          kind: 'path',
+          source: 'herdr:pi',
+          value: `/home/someone/.pi/agent/sessions/--x--/2026-01-01T00-00-00-000Z_${sessionId}.jsonl`,
+        },
+      },
+    },
+  };
+}
+
+function startCount(log) {
+  return shimArgv(log).filter((line) => line.startsWith('agent start')).length;
+}
+
+describe('worktree_session_open adversarial regressions', { concurrency: false }, () => {
+  test('an agent name herdr reads as an option is refused, never a false success', async () => {
+    const root = makeRepo('adv-name');
+    const target = addRegistered(root, 'feat/adv-name');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-adv-name:p1';
+    const world = watchWorld(root, 'feat/adv-name', target, 'ws-adv-name');
+    const seq = writeAgentSequence(paneId, [agentDoc('working', paneId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      for (const name of ['--help', '-h']) {
+        const result = await callSessionOpen(tools, { worktree: 'feat-adv-name', name }, makeCtx(root));
+        assert.equal(result.isError, true, `'${name}' must open nothing: ${resultText(result)}`);
+        assert.match(resultText(result), /invalid agent name/);
+      }
+      assert.equal(startCount(herdr.log), 0, 'no agent start runs for a name herdr would read as an option');
+      await sleep(120);
+      assert.equal(sent.length, 0, 'a refused name subscribes to nothing');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a pane holding another session is never reported as finished', async () => {
+    const root = makeRepo('adv-foreign');
+    const target = addRegistered(root, 'feat/adv-foreign');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-adv-foreign:p1';
+    const world = watchWorld(root, 'feat/adv-foreign', target, 'ws-adv-foreign');
+    const other = '11111111-2222-3333-4444-555555555555';
+    const seq = writeAgentSequence(paneId, [boundDoc('working', paneId, other), boundDoc('idle', paneId, other)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-adv-foreign' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const sessionId = result.details.sessionId;
+      await waitUntil(() => sent.length >= 1, 3000, 'the notification');
+      assert.equal(sent.length, 1);
+      const [message] = sent[0];
+      assert.notEqual(message.details.outcome, 'finished', 'another session going idle is not our finish');
+      assert.ok(!/is idle after working/.test(message.content), `never claims a finish: ${message.content}`);
+      assert.ok(message.content.includes(sessionId), 'names our session id');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('an idle pane bound to our own session is still a finish', async () => {
+    const root = makeRepo('adv-bound');
+    const target = addRegistered(root, 'feat/adv-bound');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-adv-bound:p1';
+    const world = watchWorld(root, 'feat/adv-bound', target, 'ws-adv-bound');
+    const seq = writeAgentSequence(paneId, [agentDoc('working', paneId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnvWith(modeEnv, herdr, world, seq, { intervalMs: 150, graceMs: 20, maxWaitMs: 2000 }));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-adv-bound' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const sessionId = result.details.sessionId;
+      // The pane now publishes the binding this plugin owns: our session file.
+      fs.writeFileSync(seq.last, `${JSON.stringify(boundDoc('idle', paneId, sessionId))}\n`);
+      await waitUntil(() => sent.length >= 1, 3000, 'the finish');
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0][0].details.outcome, 'finished');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a hung herdr agent get does not freeze the session that opened the delegate', async () => {
+    const root = makeRepo('adv-hung');
+    const target = addRegistered(root, 'feat/adv-hung');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-adv-hung:p1';
+    const world = watchWorld(root, 'feat/adv-hung', target, 'ws-adv-hung');
+    const seq = writeAgentSequence(paneId, [agentDoc('working', paneId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      ...watchEnvWith(modeEnv, herdr, world, seq, { intervalMs: 15, graceMs: 10, maxWaitMs: 5000 }),
+      HERDR_SHIM_AGENT_GET_SLEEP: '1',
+    });
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-adv-hung' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      // While a poll is in flight the event loop keeps turning: a
+      // synchronous poll would block it for the stub's whole second.
+      let ticks = 0;
+      const ticker = setInterval(() => { ticks += 1; }, 10);
+      await sleep(400);
+      clearInterval(ticker);
+      assert.ok(ticks >= 20, `the event loop kept turning during a hung poll: ${ticks} ticks`);
+      assert.equal(sent.length, 0, 'nothing is concluded while the poll hangs');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a delivery failure is retried, not swallowed into silence', async () => {
+    const root = makeRepo('adv-retry');
+    const target = addRegistered(root, 'feat/adv-retry');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-adv-retry:p1';
+    const world = watchWorld(root, 'feat/adv-retry', target, 'ws-adv-retry');
+    const seq = writeAgentSequence(paneId, [agentDoc('working', paneId), agentDoc('idle', paneId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      let attempts = 0;
+      const loaded = await loadExtensionWithSender({
+        sendMessage: async (message, options, sent) => {
+          attempts += 1;
+          if (attempts === 1) throw new Error('host refused the message');
+          sent.push([message, options]);
+          return 'msg-2';
+        },
+      });
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-adv-retry' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      await waitUntil(() => sent.length >= 1, 3000, 'the retried notification');
+      assert.equal(sent.length, 1);
+      assert.ok(attempts >= 2, `the failure was retried: ${attempts} attempts`);
+      assert.equal(sent[0][0].details.outcome, 'finished');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a pane of another workspace is never used, even when herdr lists it first', async () => {
+    const root = makeRepo('adv-prefix');
+    const target = addRegistered(root, 'feat/adv-prefix');
+    const herdr = makeWatchHerdrStub();
+    const world = watchWorld(root, 'feat/adv-prefix', target, 'ws-ours');
+    fs.writeFileSync(world.paneList, JSON.stringify(paneListDoc([
+      { pane_id: 'ws-foreign:p1', workspace_id: 'ws-foreign', cwd: '/tmp/elsewhere' },
+      { pane_id: 'ws-ours:p1', workspace_id: 'ws-ours', cwd: target },
+    ])));
+    const seq = writeAgentSequence('ws-ours:p1', [agentDoc('working', 'ws-ours:p1')]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-adv-prefix' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const start = shimArgv(herdr.log).find((line) => line.startsWith('agent start'));
+      assert.ok(start && start.includes('--pane ws-ours:p1'), `the worktree's own pane is used: ${start}`);
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a pane list holding only another workspace fails closed, starting nothing', async () => {
+    const root = makeRepo('adv-onlyforeign');
+    const target = addRegistered(root, 'feat/adv-onlyforeign');
+    const herdr = makeWatchHerdrStub();
+    const world = watchWorld(root, 'feat/adv-onlyforeign', target, 'ws-ours2');
+    fs.writeFileSync(world.paneList, JSON.stringify(paneListDoc([
+      { pane_id: 'ws-foreign:p1', workspace_id: 'ws-foreign', cwd: '/tmp/elsewhere' },
+    ])));
+    const seq = writeAgentSequence('ws-ours2:p1', [agentDoc('working', 'ws-ours2:p1')]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-adv-onlyforeign' }, makeCtx(root));
+      assert.equal(result.isError, true, `expected a refusal: ${resultText(result)}`);
+      assert.equal(startCount(herdr.log), 0, 'nothing is started in a foreign pane');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a root pane whose shell moved elsewhere is refused, starting nothing', async () => {
+    const root = makeRepo('adv-cwd');
+    const target = addRegistered(root, 'feat/adv-cwd');
+    const herdr = makeWatchHerdrStub();
+    const world = watchWorld(root, 'feat/adv-cwd', target, 'ws-adv-cwd');
+    fs.writeFileSync(world.paneList, JSON.stringify(paneListDoc([
+      { pane_id: 'ws-adv-cwd:p1', workspace_id: 'ws-adv-cwd', cwd: '/tmp/not-the-worktree' },
+    ])));
+    const seq = writeAgentSequence('ws-adv-cwd:p1', [agentDoc('working', 'ws-adv-cwd:p1')]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-adv-cwd' }, makeCtx(root));
+      assert.equal(result.isError, true, `expected a refusal: ${resultText(result)}`);
+      assert.match(resultText(result), /outside the worktree/);
+      assert.equal(startCount(herdr.log), 0, 'nothing is started outside the worktree');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('the docs no longer claim what the code does not enforce', async () => {
+    const docs = fs.readFileSync(path.resolve(LIB_DIR, '..', 'docs', 'worktree-tools.md'), 'utf8');
+    assert.ok(!docs.includes('so no command can ever run outside a'),
+      'the scope sentence must not promise more than the name guard enforces');
+    assert.ok(docs.includes('checked to be the worktree'),
+      'the pane cwd claim must say it is checked');
+    assert.ok(!docs.includes('never `--focus`'),
+      'the allowlist accepts --focus for the calls that predate the session tool');
+    assert.ok(docs.includes('only ever passes\n`--no-focus`') || docs.includes('only ever passes'),
+      'the --focus sentence must state what the session tool actually passes');
   });
 });
