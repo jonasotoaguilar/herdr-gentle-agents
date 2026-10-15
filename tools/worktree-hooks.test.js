@@ -312,9 +312,10 @@ describe('worktree-hooks: dependency install', () => {
     const cargo = stepByName(result, 'install:cargo');
     assert.equal(cargo.status, 'failed');
     assert.ok((result.warnings || []).some((w) => /cargo/i.test(w)), `warning names cargo: ${JSON.stringify(result.warnings)}`);
-    // Remaining steps still ran: odd symlink + codegraph init.
-    const oddLink = path.join(worktree, 'odd');
-    assert.equal(fs.lstatSync(oddLink).isSymbolicLink(), true);
+    // Remaining steps still ran (codegraph init below); S21: there are
+    // no symlink steps anymore, so nothing is linked either.
+    assert.ok(!(result.steps || []).some((s) => s.name.startsWith('link:')), `no symlink steps: ${JSON.stringify((result.steps || []).map((s) => s.name))}`);
+    assert.equal(fs.existsSync(path.join(worktree, 'odd')), false, 'no odd/ is linked into the worktree');
     const lines = stubLog(stub.log);
     assert.ok(lines.some((l) => l.startsWith('codegraph init ')), `codegraph still ran: ${JSON.stringify(lines)}`);
     assert.equal(result.ok, false, 'overall ok reflects the failure');
@@ -342,59 +343,59 @@ describe('worktree-hooks: dependency install', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Symlinks.
+// No symlinks (S21: the S8 symlink hook is removed entirely).
 // ---------------------------------------------------------------------------
 
-describe('worktree-hooks: symlinks', () => {
-  test('odd/ is created in the principal when absent and symlinked RELATIVELY', () => {
-    const principal = makePrincipal('oddabsent');
-    const worktree = addLinkedWorktree(principal, 'hooks/oddabsent');
+describe('worktree-hooks: no symlinks', () => {
+  test('creation creates no symlinks even when the sources exist in the principal', () => {
+    const principal = makePrincipal('nosymlink');
+    const worktree = addLinkedWorktree(principal, 'hooks/nosymlink');
+    fs.mkdirSync(path.join(principal, 'odd'));
+    fs.writeFileSync(path.join(principal, 'odd', 'notes.md'), 'hi\n');
+    fs.mkdirSync(path.join(principal, '.agents'));
+    fs.writeFileSync(path.join(principal, '.agents', 'note.md'), 'hi\n');
+    fs.mkdirSync(path.join(principal, '.claude'));
+    fs.writeFileSync(path.join(principal, '.claude', 'note.md'), 'hi\n');
+    const stub = makeStubBin({ bins: [] });
+    const result = runHooks(principal, worktree, { env: envWithBinIsolated(stub) });
+    // No symlink step of any kind is reported.
+    assert.ok(!(result.steps || []).some((s) => s.name.startsWith('link:')), `no symlink steps: ${JSON.stringify((result.steps || []).map((s) => s.name))}`);
+    assert.ok(!(result.steps || []).some((s) => /symlink/i.test(s.name)), 'no step name mentions symlinks');
+    // Nothing is linked into the worktree, whatever exists upstream.
+    for (const subdir of ['odd', '.agents', '.claude']) {
+      assert.equal(fs.existsSync(path.join(worktree, subdir)), false, `${subdir} is not created in the worktree`);
+    }
+    // The principal sources are left exactly as they were (real dirs).
+    assert.equal(fs.lstatSync(path.join(principal, 'odd')).isSymbolicLink(), false);
+    assert.equal(fs.readFileSync(path.join(principal, 'odd', 'notes.md'), 'utf8'), 'hi\n');
+    // What remains is unchanged: env copies, stack installs, codegraph.
+    assert.ok(stepByName(result, 'copy-unversioned'), 'env-copy step still reported');
+    assert.ok(stepByName(result, 'install'), 'install step still reported');
+    assert.ok(stepByName(result, 'codegraph-init'), 'codegraph step still reported');
+    assert.equal(result.ok, true);
+  });
+
+  test('odd/ is NOT created in the principal: the link-only directory is gone', () => {
+    const principal = makePrincipal('noodd');
+    const worktree = addLinkedWorktree(principal, 'hooks/noodd');
     assert.equal(fs.existsSync(path.join(principal, 'odd')), false);
     const stub = makeStubBin({ bins: [] });
     const result = runHooks(principal, worktree, { env: envWithBinIsolated(stub) });
-    const principalOdd = path.join(principal, 'odd');
-    assert.equal(fs.statSync(principalOdd).isDirectory(), true);
-    const link = path.join(worktree, 'odd');
-    assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
-    const target = fs.readlinkSync(link);
-    assert.ok(!path.isAbsolute(target), `link target must be relative, got ${target}`);
-    assert.equal(path.resolve(worktree, target), principalOdd);
-    assert.equal(stepByName(result, 'link:odd').status, 'done');
+    assert.equal(fs.existsSync(path.join(principal, 'odd')), false, 'the hooks no longer create odd/ upstream');
+    assert.equal(fs.existsSync(path.join(worktree, 'odd')), false, 'and link nothing downstream');
+    assert.equal(stepByName(result, 'link:odd'), null, 'no link:odd step is reported');
   });
 
-  test('.agents/ is symlinked only when present; .codegraph/ is never symlinked', () => {
-    const principal = makePrincipal('agents');
-    const worktree = addLinkedWorktree(principal, 'hooks/agents');
-    fs.mkdirSync(path.join(principal, '.agents'));
-    fs.writeFileSync(path.join(principal, '.agents', 'note.md'), 'hi\n');
-    fs.mkdirSync(path.join(principal, '.codegraph'));
-    fs.writeFileSync(path.join(principal, '.codegraph', 'index.db'), 'x\n');
-    const stub = makeStubBin({ bins: [] });
-    const result = runHooks(principal, worktree, { env: envWithBinIsolated(stub) });
-    // .agents symlinked.
-    const agentsLink = path.join(worktree, '.agents');
-    assert.equal(fs.lstatSync(agentsLink).isSymbolicLink(), true);
-    assert.equal(path.resolve(worktree, fs.readlinkSync(agentsLink)), path.join(principal, '.agents'));
-    assert.equal(stepByName(result, 'link:.agents').status, 'done');
-    // .claude absent -> skipped.
-    assert.equal(fs.existsSync(path.join(worktree, '.claude')), false);
-    assert.equal(stepByName(result, 'link:.claude').status, 'skipped');
-    // .codegraph never symlinked even though it exists in the principal.
-    assert.equal(fs.existsSync(path.join(worktree, '.codegraph')), false);
-    assert.ok(!(result.steps || []).some((s) => s.name.includes('codegraph') && s.name.includes('link')));
-  });
-
-  test('an existing path in the worktree is never replaced', () => {
-    const principal = makePrincipal('existlink');
-    const worktree = addLinkedWorktree(principal, 'hooks/existlink');
+  test('a worktree-owned .agents/ directory is left untouched', () => {
+    const principal = makePrincipal('ownagents');
+    const worktree = addLinkedWorktree(principal, 'hooks/ownagents');
     fs.mkdirSync(path.join(principal, '.agents'));
     fs.mkdirSync(path.join(worktree, '.agents'));
     fs.writeFileSync(path.join(worktree, '.agents', 'mine.md'), 'mine\n');
     const stub = makeStubBin({ bins: [] });
-    const result = runHooks(principal, worktree, { env: envWithBinIsolated(stub) });
+    runHooks(principal, worktree, { env: envWithBinIsolated(stub) });
     assert.equal(fs.lstatSync(path.join(worktree, '.agents')).isSymbolicLink(), false);
     assert.equal(fs.readFileSync(path.join(worktree, '.agents', 'mine.md'), 'utf8'), 'mine\n');
-    assert.equal(stepByName(result, 'link:.agents').status, 'skipped');
   });
 });
 
@@ -445,7 +446,7 @@ describe('worktree-hooks: idempotency', () => {
     const second = runHooks(principal, worktree, { env });
     assert.equal(fs.readFileSync(path.join(worktree, '.env'), 'utf8'), 'TAINTED=1\n');
     assert.equal(stepByName(second, 'copy-unversioned').status, 'skipped');
-    assert.equal(stepByName(second, 'link:odd').status, 'skipped');
+    assert.ok(!(second.steps || []).some((s) => s.name.startsWith('link:')), 'no symlink steps on a second run either');
   });
 });
 
@@ -584,9 +585,10 @@ describe('worktree_create hook wiring', { concurrency: false }, () => {
       assert.equal(result.isError, undefined, `hooks must never fail creation: ${JSON.stringify(result)}`);
       const text = (result.content || []).map((p) => p.text || '').join('\n');
       assert.equal(text, `worktree create: ${target}`);
-      // Hook side effects happened.
+      // Hook side effects happened: the env copy lands, and S21 means no
+      // odd/ symlink is created in the worktree.
       assert.equal(fs.readFileSync(path.join(target, '.env'), 'utf8'), 'HOOKED=1\n');
-      assert.equal(fs.lstatSync(path.join(target, 'odd')).isSymbolicLink(), true);
+      assert.equal(fs.existsSync(path.join(target, 'odd')), false, 'creation creates no symlinks');
       // Hook steps + warnings are reported inside details and failures visible.
       assert.ok(result.details && result.details.hooks, 'expected details.hooks');
       assert.ok(Array.isArray(result.details.hooks.steps), 'expected steps array');

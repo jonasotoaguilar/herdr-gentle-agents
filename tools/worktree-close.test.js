@@ -376,7 +376,7 @@ describe('worktree_list registration', { concurrency: false }, () => {
 });
 
 describe('worktree_list output', { concurrency: false }, () => {
-  test('an empty registry lists exactly `worktree list: none`', async () => {
+  test('an empty registry lists exactly the principal line (`none` is retired)', async () => {
     const root = makeRepo('list-empty');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([35]);
@@ -385,12 +385,16 @@ describe('worktree_list output', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
+      // S19 retires `worktree list: none`: with no agent worktrees the
+      // output is exactly the principal line.
+      const branch = git(root, ['branch', '--show-current']);
+      const expected = `worktree list: ${root} ${branch} principal`;
       const plain = await callList(tools, {}, ctx);
       assert.equal(plain.isError, undefined);
-      assert.equal(resultText(plain), 'worktree list: none');
+      assert.equal(resultText(plain), expected);
       const withAll = await callList(tools, { all: true }, ctx);
       assert.equal(withAll.isError, undefined);
-      assert.equal(resultText(withAll), 'worktree list: none');
+      assert.equal(resultText(withAll), expected);
       // Listing never creates the registry file.
       assert.equal(registryBytes(root), null);
     } finally {
@@ -414,9 +418,11 @@ describe('worktree_list output', { concurrency: false }, () => {
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callList(tools, {}, ctx);
       assert.equal(result.isError, undefined);
+      const branch = git(root, ['branch', '--show-current']);
       assert.equal(
         resultText(result),
-        `worktree list: ${first} feat/one thread=thread-1 issues=35\n`
+        `worktree list: ${root} ${branch} principal\n`
+        + `worktree list: ${first} feat/one thread=thread-1 issues=35\n`
         + `worktree list: ${second} feat/two thread=thread-2 issues=35,7`,
       );
       // The list never mutates the registry file and leaves no lock behind.
@@ -442,12 +448,13 @@ describe('worktree_list output', { concurrency: false }, () => {
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callList(tools, {}, ctx);
       assert.equal(result.isError, undefined);
-      // S16 self-heal: nothing registered and real, so the listing is
-      // empty — and the dead row is pruned from the registry, named in
-      // details.pruned and in the warning (which also says git may still
-      // record the checkout until `git worktree prune`).
-      assert.equal(resultText(result), 'worktree list: none');
-      assert.deepEqual(result.details.worktrees, []);
+      // S16 self-heal: nothing registered and real, so the listing is the
+      // principal line alone — and the dead row is pruned from the
+      // registry, named in details.pruned and in the warning (which also
+      // says git may still record the checkout until `git worktree prune`).
+      const branch = git(root, ['branch', '--show-current']);
+      assert.equal(resultText(result), `worktree list: ${root} ${branch} principal`);
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal']);
       assert.deepEqual(result.details.pruned, [target]);
       assert.ok(
         result.details.warnings.join('\n').includes(target),
@@ -474,15 +481,18 @@ describe('worktree_list output', { concurrency: false }, () => {
 
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
+      const branch = git(root, ['branch', '--show-current']);
       const plain = await callList(tools, {}, ctx);
       assert.equal(
         resultText(plain),
-        `worktree list: ${known} feat/known thread=thread-1 issues=35`,
+        `worktree list: ${root} ${branch} principal\n`
+        + `worktree list: ${known} feat/known thread=thread-1 issues=35`,
       );
       const all = await callList(tools, { all: true }, ctx);
       assert.equal(
         resultText(all),
-        `worktree list: ${known} feat/known thread=thread-1 issues=35\n`
+        `worktree list: ${root} ${branch} principal\n`
+        + `worktree list: ${known} feat/known thread=thread-1 issues=35\n`
         + `worktree list: ${ghost} feat/ghost unregistered`,
       );
       assert.deepEqual(registryBytes(root), before, 'listing never mutates the registry');
@@ -681,6 +691,49 @@ describe('worktree_close', { concurrency: false }, () => {
       const registryLib = require('../lib/worktree-registry.js');
       assert.equal(registryLib.findByBranch(root, 'feat/dirty').path, target);
       assert.equal(fs.readFileSync(path.join(target, 'scratch.txt'), 'utf8'), 'untracked\n');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S21: a tool-created checkout with no env files closes WITHOUT force', async () => {
+    // S21 removed every symlink step from the creation hooks, so a
+    // fixture with no .env files, no lockfiles and no `codegraph` binary
+    // yields a clean checkout: git's own dirty refusal never fires and no
+    // --force is needed. (With env copies or a `codegraph init` laying
+    // down untracked files, force is still required.) PATH is filtered so
+    // any installed `codegraph` cannot dirty the fixture.
+    const root = makeRepo('close-clean-created');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    const cleanPath = String(process.env.PATH || '').split(path.delimiter).filter((dir) => {
+      try {
+        fs.accessSync(path.join(dir, 'codegraph'), fs.constants.X_OK);
+        return false;
+      } catch {
+        return true;
+      }
+    }).join(path.delimiter);
+    setEnv({ ...stdEnv({ herdr, gh, modeEnv }), PATH: cleanPath });
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const created = await tools.get('worktree_create').execute(
+        'call-1', { branch: 'feat/clean-close', issues: [35] }, undefined, undefined, ctx,
+      );
+      assert.equal(created.isError, undefined, `setup create failed: ${resultText(created)}`);
+      const target = created.details.path;
+      assert.equal(fs.existsSync(path.join(target, 'odd')), false, 'no hook-created odd symlink dirties the checkout');
+      const result = await callClose(tools, { branch: 'feat/clean-close' }, ctx);
+      assert.equal(result.isError, undefined, `clean tool-created checkout closes without force, got: ${resultText(result)}`);
+      assert.equal(resultText(result), `worktree close: ${target}`);
+      assert.ok(!livePaths(root).includes(target), 'checkout removed');
+      assert.equal(branchExists(root, 'feat/clean-close'), true, 'the branch is kept');
+      const calls = shimArgv(herdr.log);
+      const removeLine = calls.find((line) => line.startsWith('worktree remove '));
+      assert.ok(removeLine, `herdr remove ran: ${JSON.stringify(calls)}`);
+      assert.ok(!removeLine.split(' ').includes('--force'), `no --force was passed: ${removeLine}`);
     } finally {
       restoreEnv();
     }
