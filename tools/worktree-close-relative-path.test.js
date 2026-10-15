@@ -401,7 +401,7 @@ describe('worktree_close with a relative registry path', { concurrency: false },
         `the relative entry is missing, never live: ${text}`,
       );
       assert.ok(
-        text.includes(`${far} feat-b thread=thread-2 issues=35`) && !text.split('\n').find((line) => line.includes('feat-b')).endsWith(' missing'),
+        text.split('\n').some((line) => line.startsWith('worktree list: feat-b feat-b thread=thread-2 issues=35')) && !text.split('\n').find((line) => line.includes('feat-b')).endsWith(' missing'),
         `the absolute entry stays live: ${text}`,
       );
       void nested;
