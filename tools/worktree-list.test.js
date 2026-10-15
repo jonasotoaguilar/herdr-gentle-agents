@@ -564,7 +564,7 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
     }
   });
 
-  test('session in an unregistered checkout with all:true: principal first, checkout still unregistered', async () => {
+  test('session in an unregistered checkout with all:true: session checkout first, then principal', async () => {
     const root = makeRepo('s19-session-ghost');
     setEnv(stdEnv());
     try {
@@ -575,17 +575,19 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       const result = await tools.get('worktree_list').execute('call-1', { all: true }, undefined, undefined, makeCtx(ghost));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      // F2: S19's session-first rule covers the unregistered session
+      // checkout too — it leads, the principal follows immediately.
       assert.equal(
         text,
-        `${principalLine(root)}\n`
-        + `worktree list: ${known} feat/known thread=thread-1 issues=35\n`
-        + `worktree list: ${ghost} feat/ghost unregistered`,
+        `worktree list: ${ghost} feat/ghost unregistered\n`
+        + `${principalLine(root)}\n`
+        + `worktree list: ${known} feat/known thread=thread-1 issues=35`,
       );
       const ghostItem = result.details.worktrees.find((item) => item.path === ghost);
       assert.ok(ghostItem, 'the session checkout is still reported');
       assert.equal(ghostItem.status, 'unregistered');
       assert.equal(ghostItem.kind, 'unregistered');
-      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal', 'agent', 'unregistered']);
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['unregistered', 'principal', 'agent']);
     } finally {
       restoreEnv();
     }
@@ -688,6 +690,151 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
         [principalLine(root), ...resultText(first).split('\n').slice(1)],
       );
       assert.equal(resultText(first).split('\n').length, 3);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('F1: symlink spellings resolve through the same identity rule', { concurrency: false }, () => {
+  function principalBranch(root) {
+    return git(root, ['branch', '--show-current']);
+  }
+
+  test('symlink cwd to the principal yields exactly the principal line, never none', async () => {
+    const root = makeRepo('f1-symlink-principal');
+    setEnv(stdEnv());
+    try {
+      const link = path.join(path.dirname(root), `${path.basename(root)}-principal-link`);
+      track(link);
+      fs.symlinkSync(root, link);
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(link));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.equal(result.details.worktrees[0].kind, 'principal');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('symlink cwd to a registered worktree puts that worktree first, principal second', async () => {
+    const root = makeRepo('f1-symlink-worktree');
+    setEnv(stdEnv());
+    try {
+      const first = addRegistered(root, 'feat/one', { thread: 'thread-1', issues: [35] });
+      const second = addRegistered(root, 'feat/two', { thread: 'thread-2', issues: [7] });
+      const link = path.join(path.dirname(root), `${path.basename(root)}-wt-link`);
+      track(link);
+      fs.symlinkSync(second, link);
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(link));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const lines = text.split('\n');
+      assert.equal(lines[0], `worktree list: ${second} feat/two thread=thread-2 issues=7`);
+      assert.equal(lines[1], `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.ok(lines[2].includes('feat/one'), `remaining row follows: ${text}`);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [second, root, first]);
+      assert.equal(result.details.worktrees[0].kind, 'agent');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('symlink cwd to a worktree subdirectory keeps that worktree first', async () => {
+    const root = makeRepo('f1-symlink-sub');
+    setEnv(stdEnv());
+    try {
+      const first = addRegistered(root, 'feat/one', { thread: 'thread-1', issues: [35] });
+      const second = addRegistered(root, 'feat/two', { thread: 'thread-2', issues: [7] });
+      fs.mkdirSync(path.join(second, 'sub'), { recursive: true });
+      const link = path.join(path.dirname(root), `${path.basename(root)}-sub-link`);
+      track(link);
+      fs.symlinkSync(second, link);
+      const tools = await loadExtension();
+      const cwd = path.join(link, 'sub');
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(cwd));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const lines = text.split('\n');
+      assert.equal(lines[0], `worktree list: ${second} feat/two thread=thread-2 issues=7`);
+      assert.equal(lines[1], `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [second, root, first]);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a subdirectory of the principal still resolves the principal from the common dir', async () => {
+    const root = makeRepo('f1-subdir-principal');
+    setEnv(stdEnv());
+    try {
+      const sub = track(path.join(root, 'tools'));
+      fs.mkdirSync(sub, { recursive: true });
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(sub));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.equal(result.details.worktrees[0].kind, 'principal');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a symlinked subdirectory of the principal still resolves the principal', async () => {
+    const root = makeRepo('f1-symlink-subdir-principal');
+    setEnv(stdEnv());
+    try {
+      const sub = track(path.join(root, 'tools'));
+      fs.mkdirSync(sub, { recursive: true });
+      const link = path.join(path.dirname(root), `${path.basename(root)}-subdir-link`);
+      track(link);
+      fs.symlinkSync(sub, link);
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(link));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.equal(text, `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.equal(result.details.worktrees[0].kind, 'principal');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('F2: unregistered session checkout is first with all:true', { concurrency: false }, () => {
+  function principalBranch(root) {
+    return git(root, ['branch', '--show-current']);
+  }
+
+  function addUnregisteredWorktree(root, branch) {
+    const slug = branch.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'worktree';
+    const target = path.join(path.dirname(root), `${path.basename(root)}-wt-${slug}`);
+    track(target);
+    git(root, ['worktree', 'add', '-b', branch, target, 'HEAD']);
+    return fs.realpathSync(target);
+  }
+
+  test('session inside its own unregistered checkout sees it first, then the principal', async () => {
+    const root = makeRepo('f2-unregistered-first');
+    setEnv(stdEnv());
+    try {
+      const known = addRegistered(root, 'feat/known', { thread: 'thread-1', issues: [35] });
+      const ghost = addUnregisteredWorktree(root, 'feat/ghost');
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', { all: true }, undefined, undefined, makeCtx(ghost));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const lines = text.split('\n');
+      assert.equal(lines[0], `worktree list: ${ghost} feat/ghost unregistered`);
+      assert.equal(lines[1], `worktree list: ${root} ${principalBranch(root)} principal`);
+      assert.ok(lines[2].includes('feat/known'), `registered row follows: ${text}`);
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['unregistered', 'principal', 'agent']);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [ghost, root, known]);
+      assert.equal(result.details.worktrees[0].status, 'unregistered');
     } finally {
       restoreEnv();
     }

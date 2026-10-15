@@ -1641,7 +1641,7 @@ describe('S22: any pre-existing entry at the target is refused before any backen
       fs.mkdirSync(target, { recursive: true });
       const before = listWorktreePaths(root);
       const refused = await callCreate(tools, { branch: 'feat/occupied', issues: [35] }, ctx);
-      assertOccupantRefusal(refused, target, /empty directory/i);
+      assertOccupantRefusal(refused, target, /occupied by an empty directory/i);
       assert.deepEqual(listWorktreePaths(root), before, 'no checkout is added');
       assert.ok(fs.existsSync(target), 'the occupant is left for the caller to remove');
       assertNoBackendNoRegistry(root, herdr, { branch: 'feat/occupied' });
@@ -1735,7 +1735,9 @@ describe('S22: any pre-existing entry at the target is refused before any backen
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.symlinkSync(path.join(path.dirname(target), 'nowhere-gone'), target);
       const refused = await callCreate(tools, { branch: 'feat/dangle', issues: [35] }, ctx);
-      assertOccupantRefusal(refused, target, /dangling symlink/i);
+      // F4: a dangling link names no referent — a plain symlink refusal.
+      const dangleText = assertOccupantRefusal(refused, target, /occupied by a symlink:/i);
+      assert.ok(!/to a file|to a directory/i.test(dangleText), `names no referent: ${dangleText}`);
       assertNoBackendNoRegistry(root, herdr, { branch: 'feat/dangle' });
     } finally {
       restoreEnv();
@@ -1783,6 +1785,103 @@ describe('S22: any pre-existing entry at the target is refused before any backen
       assert.equal(second.isError, undefined);
       assert.equal(resultText(second), `worktree create: ${target}`);
       assert.equal(second.details.created, false, 'the own checkout returns created:false, never a refusal');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('F4: symlink occupant names its referent', { concurrency: false }, () => {
+  function stdEnv(herdr, gh, modeEnv) {
+    return {
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_SHIM_EXIT: undefined,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    };
+  }
+
+  test('a symlink to a FILE is refused as a symlink to a file', async () => {
+    const root = makeRepo('f4-linkfile');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-f4-file' });
+      const target = expectedTarget(root, 'feat-f4file');
+      track(target);
+      const referent = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-referent-')));
+      const referentFile = path.join(referent, 'real.txt');
+      fs.writeFileSync(referentFile, 'real\n');
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(referentFile, target);
+      const result = await callCreate(tools, { branch: 'feat/f4file', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, true);
+      assert.ok(text.includes(target), `names the occupant path: ${text}`);
+      assert.match(text, /occupied by a symlink to a file/i, `names the file referent: ${text}`);
+      assert.match(text, /remove it by hand or pick another branch/i);
+      assert.deepEqual(shimArgv(herdr.log), [], 'no backend ran');
+      assert.deepEqual(require('../lib/worktree-registry.js').readRegistry(root).worktrees, [], 'no registry row is written');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a symlink to a DIRECTORY is refused as a symlink to a directory', async () => {
+    const root = makeRepo('f4-linkdir');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-f4-dir' });
+      const target = expectedTarget(root, 'feat-f4dir');
+      track(target);
+      const referent = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-referent-')));
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(referent, target);
+      const result = await callCreate(tools, { branch: 'feat/f4dir', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, true);
+      assert.ok(text.includes(target), `names the occupant path: ${text}`);
+      assert.match(text, /occupied by a symlink to a directory/i, `names the directory referent: ${text}`);
+      assert.match(text, /remove it by hand or pick another branch/i);
+      assert.deepEqual(shimArgv(herdr.log), [], 'no backend ran');
+      assert.deepEqual(require('../lib/worktree-registry.js').readRegistry(root).worktrees, [], 'no registry row is written');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a DANGLING symlink is refused as a plain symlink', async () => {
+    const root = makeRepo('f4-dangle');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-f4-dangle' });
+      const target = expectedTarget(root, 'feat-f4dangle');
+      track(target);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(path.join(path.dirname(target), 'nowhere-gone'), target);
+      const result = await callCreate(tools, { branch: 'feat/f4dangle', issues: [35] }, ctx);
+      const text = resultText(result);
+      assert.equal(result.isError, true);
+      assert.ok(text.includes(target), `names the occupant path: ${text}`);
+      assert.match(text, /occupied by a symlink:/, `dangling stays a plain symlink: ${text}`);
+      assert.ok(!/to a file|to a directory/i.test(text), `names no referent: ${text}`);
+      assert.match(text, /remove it by hand or pick another branch/i);
+      assert.deepEqual(shimArgv(herdr.log), [], 'no backend ran');
+      assert.deepEqual(require('../lib/worktree-registry.js').readRegistry(root).worktrees, [], 'no registry row is written');
     } finally {
       restoreEnv();
     }

@@ -401,8 +401,12 @@ async function executeWorktreeCreate(params, ctx) {
         } catch {
           stat = null;
         }
-        if (!stat) occupantKind = "dangling symlink";
+        // Name the referent when it resolves: a symlink to a file or to
+        // a directory says so; a dangling link (nothing resolves) stays
+        // a plain symlink with no referent to name.
+        if (!stat) occupantKind = "symlink";
         else if (stat.isDirectory()) occupantKind = "symlink to a directory";
+        else if (stat.isFile()) occupantKind = "symlink to a file";
         else occupantKind = "symlink";
       } else if (lst.isFile()) {
         occupantKind = "file";
@@ -425,8 +429,10 @@ async function executeWorktreeCreate(params, ctx) {
       occupantKind = null;
     }
     if (occupantKind !== null) {
+      // "a empty directory" reads wrong; the article follows the kind.
+      const article = /^[aeiou]/i.test(occupantKind) ? "an" : "a";
       return errorResult(
-        `target path ${target} is occupied by a ${occupantKind}: remove it by hand or pick another branch; the registry was left untouched`,
+        `target path ${target} is occupied by ${article} ${occupantKind}: remove it by hand or pick another branch; the registry was left untouched`,
         { branch, issues: issueNumbers, path: target, pruned: prunedStale },
       );
     }
@@ -867,15 +873,20 @@ async function executeWorktreeList(params, ctx) {
   // the shared common dir instead — for a normal repository
   // <principal>/.git is the common dir, the same recovery runCreationHooks
   // uses for its sources. The principal is the listing entry whose
-  // resolved path equals that main root. It is printed distinguished
-  // (`principal`, never thread=/issues=), is never pruned (the registry
-  // holds agent rows only) and is never reported as unregistered. When no
-  // listing entry matches, no principal line is invented.
+  // resolved identity equals that main root: realpath with an absolute
+  // fallback (the same rule checkoutState uses, never the process cwd),
+  // so a symlink spelling of the principal still finds it. It is printed
+  // distinguished (`principal`, never thread=/issues=), is never pruned
+  // (the registry holds agent rows only) and is never reported as
+  // unregistered. When no listing entry matches, no principal line is
+  // invented.
   let principalEntry = null;
   let principalPath = null;
   if (typeof repo.commonDir === "string" && path.basename(repo.commonDir) === ".git") {
     try {
-      principalPath = path.resolve(path.dirname(repo.commonDir));
+      const rawPrincipal = path.resolve(path.dirname(repo.commonDir));
+      const principalState = checkoutState(rawPrincipal, repo.root);
+      principalPath = principalState.real !== null ? principalState.real : principalState.absolute;
     } catch {
       principalPath = null;
     }
@@ -884,7 +895,9 @@ async function executeWorktreeList(params, ctx) {
     for (const entry of live) {
       if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
       const st = checkoutState(entry.path, repo.root);
-      if (st.absolute !== null && st.absolute === principalPath) {
+      if (st.absolute === null) continue;
+      const entryId = st.real !== null ? st.real : st.absolute;
+      if (entryId === principalPath) {
         principalEntry = entry;
         break;
       }
@@ -950,26 +963,33 @@ async function executeWorktreeList(params, ctx) {
   // S19: the session's own checkout is the FIRST line, whether that is
   // the principal or a registered worktree — the checkout containing or
   // equal to the tool context's cwd, deepest match winning, the
-  // principal as a candidate. A session outside every checkout (or inside
-  // an unregistered one) gets the principal first. Then the principal
-  // (when the first line was a worktree), then the remaining agent rows
-  // in registry order. The agent-row text contract is unchanged.
-  const sessionCwd = path.resolve(cwd);
+  // principal as a candidate. Identity is realpath with an absolute
+  // fallback on both legs (never the process cwd and never a lexical
+  // resolve alone), so a symlink spelling of a checkout — or of a
+  // subdirectory inside one — still matches that checkout. A session
+  // outside every checkout (or inside an unregistered one, without
+  // all:true) gets the principal first. Then the principal (when the
+  // first line was a worktree), then the remaining agent rows in registry
+  // order. The agent-row text contract is unchanged.
+  const sessionState = checkoutState(cwd, repo.root);
+  const sessionTarget = sessionState.real !== null ? sessionState.real : sessionState.absolute;
   const containsOrEquals = (base, target) => target === base || target.startsWith(base + path.sep);
   let sessionAgent = -1;
   let bestLen = -1;
-  if (principalItem !== null && containsOrEquals(principalItem.path, sessionCwd)) {
-    bestLen = principalItem.path.length;
+  if (principalItem !== null && sessionTarget !== null) {
+    const principalState = checkoutState(principalItem.path, repo.root);
+    const principalBase = principalState.real !== null ? principalState.real : principalState.absolute;
+    if (principalBase !== null && containsOrEquals(principalBase, sessionTarget)) {
+      bestLen = principalBase.length;
+    }
   }
   agentRows.forEach((row, index) => {
     if (typeof row.item.path !== "string" || !path.isAbsolute(row.item.path)) return;
-    let base;
-    try {
-      base = path.resolve(row.item.path);
-    } catch {
-      return;
-    }
-    if (containsOrEquals(base, sessionCwd) && base.length > bestLen) {
+    if (sessionTarget === null) return;
+    const rowState = checkoutState(row.item.path, repo.root);
+    const base = rowState.real !== null ? rowState.real : rowState.absolute;
+    if (base === null) return;
+    if (containsOrEquals(base, sessionTarget) && base.length > bestLen) {
       sessionAgent = index;
       bestLen = base.length;
     }
@@ -1050,9 +1070,11 @@ async function executeWorktreeList(params, ctx) {
     // The principal checkout is never an extra: it already has its
     // distinguished line. Any other live checkout the registry does not
     // know about — including the session's own checkout when it is
-    // unregistered — is reported. When no principal could be determined,
-    // the caller's checkout keeps the old exclusion so the degenerate
-    // listing stays exactly `worktree list: none`.
+    // unregistered — is reported. The principal exclusion is by resolved
+    // identity (realpath with absolute fallback), so a symlink spelling
+    // of the principal never surfaces as unregistered. When no principal
+    // could be determined, the caller's checkout keeps the old exclusion
+    // so the degenerate listing stays exactly `worktree list: none`.
     const self = principalPath !== null ? principalPath : path.resolve(repo.root);
     const extra = live
       .filter((entry) => {
@@ -1063,17 +1085,60 @@ async function executeWorktreeList(params, ctx) {
         if (st.absolute === null || !st.exists || !st.isDirectory) return false;
         if (registered.has(st.absolute)) return false;
         if (st.real !== null && registered.has(st.real)) return false;
-        if (st.absolute === self) return false;
+        const entryId = st.real !== null ? st.real : st.absolute;
+        if (entryId === self) return false;
         return true;
       })
       .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-    for (const entry of extra) {
+    // F2/S19: the session's OWN unregistered checkout is the FIRST line.
+    // When the session runs inside a live checkout the registry does not
+    // know about, that checkout leads — the principal follows immediately
+    // (when the session is not in it), then the agent rows in registry
+    // order, then the remaining unregistered extras in path order. The
+    // match is deepest-containing on resolved identity, the same rule as
+    // the registered session match above. Every other ordering and the
+    // agent-row text contract are unchanged.
+    let sessionExtra = -1;
+    let sessionBest = -1;
+    if (sessionTarget !== null) {
+      extra.forEach((entry, index) => {
+        const st = checkoutState(entry.path, repo.root);
+        const base = st.real !== null ? st.real : st.absolute;
+        if (base === null) return;
+        if (containsOrEquals(base, sessionTarget) && base.length > sessionBest) {
+          sessionExtra = index;
+          sessionBest = base.length;
+        }
+      });
+    }
+    const orderedExtra = sessionExtra >= 0
+      ? [extra[sessionExtra], ...extra.filter((_, index) => index !== sessionExtra)]
+      : extra;
+    const extraLines = [];
+    for (const entry of orderedExtra) {
       const branch = entry.branch || "(detached)";
       // Report the resolved absolute form so details.worktrees never
       // carries a relative spelling or a path that does not exist.
       const shown = checkoutState(entry.path, repo.root).absolute || entry.path;
-      lines.push(`worktree list: ${shown} ${branch} unregistered`);
-      items.push({ path: shown, branch, thread: null, issues: [], status: "unregistered", kind: "unregistered" });
+      extraLines.push({
+        line: `worktree list: ${shown} ${branch} unregistered`,
+        item: { path: shown, branch, thread: null, issues: [], status: "unregistered", kind: "unregistered" },
+      });
+    }
+    if (sessionExtra >= 0) {
+      // The session's own checkout leads; everything already in
+      // lines/items (principal, then agents in registry order) follows.
+      lines.unshift(extraLines[0].line);
+      items.unshift(extraLines[0].item);
+      for (const rest of extraLines.slice(1)) {
+        lines.push(rest.line);
+        items.push(rest.item);
+      }
+    } else {
+      for (const rest of extraLines) {
+        lines.push(rest.line);
+        items.push(rest.item);
+      }
     }
   }
   // S19 retires `worktree list: none`: with the principal line always
