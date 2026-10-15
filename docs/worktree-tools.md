@@ -86,9 +86,16 @@ worktree list: <name> <branch> unregistered        # only with all: true
 
 The FIRST column is the NAME (S24): the flattened branch slug
 (`feat/worktree-warp` → `feat-worktree-warp`), or `principal` for the
-principal checkout — exactly the identifier the warp verb accepts and the
-close `name` selector takes. The absolute path is not dropped: it stays in
-`details.worktrees[].path` (alongside `details.worktrees[].name`).
+principal checkout — the identifier the warp verb accepts and the close
+`name` selector takes for every registered row and for the principal. The
+absolute path is not dropped: it stays in `details.worktrees[].path`
+(alongside `details.worktrees[].name`). Two cases are printed but NOT
+selectable by name, and both fail closed instead of picking a checkout: an
+unregistered checkout, whose name is shown with `all: true` while close and
+warp act on registered rows only; and any name that more than one live
+checkout carries — including `principal`, which is reserved, so a branch
+whose slug is also `principal` makes that name ambiguous. Pass the path or
+the branch in those cases.
 
 The principal checkout (S19) is the main worktree of git's listing — the
 entry whose resolved path equals the main root recovered from the shared
@@ -427,8 +434,10 @@ command verb, never a `worktree_warp` tool: session control
 (`waitForIdle`/`switchSession`) lives on the extension command context, so
 a tool context cannot do this. The name resolves through the same resolver
 as close-by-name — one place, never two: an unknown name fails closed
-naming the known ones, and two rows flattening to one name are ambiguous
-and fail closed naming both.
+naming the closest names (up to three), and a name that more than one live
+checkout carries is ambiguous and fails closed naming each of them, with the
+unregistered one marked as such. `principal` is reserved, so a branch whose
+slug is also `principal` makes that name ambiguous too.
 
 Success text is `worktree warp: <name> -> <path>`; warping to the checkout
 the session already runs in reports `worktree warp: <name> (already there)`
@@ -447,7 +456,8 @@ it removes the target session file, reports it, and changes nothing else.
 Honest scope of the move: the SESSION cwd changes and the tools operate in
 the target, while the PROCESS cwd does not (Pi never calls `process.chdir`).
 After a successful switch the command emits OSC-7
-(`ESC ] 7 ; file://<cwd> ESC \`, only when the output stream is a TTY) so
+(`ESC ] 7 ; <file-url> ESC \`, a percent-encoded `file://` URL of the new
+cwd, only when the output stream is a TTY) so
 the TERMINAL learns the new cwd, and Herdr follows it natively: it embeds
 ghostty-vt, whose `pwd_changed` callback is documented as fired by OSC 7,
 so its pane pwd tracks the emission and new panes, tabs and workspaces with

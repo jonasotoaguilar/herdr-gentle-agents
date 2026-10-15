@@ -1124,4 +1124,66 @@ describe('S24: worktree_close accepts name (T33 RED)', { concurrency: false }, (
       restoreEnv();
     }
   });
+
+  test('a branch whose slug is the reserved name principal makes that name ambiguous', async () => {
+    const root = makeRepo('close-principal-clash');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      // `principal` is a valid branch name, so the tool can register it; the
+      // listing then shows that name on two different checkouts.
+      const clash = addRegistered(root, 'principal', { thread: 'thread-1', issues: [35] });
+      const beforeLive = livePaths(root);
+      const beforeRegistry = registryBytes(root);
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const refused = await callClose(tools, { name: 'principal' }, ctx);
+      assert.equal(refused.isError, true, 'the reserved name never picks one');
+      assert.match(resultText(refused), /ambiguous/i);
+      assert.ok(resultText(refused).includes('principal'), `names the clash: ${resultText(refused)}`);
+      assert.deepEqual(livePaths(root), beforeLive, 'no checkout touched');
+      assert.deepEqual(registryBytes(root), beforeRegistry, 'registry untouched');
+      assert.ok(livePaths(root).includes(clash));
+      // The row stays reachable by branch, which is unambiguous.
+      const byBranch = await callClose(tools, { branch: 'principal' }, ctx);
+      assert.equal(byBranch.isError, undefined, `the branch still resolves: ${resultText(byBranch)}`);
+      assert.equal(resultText(byBranch), `worktree close: ${clash}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an unregistered checkout sharing the printed name makes it ambiguous', async () => {
+    const root = makeRepo('close-unregistered-clash');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const registered = addRegistered(root, 'feat/mix', { thread: 'thread-1', issues: [35] });
+      // A second live checkout whose branch flattens to the same name; it is
+      // printed by `all: true` under that name but is never registered.
+      const other = path.join(path.dirname(root), `${path.basename(root)}-unreg-mix`);
+      track(other);
+      git(root, ['worktree', 'add', '-b', 'feat-mix', other, 'HEAD']);
+      const unregistered = fs.realpathSync(other);
+      const beforeRegistry = registryBytes(root);
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const refused = await callClose(tools, { name: 'feat-mix' }, ctx);
+      assert.equal(refused.isError, true, 'a name two live checkouts share never picks one');
+      assert.match(resultText(refused), /ambiguous/i);
+      const text = resultText(refused);
+      assert.ok(text.includes('feat/mix') && text.includes('feat-mix'), `names both rows: ${text}`);
+      assert.match(text, /unregistered/, `says which one is unregistered: ${text}`);
+      assert.ok(livePaths(root).includes(registered), 'the registered checkout survives');
+      assert.ok(livePaths(root).includes(unregistered), 'the unregistered checkout survives');
+      assert.deepEqual(registryBytes(root), beforeRegistry, 'registry untouched');
+      assert.deepEqual(shimArgv(herdr.log), [], 'herdr never invoked');
+    } finally {
+      restoreEnv();
+    }
+  });
 });

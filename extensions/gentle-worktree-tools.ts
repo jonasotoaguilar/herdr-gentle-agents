@@ -16,7 +16,7 @@ import { defineTool } from "@earendil-works/pi-coding-agent";
 import { createRequire } from "node:module";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 
@@ -1353,24 +1353,79 @@ function vanishedCheckouts(git, repoRoot, live, resolvedTarget, after) {
 // An unknown name fails closed; two registry rows flattening to one name
 // are AMBIGUOUS and fail closed naming every matching row, never picking
 // one.
-function resolveCheckoutByName(name, git, read, principal) {
+// Names are the flattened branch slug, and `principal` is reserved for the
+// principal checkout. A branch whose slug is also `principal`, or a live
+// checkout the registry does not own that shares a name with a registered
+// row, makes that name genuinely ambiguous to whoever read it in the
+// listing — so those cases fail closed instead of silently selecting one
+// checkout. The caller can always pass the path or the branch.
+function slugOf(git, branch) {
+  try {
+    const slug = typeof branch === "string" ? git.slugifyBranch(branch) : null;
+    return typeof slug === "string" && slug.length > 0 ? slug : null;
+  } catch {
+    return null;
+  }
+}
+
+function prefixScore(query, slug) {
+  const q = String(query);
+  const s = String(slug);
+  const shared = Math.min(q.length, s.length);
+  let score = 0;
+  while (score < shared && q[score] === s[score]) score += 1;
+  return score;
+}
+
+// Live checkouts git lists that no registry row owns, by resolved identity.
+// `all: true` prints them, so a name they share with a registered row is
+// ambiguous to the reader even though only the registered row is selectable.
+function liveUnregisteredEntries(rows, live, repoRoot) {
+  const owned = new Set();
+  for (const row of rows) {
+    if (!row || typeof row.path !== "string" || row.path.length === 0) continue;
+    const st = checkoutState(row.path, repoRoot);
+    if (st.absolute !== null) owned.add(st.absolute);
+    if (st.real !== null) owned.add(st.real);
+  }
+  const out = [];
+  for (const entry of live || []) {
+    if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
+    const st = checkoutState(entry.path, repoRoot);
+    const id = st.real !== null ? st.real : st.absolute;
+    if (id === null || owned.has(id)) continue;
+    out.push({ path: id, branch: entry.branch || "(detached)" });
+  }
+  return out;
+}
+
+function resolveCheckoutByName(name, git, read, principal, live, repoRoot) {
   const rows = read && Array.isArray(read.worktrees) ? read.worktrees : [];
+  const extras = liveUnregisteredEntries(rows, live, repoRoot);
   const knownNames = [];
   if (principal) knownNames.push("principal");
   const seen = new Set();
-  for (const row of rows) {
-    if (!row || typeof row.branch !== "string") continue;
-    let slug = null;
-    try {
-      slug = git.slugifyBranch(row.branch);
-    } catch {
-      slug = null;
-    }
-    if (typeof slug !== "string" || slug.length === 0 || seen.has(slug)) continue;
+  for (const item of [...rows, ...extras]) {
+    const slug = slugOf(git, item && item.branch);
+    if (slug === null || seen.has(slug)) continue;
     seen.add(slug);
     knownNames.push(slug);
   }
   if (name === "principal") {
+    const clashes = [];
+    for (const row of rows) {
+      if (slugOf(git, row && row.branch) === "principal") clashes.push(`'${row.branch}' at ${row.path}`);
+    }
+    for (const extra of extras) {
+      if (slugOf(git, extra.branch) === "principal") clashes.push(`'${extra.branch}' at ${extra.path} (unregistered)`);
+    }
+    if (clashes.length > 0) {
+      return {
+        ok: false,
+        error: `worktree name "principal" is ambiguous: it names the principal checkout and ${clashes.join(", ")}; pass the path or branch instead`,
+        candidates: knownNames,
+      };
+    }
     if (principal) {
       return {
         ok: true, kind: "principal", name: "principal",
@@ -1385,14 +1440,19 @@ function resolveCheckoutByName(name, git, read, principal) {
   }
   const matches = [];
   for (const row of rows) {
-    if (!row || typeof row.branch !== "string") continue;
-    let slug = null;
-    try {
-      slug = git.slugifyBranch(row.branch);
-    } catch {
-      slug = null;
-    }
-    if (slug === name) matches.push(row);
+    if (slugOf(git, row && row.branch) === name) matches.push(row);
+  }
+  const extraMatches = extras.filter((extra) => slugOf(git, extra.branch) === name);
+  if (matches.length + extraMatches.length > 1) {
+    const named = [
+      ...matches.map((row) => `'${row.branch}' at ${row.path}`),
+      ...extraMatches.map((extra) => `'${extra.branch}' at ${extra.path} (unregistered)`),
+    ].join(", ");
+    return {
+      ok: false,
+      error: `worktree name "${name}" is ambiguous: ${named}; pass the path or branch instead`,
+      candidates: knownNames,
+    };
   }
   if (matches.length === 1) {
     const row = matches[0];
@@ -1401,34 +1461,25 @@ function resolveCheckoutByName(name, git, read, principal) {
       path: row.path, branch: row.branch, entry: row,
     };
   }
-  if (matches.length > 1) {
-    const named = matches.map((row) => `'${row.branch}' at ${row.path}`).join(", ");
+  if (extraMatches.length === 1) {
+    const only = extraMatches[0];
     return {
       ok: false,
-      error: `worktree name "${name}" is ambiguous: ${named}; pass the path or branch instead`,
+      error: `no registered worktree for ${JSON.stringify(name)}: '${only.branch}' at ${only.path} is unregistered, and neither close nor warp acts on an unregistered checkout`,
       candidates: knownNames,
     };
   }
   // Unknown: fail closed in the style of the unknown-path error, naming
-  // the closest registered candidates by name.
-  const ranked = rows
-    .map((row) => {
-      let slug = "";
-      try {
-        slug = typeof row.branch === "string" ? git.slugifyBranch(row.branch) : "";
-      } catch {
-        slug = "";
-      }
-      const q = String(name);
-      const shared = Math.min(q.length, slug.length);
-      let score = 0;
-      while (score < shared && q[score] === slug[score]) score += 1;
-      return { row, slug, score };
-    })
-    .sort((a, b) => b.score - a.score)
+  // the closest known candidates by name.
+  const ranked = [
+    ...rows.map((row) => ({ branch: row && row.branch, path: row && row.path })),
+    ...extras,
+  ]
+    .map((item) => ({ item, slug: slugOf(git, item.branch) || "" }))
+    .sort((a, b) => prefixScore(name, b.slug) - prefixScore(name, a.slug))
     .slice(0, 3);
-  const named = ranked.map((item) => `'${item.slug}' (branch '${item.row.branch}') at ${item.row.path}`).join(", ");
-  const suffix = ranked.length > 0 ? `: closest registered worktrees: ${named}` : ": no worktrees are registered";
+  const named = ranked.map((item) => `'${item.slug}' (branch '${item.item.branch}') at ${item.item.path}`).join(", ");
+  const suffix = ranked.length > 0 ? `: closest worktrees: ${named}` : ": no worktrees are registered";
   return {
     ok: false,
     error: `no registered worktree for ${JSON.stringify(name)}${suffix}`,
@@ -1550,7 +1601,7 @@ async function executeWorktreeClose(params, ctx) {
         { name: rawName, force },
       );
     }
-    const resolved = resolveCheckoutByName(rawName, git, read, principalForName(git, repo.root, repo, liveForName));
+    const resolved = resolveCheckoutByName(rawName, git, read, principalForName(git, repo.root, repo, liveForName), liveForName, repo.root);
     if (!resolved.ok) {
       return errorResult(resolved.error, { query: rawName, candidates: resolved.candidates, force });
     }
@@ -2104,15 +2155,17 @@ function handleWorktreeOddEvent(event, ctx) {
 // its parent shell's cwd.
 // ---------------------------------------------------------------------------
 
-// Emit OSC-7 (`ESC ] 7 ; file://<cwd> ESC \`) announcing the session's
-// new cwd to the terminal — written ONLY when the stream is a TTY, so a
-// stream the TUI owns when it is not a TTY is never written to. The stream
-// is injectable so tests can assert the exact bytes.
+// Emit OSC-7 announcing the session's new cwd to the terminal — written
+// ONLY when the stream is a TTY, so a stream the TUI owns when it is not a
+// TTY is never written to. The payload is a file URL, so a path holding a
+// space or a non-ASCII character is percent-encoded instead of splitting
+// the OSC-7 argument. The stream is injectable so tests can assert the
+// exact bytes.
 function emitOsc7(stream, cwd) {
   try {
     if (!stream || stream.isTTY !== true || typeof stream.write !== "function") return false;
     if (typeof cwd !== "string" || cwd.length === 0) return false;
-    stream.write(`\x1b]7;file://${cwd}\x1b\\`);
+    stream.write(`\x1b]7;${pathToFileURL(cwd).href}\x1b\\`);
     return true;
   } catch {
     return false;
@@ -2205,7 +2258,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     return warpFail(`worktree warp: cannot list worktrees: ${(err && err.message) || err}`, { name, alreadyThere: false, cancelled: false });
   }
   // The SAME resolver as close-by-name: unknown or ambiguous fails closed.
-  const resolved = resolveCheckoutByName(name, git, read, principalForName(git, repo.root, repo, live));
+  const resolved = resolveCheckoutByName(name, git, read, principalForName(git, repo.root, repo, live), live, repo.root);
   if (!resolved.ok) {
     return warpFail(`worktree warp: ${resolved.error}`, { name, alreadyThere: false, cancelled: false, candidates: resolved.candidates });
   }
@@ -2216,10 +2269,29 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     : targetState.absolute !== null ? targetState.absolute
     : path.resolve(resolved.path);
   // Warping to the checkout the session already runs in reports that and
-  // changes nothing: no fork, no switch, no OSC-7.
+  // changes nothing: no fork, no switch, no OSC-7. "Already there" is the
+  // DEEPEST live checkout containing the session, the rule the listing
+  // already uses: a session inside a nested worktree under the principal
+  // is not in the principal, while a session in a subdirectory of the
+  // target is in the target.
   const sessionState = checkoutState(fromCwd, repo.root);
   const sessionId = sessionState.real !== null ? sessionState.real : sessionState.absolute;
-  if (sessionId !== null && (sessionId === targetCwd || sessionId.startsWith(targetCwd + path.sep))) {
+  let sessionCheckout = null;
+  if (sessionId !== null) {
+    const candidates = [targetCwd];
+    for (const entry of live) {
+      if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
+      const st = checkoutState(entry.path, repo.root);
+      const id = st.real !== null ? st.real : st.absolute;
+      if (id !== null) candidates.push(id);
+    }
+    for (const id of candidates) {
+      if (sessionId === id || sessionId.startsWith(id + path.sep)) {
+        if (sessionCheckout === null || id.length > sessionCheckout.length) sessionCheckout = id;
+      }
+    }
+  }
+  if (sessionCheckout !== null && sessionCheckout === targetCwd) {
     return {
       text: `worktree warp: ${name} (already there)`,
       details: { name, path: targetCwd, branch: resolved.branch, kind: resolved.kind, alreadyThere: true, cancelled: false },

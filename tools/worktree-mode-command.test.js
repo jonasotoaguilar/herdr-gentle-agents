@@ -640,4 +640,71 @@ describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, ()
       restoreEnv();
     }
   });
+
+  test('warp refuses the reserved name principal when a branch shares it', async () => {
+    const root = makeRepo('principal-clash');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      // `principal` is a valid branch name, so the tool can register it; the
+      // listing then prints that name for two different checkouts.
+      const clash = addRegistered(root, 'principal', { thread: 'thread-1', issues: [9] });
+      const calls = [];
+      const { ctx, switches } = makeWarpCtx({ cwd: clash, sessionFile: path.join(root, 's.jsonl'), calls });
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('principal', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: oscFake(true) });
+      assert.equal(out.isError, true, 'the reserved name never picks one');
+      assert.match(out.text, /ambiguous/i);
+      assert.equal(switches.length, 0, 'nothing switched');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a session inside a nested worktree is not already there for the principal', async () => {
+    const root = makeRepo('nested');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const nested = path.join(root, 'nested-wt');
+      track(nested);
+      git(root, ['worktree', 'add', '-b', 'feat/nested', nested, 'HEAD']);
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.upsertWorktree(root, {
+        branch: 'feat/nested', path: fs.realpathSync(nested), thread: 'thread-nested', issues: [1], odd: [],
+      }).ok, true);
+      const sessionFile = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-nested-sess-'))), 'session.jsonl');
+      fs.writeFileSync(sessionFile, '{"type":"session"}\n');
+      const calls = [];
+      const { ctx, switches } = makeWarpCtx({ cwd: fs.realpathSync(nested), sessionFile, calls });
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('principal', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: oscFake(true) });
+      assert.equal(out.isError, undefined, `expected a real move, got: ${out.text}`);
+      assert.equal(out.text, `worktree warp: principal -> ${root}`);
+      assert.equal(out.details.path, root, 'the target is the principal checkout');
+      assert.equal(switches.length, 1, 'the session really switched');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('warp refuses a name an unregistered checkout also carries', async () => {
+    const root = makeRepo('unreg-clash');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/mix', { thread: 'thread-1', issues: [35] });
+      // A second live checkout whose branch flattens to the same printed name.
+      const other = path.join(path.dirname(root), `${path.basename(root)}-unreg-mix`);
+      track(other);
+      git(root, ['worktree', 'add', '-b', 'feat-mix', other, 'HEAD']);
+      const calls = [];
+      const { ctx, switches } = makeWarpCtx({ cwd: root, sessionFile: path.join(root, 's.jsonl'), calls });
+      const { mod } = await loadExtension();
+      const out = await mod.executeWorktreeWarp('feat-mix', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: oscFake(true) });
+      assert.equal(out.isError, true, 'a name two live checkouts share never picks one');
+      assert.match(out.text, /ambiguous/i);
+      assert.match(out.text, /unregistered/, `says which one is unregistered: ${out.text}`);
+      assert.equal(switches.length, 0, 'nothing switched');
+    } finally {
+      restoreEnv();
+    }
+  });
 });
