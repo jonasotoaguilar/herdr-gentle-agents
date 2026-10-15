@@ -1902,13 +1902,204 @@ const worktreeCloseTool = defineTool({
 // `[A-Za-z0-9._-]` session-id charset) for a new session so the id is
 // known immediately and returned.
 //
-// `notify` (default true) is accepted and reported in `details`; the
-// finish subscription that honours it is T35/S26, not this tool.
+// `notify` (default true) starts the S26 finish watcher for the opened
+// pane; `notify: false` starts none.
 // ---------------------------------------------------------------------------
 
 // How long `herdr agent start` waits for interactive readiness (its own
 // `--timeout`; max 300000). Fixed so the argv is exact and testable.
 const AGENT_START_TIMEOUT_MS = 120000;
+
+// ---------------------------------------------------------------------------
+// Finish subscription (S26, T35): whoever opens a session subscribes to
+// its real finish.
+//
+// `worktree_session_open` with `notify !== false` starts ONE watcher for
+// the pane it just opened; `notify: false` starts none. Watchers coexist
+// in `SESSION_WATCHERS`, keyed by pane id (one entry per pane; opening a
+// pane that already has a watcher replaces it), and
+// `clearSessionWatchers` stops them all so tests can reset the registry.
+//
+// WHAT it watches: the pane id the tool returns in `details.paneId`,
+// read with `herdr agent get <paneId>` — whose real shape is
+// `{result: {agent: {agent: "pi", agent_status, pane_id, tokens: {...}}}}`.
+// A missing agent answers
+// `{error: {code: "agent_not_found", message: "agent target <t> not found"}}`
+// — the VANISHED signal. The target is the pane id, never the kind name.
+//
+// WHAT a finish is: `agent_status` reading `idle` AFTER that same pane
+// was observed `working` at least once. `blocked` is the delegate waiting
+// for input and never counts as the `working` observation. A delegate that
+// never reports `working` is reported as never-started, honestly; a pane
+// that vanishes is reported as vanished; reaching the maximum wait without
+// either is reported as a timeout. None of those three claims a finish.
+//
+// HOW it polls: a bounded `setInterval`, never a busy loop, with a launch
+// grace window before anything is concluded (the delegate is idle right
+// after `agent start`, so a finish inside it is impossible), a maximum
+// wait, and the timer cleared and unref'd when it ends. The interval, the
+// grace and the maximum are injectable through the options object (with
+// production defaults below) so tests run in milliseconds.
+//
+// HOW it delivers: `pi.sendMessage({customType:
+// "herdr-agent-sessions.finished", content, display: true, details},
+// {deliverAs: "followUp", triggerTurn: true})` — the route incoming
+// session messages already use, because the orchestrator has to act on it.
+// The content states which outcome was observed and names the worktree,
+// the pane and the session id; the details carry the same facts as data.
+// ---------------------------------------------------------------------------
+
+// Production timing: poll like a state beat, grace past the launch idle,
+// and a maximum wait after which the delegate is reported as timed out.
+const SESSION_WATCH_DEFAULTS = { intervalMs: 15000, graceMs: 60000, maxWaitMs: 4 * 60 * 60 * 1000 };
+
+// Live watchers by pane id. The host `pi` captured at load, whose
+// `sendMessage` is the delivery route (null until the extension loads).
+const SESSION_WATCHERS = new Map();
+let sessionNotifyPi = null;
+
+// Resolve the watcher timing: explicit options win, then the
+// `GENTLE_WORKTREE_WATCH_*_MS` overrides (tests), then production
+// defaults. Non-positive or unparseable values never apply.
+function sessionWatchOptions(overrides) {
+  const pick = (value) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined);
+  const envPick = (name) => {
+    const raw = process.env[name];
+    if (typeof raw !== "string" || raw.length === 0) return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  const src = overrides && typeof overrides === "object" ? overrides : {};
+  return {
+    intervalMs: pick(src.intervalMs) ?? envPick("GENTLE_WORKTREE_WATCH_INTERVAL_MS") ?? SESSION_WATCH_DEFAULTS.intervalMs,
+    graceMs: pick(src.graceMs) ?? envPick("GENTLE_WORKTREE_WATCH_GRACE_MS") ?? SESSION_WATCH_DEFAULTS.graceMs,
+    maxWaitMs: pick(src.maxWaitMs) ?? envPick("GENTLE_WORKTREE_WATCH_MAX_MS") ?? SESSION_WATCH_DEFAULTS.maxWaitMs,
+  };
+}
+
+// One outcome, one text: which of finished / never-started / vanished /
+// timed-out was observed, naming the worktree, the pane and the session
+// id. Only the finished text claims a finish.
+function sessionWatchContent(outcome, { worktree, paneId, sessionId, maxWaitMs }) {
+  switch (outcome) {
+    case "finished":
+      return `worktree session finished: ${worktree} ${sessionId} in pane ${paneId} is idle after working`;
+    case "never-started":
+      return `worktree session never started: ${worktree} ${sessionId} in pane ${paneId} went idle without ever reporting working (the published state is another process's view, so "never started" and "never reported anything" are indistinguishable)`;
+    case "vanished":
+      return `worktree session vanished: ${worktree} ${sessionId} in pane ${paneId} disappeared (agent not found)`;
+    default:
+      return `worktree session timed out: ${worktree} ${sessionId} in pane ${paneId} did not finish within ${maxWaitMs}ms`;
+  }
+}
+
+// Read one `herdr agent get` reply: `{status, vanished}`. The
+// `agent_not_found` error is the vanished signal; the status is the
+// published `agent_status` (with tolerant fallbacks); anything
+// unparseable is neither, so the watcher keeps polling to its maximum.
+function sessionWatchReading(stdout) {
+  let doc = null;
+  try {
+    doc = JSON.parse(stdout);
+  } catch {
+    return { status: null, vanished: false };
+  }
+  if (!doc || typeof doc !== "object") return { status: null, vanished: false };
+  const err = doc.error;
+  if (err && typeof err === "object" && err.code === "agent_not_found") {
+    return { status: null, vanished: true };
+  }
+  const agent = doc.result && typeof doc.result === "object" ? doc.result.agent : null;
+  if (agent && typeof agent.agent_status === "string") return { status: agent.agent_status, vanished: false };
+  const fallback = doc.result && typeof doc.result === "object" && typeof doc.result.agent_status === "string"
+    ? doc.result.agent_status
+    : typeof doc.agent_status === "string" ? doc.agent_status : null;
+  return { status: fallback, vanished: false };
+}
+
+// Start the watcher for one opened pane. Replaces any watcher already
+// keyed at that pane id; the registry keeps every other pane's watcher.
+// The timer is unref'd so it never holds the process open, and cleared
+// with the registry entry the moment an outcome is delivered.
+function startAgentSessionWatcher({ paneId, worktree, branch, sessionId, agentName, workspaceId, path: targetPath, repoRoot }, options) {
+  const { intervalMs, graceMs, maxWaitMs } = sessionWatchOptions(options);
+  const startedAt = Date.now();
+  let seenWorking = false;
+  const previous = SESSION_WATCHERS.get(paneId);
+  if (previous) {
+    try {
+      clearInterval(previous.timer);
+    } catch {}
+  }
+  const finish = (outcome) => {
+    const record = SESSION_WATCHERS.get(paneId);
+    if (record && record.timer === timer) SESSION_WATCHERS.delete(paneId);
+    try {
+      clearInterval(timer);
+    } catch {}
+    const sender = sessionNotifyPi && typeof sessionNotifyPi.sendMessage === "function" ? sessionNotifyPi : null;
+    if (!sender) return;
+    const content = sessionWatchContent(outcome, { worktree, paneId, sessionId, maxWaitMs });
+    const details = { worktree, branch, path: targetPath, paneId, workspaceId, sessionId, agentName, outcome, seenWorking };
+    try {
+      const sent = sender.sendMessage(
+        { customType: "herdr-agent-sessions.finished", content, display: true, details },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+      if (sent && typeof sent.catch === "function") sent.catch(() => {});
+    } catch {}
+  };
+  const timer = setInterval(() => {
+    let reading;
+    try {
+      const git = libRequire("worktree-git.js");
+      const gotten = git.runArgv(herdrBinary(), git.herdrArgv("agent-get", { target: paneId }), {
+        cwd: repoRoot,
+        timeoutMs: 10000,
+      });
+      reading = sessionWatchReading(gotten.stdout);
+    } catch {
+      reading = { status: null, vanished: false };
+    }
+    const elapsed = Date.now() - startedAt;
+    if (reading.status === "working") seenWorking = true;
+    // Launch grace: the delegate is idle right after `agent start`, so no
+    // outcome — finish, never-started, vanished or timeout — is concluded
+    // inside it. Observations still count: a `working` here arms the finish.
+    if (elapsed < graceMs) return;
+    if (reading.vanished) {
+      finish("vanished");
+      return;
+    }
+    if (reading.status === "idle") {
+      finish(seenWorking ? "finished" : "never-started");
+      return;
+    }
+    // `blocked` is the delegate waiting for input — never a finish — and
+    // anything unparseable is ignored: both keep polling to the maximum.
+    if (elapsed >= maxWaitMs) {
+      finish("timed-out");
+    }
+  }, intervalMs);
+  if (timer && typeof timer.unref === "function") {
+    try {
+      timer.unref();
+    } catch {}
+  }
+  SESSION_WATCHERS.set(paneId, { timer, startedAt, paneId, worktree, sessionId });
+  return timer;
+}
+
+// Stop every watcher and empty the registry. Tests clear the pane-keyed
+// registry through this between cases.
+function clearSessionWatchers() {
+  for (const record of SESSION_WATCHERS.values()) {
+    try {
+      clearInterval(record.timer);
+    } catch {}
+  }
+  SESSION_WATCHERS.clear();
+}
 
 function sessionSuccessText(worktree, sessionId) {
   return `worktree session open: ${worktree} ${sessionId}`;
@@ -2066,7 +2257,7 @@ function herdrFailureText(call, status, reason) {
 
 // Core of `worktree_session_open`. Exported for unit tests; the
 // registered tool calls it with the live Pi context.
-async function executeWorktreeSessionOpen(params, ctx) {
+async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
   const git = libRequire("worktree-git.js");
   const registry = libRequire("worktree-registry.js");
   const mode = libRequire("worktree-mode.js");
@@ -2308,7 +2499,7 @@ async function executeWorktreeSessionOpen(params, ctx) {
       },
     );
   }
-  return textResult(
+  const opened = textResult(
     sessionSuccessText(resolved.name, sessionId),
     {
       worktree: resolved.name, branch, path: targetCwd,
@@ -2316,12 +2507,27 @@ async function executeWorktreeSessionOpen(params, ctx) {
     },
     false,
   );
+  // S26: subscribing is opening with `notify !== false` — one watcher for
+  // the pane just opened, `notify: false` starts none. The watcher needs
+  // the host message route; without it nothing is watched.
+  if (notify && sessionNotifyPi && typeof sessionNotifyPi.sendMessage === "function") {
+    try {
+      startAgentSessionWatcher(
+        {
+          paneId, worktree: resolved.name, branch, sessionId,
+          agentName, workspaceId, path: targetCwd, repoRoot: repo.root,
+        },
+        watcherOptions,
+      );
+    } catch {}
+  }
+  return opened;
 }
 
 const worktreeSessionOpenTool = defineTool({
   name: "worktree_session_open",
   label: "Worktree Session Open",
-  description: "Open a Pi session inside a registered agent worktree via Herdr (workspace only, never a path): pass the worktree NAME 'worktree list' prints (or a branch name) and optionally a session id to resume. A new session id is minted when resuming is not asked.",
+  description: "Open a Pi session inside a registered agent worktree via Herdr (workspace only, never a path): pass the worktree NAME 'worktree list' prints (or a branch name) and optionally a session id to resume. A new session id is minted when resuming is not asked. Unless notify:false is passed, the creator is notified when that session really finishes.",
   parameters: Type.Object({
     worktree: Type.String({ description: "Name of the registered worktree to open the session in (the flattened branch slug, or a branch name)" }),
     session: opt(Type.String({ description: "Pi session id or path to resume; absent means a new session" })),
@@ -3006,6 +3212,9 @@ function registerWorktreeCommand(pi, toolsRegistered) {
 }
 
 export default function (pi) {
+  // The S26 delivery route: watchers started by `worktree_session_open`
+  // notify through this host object.
+  sessionNotifyPi = pi;
   // Load-time gate (D9): missing means enabled, malformed never enables.
   // The toggle command below always stays registered so the mode can be
   // flipped back; the current registration state is reported through its
@@ -3033,4 +3242,4 @@ export default function (pi) {
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, emitOsc7, executeWorktreeSessionOpen };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers };

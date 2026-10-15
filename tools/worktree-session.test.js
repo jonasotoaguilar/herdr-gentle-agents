@@ -915,3 +915,441 @@ describe('worktree_session_open preserves the existing tools (S25)', { concurren
     }
   });
 });
+
+// T35 (S26) tests (test-first): the finish subscription is behaviour of
+// `worktree_session_open`, not a new tool. With `notify !== false` the
+// open starts ONE watcher for the pane it just opened; the watcher polls
+// `herdr agent get <paneId>` on a bounded interval (grace before
+// anything is concluded, maximum wait) and delivers one custom message
+// via `pi.sendMessage(..., {deliverAs: "followUp", triggerTurn: true})`.
+//
+// Each test drives the tool through its public `execute` with a fake `pi`
+// carrying `sendMessage`, and answers `agent get` from per-call JSON
+// fixtures selected by a counter file — so a `working` -> `idle`
+// sequence is observable and the notification can be shown to fire only
+// after the `idle` poll. Watch timing comes from the
+// GENTLE_WORKTREE_WATCH_*_MS env overrides so tests run in milliseconds.
+
+function agentDoc(status, paneId) {
+  return { result: { agent: { agent: 'pi', agent_status: status, pane_id: paneId, tokens: {} } } };
+}
+
+function vanishedDoc(paneId) {
+  return { error: { code: 'agent_not_found', message: `agent target ${paneId} not found` } };
+}
+
+function writeAgentSequence(paneId, docs) {
+  assert.ok(docs.length > 0, 'a sequence needs at least one answer');
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sess-agentseq-')));
+  docs.forEach((doc, index) => writeJson(dir, `${index + 1}.json`, doc));
+  const last = path.join(dir, 'last.json');
+  fs.writeFileSync(last, `${JSON.stringify(docs[docs.length - 1])}\n`);
+  const count = path.join(dir, 'count');
+  fs.writeFileSync(count, '0\n');
+  return { dir, last, count };
+}
+
+function readAgentGetCount(countFile) {
+  try {
+    return Number(fs.readFileSync(countFile, 'utf8').trim());
+  } catch {
+    return 0;
+  }
+}
+
+// Stub `herdr` with the `agent get` leg added: every invocation logs its
+// argv to $HERDR_SHIM_LOG, and `agent get` answers the Nth fixture in
+// $HERDR_STUB_AGENT_GET_DIR (`<n>.json`, falling back to
+// $HERDR_STUB_AGENT_GET_LAST once the sequence is exhausted) while
+// counting invocations in $HERDR_STUB_AGENT_GET_COUNT.
+function makeWatchHerdrStub() {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sess-watch-herdr-')));
+  const bin = path.join(dir, 'herdr');
+  fs.writeFileSync(
+    bin,
+    [
+      '#!/bin/sh',
+      'printf \'%s\\n\' "$*" >> "$HERDR_SHIM_LOG"',
+      'if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then',
+      '  if [ "${HERDR_SHIM_WORKTREE_LIST_EXIT:-0}" != "0" ]; then echo "shim worktree list failure" >&2; exit 1; fi',
+      '  cat "$HERDR_STUB_WORKTREE_LIST"; exit 0',
+      'fi',
+      'if [ "$1" = "worktree" ] && [ "$2" = "open" ]; then',
+      '  if [ "${HERDR_SHIM_OPEN_EXIT:-0}" != "0" ]; then echo "shim worktree open failure" >&2; exit 1; fi',
+      '  cat "$HERDR_STUB_WORKTREE_OPEN"; exit 0',
+      'fi',
+      'if [ "$1" = "pane" ] && [ "$2" = "list" ]; then',
+      '  if [ "${HERDR_SHIM_PANE_LIST_EXIT:-0}" != "0" ]; then echo "shim pane list failure" >&2; exit 1; fi',
+      '  cat "$HERDR_STUB_PANE_LIST"; exit 0',
+      'fi',
+      'if [ "$1" = "agent" ] && [ "$2" = "start" ]; then',
+      '  if [ "${HERDR_SHIM_AGENT_START_EXIT:-0}" != "0" ]; then echo "shim agent start failure" >&2; exit 1; fi',
+      '  echo "{}"; exit 0',
+      'fi',
+      'if [ "$1" = "agent" ] && [ "$2" = "get" ]; then',
+      '  n=$(cat "$HERDR_STUB_AGENT_GET_COUNT" 2>/dev/null || echo 0)',
+      '  n=$((n + 1)); echo "$n" > "$HERDR_STUB_AGENT_GET_COUNT"',
+      '  f="$HERDR_STUB_AGENT_GET_DIR/$n.json"',
+      '  if [ -f "$f" ]; then cat "$f"; exit 0; fi',
+      '  cat "$HERDR_STUB_AGENT_GET_LAST"; exit 0',
+      'fi',
+      'echo "herdr stub: unexpected argv $*" >&2; exit 1',
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  const log = path.join(dir, 'herdr-argv.log');
+  return { bin, log };
+}
+
+async function loadExtensionWithSender() {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sess-watch-ext-')));
+  const copy = path.join(dir, 'gentle-worktree-tools.mjs');
+  fs.writeFileSync(copy, stubbed);
+  const tools = new Map();
+  const commands = new Map();
+  const sent = [];
+  const pi = {
+    registerTool: (tool) => { tools.set(tool.name, tool); },
+    registerCommand: (name, def) => { commands.set(name, def); },
+    on: () => () => {},
+    sendMessage: async (message, options) => { sent.push([message, options]); return 'msg-1'; },
+  };
+  const mod = await import(pathToFileURL(copy).href);
+  mod.default(pi);
+  return { tools, commands, mod, pi, sent };
+}
+
+function watchEnv(modeEnv, herdr, world, seq) {
+  return {
+    GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+    GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+    HERDR_BIN_PATH: herdr.bin,
+    HERDR_SHIM_LOG: herdr.log,
+    HERDR_STUB_WORKTREE_LIST: world.worktreeList,
+    HERDR_STUB_PANE_LIST: world.paneList,
+    HERDR_STUB_AGENT_GET_DIR: seq.dir,
+    HERDR_STUB_AGENT_GET_COUNT: seq.count,
+    HERDR_STUB_AGENT_GET_LAST: seq.last,
+    GENTLE_WORKTREE_WATCH_INTERVAL_MS: '15',
+    GENTLE_WORKTREE_WATCH_GRACE_MS: '20',
+    GENTLE_WORKTREE_WATCH_MAX_MS: '600',
+  };
+}
+
+async function waitUntil(predicate, timeoutMs, what) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function watchWorld(root, branch, target, workspaceId) {
+  return workspaceWorld(root, branch, target, { workspaceId });
+}
+
+describe('worktree_session_open finish subscription (S26)', { concurrency: false }, () => {
+  test('idle after working reports finished, only after the idle poll', async () => {
+    const root = makeRepo('watch-finished');
+    const target = addRegistered(root, 'feat/watch-finished');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-watch-fin:p1';
+    const world = watchWorld(root, 'feat/watch-finished', target, 'ws-watch-fin');
+    const seq = writeAgentSequence(paneId, [agentDoc('working', paneId), agentDoc('idle', paneId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-watch-finished' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const sessionId = result.details.sessionId;
+      assert.match(resultText(result), new RegExp(`^worktree session open: feat-watch-finished ${sessionId}$`));
+      // The first poll observes `working`: a finish is impossible yet, so
+      // nothing may be delivered on that poll.
+      await waitUntil(() => readAgentGetCount(seq.count) >= 1, 3000, 'the first agent get poll');
+      assert.equal(sent.length, 0, 'no notification fires on the working poll');
+      // The second poll observes `idle` after `working`: exactly one
+      // finished notification follows.
+      await waitUntil(() => sent.length >= 1, 3000, 'the finished notification');
+      assert.equal(sent.length, 1, 'exactly one notification is delivered');
+      const [message, options] = sent[0];
+      assert.equal(message.customType, 'herdr-agent-sessions.finished');
+      assert.equal(message.display, true);
+      assert.deepEqual(options, { deliverAs: 'followUp', triggerTurn: true });
+      assert.match(message.content, /finished/);
+      assert.ok(message.content.includes('feat-watch-finished'), `names the worktree: ${message.content}`);
+      assert.ok(message.content.includes(paneId), `names the pane: ${message.content}`);
+      assert.ok(message.content.includes(sessionId), `names the session id: ${message.content}`);
+      assert.equal(message.details.outcome, 'finished');
+      assert.equal(message.details.worktree, 'feat-watch-finished');
+      assert.equal(message.details.paneId, paneId);
+      assert.equal(message.details.sessionId, sessionId);
+      // The target is the pane id, never the kind name: every `agent get`
+      // names the pane the tool returned.
+      for (const line of shimArgv(herdr.log).filter((entry) => entry.startsWith('agent get'))) {
+        assert.equal(line, `agent get ${paneId}`, `agent get targets the pane id: ${line}`);
+      }
+      assert.ok(shimArgv(herdr.log).filter((entry) => entry.startsWith('agent get')).length >= 2,
+        'the watcher polled past the working observation to the idle one');
+      assert.equal(typeof mod.clearSessionWatchers, 'function', 'tests can clear the pane-keyed watcher registry');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('idle without ever working reports never-started, never a finish', async () => {
+    const root = makeRepo('watch-never');
+    const target = addRegistered(root, 'feat/watch-never');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-watch-nev:p1';
+    const world = watchWorld(root, 'feat/watch-never', target, 'ws-watch-nev');
+    const seq = writeAgentSequence(paneId, [agentDoc('idle', paneId), agentDoc('idle', paneId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-watch-never' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const sessionId = result.details.sessionId;
+      await waitUntil(() => sent.length >= 1, 3000, 'the never-started notification');
+      assert.equal(sent.length, 1);
+      const [message, options] = sent[0];
+      assert.equal(message.customType, 'herdr-agent-sessions.finished');
+      assert.deepEqual(options, { deliverAs: 'followUp', triggerTurn: true });
+      assert.equal(message.details.outcome, 'never-started');
+      assert.match(message.content, /never[- ]started/);
+      assert.ok(!/^worktree session finished:/.test(message.content), `never claims a finish: ${message.content}`);
+      assert.ok(message.content.includes('feat-watch-never'));
+      assert.ok(message.content.includes(paneId));
+      assert.ok(message.content.includes(sessionId));
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a vanished pane reports vanished, never a finish', async () => {
+    const root = makeRepo('watch-vanished');
+    const target = addRegistered(root, 'feat/watch-vanished');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-watch-van:p1';
+    const world = watchWorld(root, 'feat/watch-vanished', target, 'ws-watch-van');
+    const seq = writeAgentSequence(paneId, [vanishedDoc(paneId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-watch-vanished' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const sessionId = result.details.sessionId;
+      await waitUntil(() => sent.length >= 1, 3000, 'the vanished notification');
+      assert.equal(sent.length, 1);
+      const [message, options] = sent[0];
+      assert.equal(message.customType, 'herdr-agent-sessions.finished');
+      assert.deepEqual(options, { deliverAs: 'followUp', triggerTurn: true });
+      assert.equal(message.details.outcome, 'vanished');
+      assert.match(message.content, /vanished/);
+      assert.ok(!/^worktree session finished:/.test(message.content), `never claims a finish: ${message.content}`);
+      assert.ok(message.content.includes('feat-watch-vanished'));
+      assert.ok(message.content.includes(paneId));
+      assert.ok(message.content.includes(sessionId));
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('no finish within the maximum wait reports timed-out, never a finish', async () => {
+    const root = makeRepo('watch-timeout');
+    const target = addRegistered(root, 'feat/watch-timeout');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-watch-tmo:p1';
+    const world = watchWorld(root, 'feat/watch-timeout', target, 'ws-watch-tmo');
+    // The delegate keeps working: the maximum wait, not a finish, ends it.
+    const seq = writeAgentSequence(paneId, [agentDoc('working', paneId)]);
+    const modeEnv = scratchModeEnv();
+    const env = watchEnv(modeEnv, herdr, world, seq);
+    env.GENTLE_WORKTREE_WATCH_MAX_MS = '120';
+    setEnv(env);
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-watch-timeout' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const sessionId = result.details.sessionId;
+      await waitUntil(() => sent.length >= 1, 3000, 'the timed-out notification');
+      assert.equal(sent.length, 1);
+      const [message, options] = sent[0];
+      assert.equal(message.customType, 'herdr-agent-sessions.finished');
+      assert.deepEqual(options, { deliverAs: 'followUp', triggerTurn: true });
+      assert.equal(message.details.outcome, 'timed-out');
+      assert.match(message.content, /timed out/);
+      assert.ok(!/^worktree session finished:/.test(message.content), `never claims a finish: ${message.content}`);
+      assert.ok(message.content.includes('feat-watch-timeout'));
+      assert.ok(message.content.includes(paneId));
+      assert.ok(message.content.includes(sessionId));
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('notify:false starts no watcher while the default subscribes', async () => {
+    const root = makeRepo('watch-notify');
+    const offTarget = addRegistered(root, 'feat/watch-off');
+    const onTarget = addRegistered(root, 'feat/watch-on');
+    const herdr = makeWatchHerdrStub();
+    const offPane = 'ws-watch-off:p1';
+    const offWorld = watchWorld(root, 'feat/watch-off', offTarget, 'ws-watch-off');
+    const offSeq = writeAgentSequence(offPane, [agentDoc('working', offPane), agentDoc('idle', offPane)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, offWorld, offSeq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const off = await callSessionOpen(tools, { worktree: 'feat-watch-off', notify: false }, makeCtx(root));
+      assert.equal(off.isError, undefined, `expected success: ${resultText(off)}`);
+      assert.equal(off.details.notify, false);
+      // Even a working -> idle delegate delivers nothing: no watcher runs.
+      await sleep(250);
+      assert.equal(sent.length, 0, 'notify:false delivers no notification');
+      assert.ok(!shimArgv(herdr.log).some((line) => line.startsWith('agent get')),
+        'notify:false never polls the delegate at all');
+      // The default subscribes the same way the other tests observe.
+      const onPane = 'ws-watch-on:p1';
+      const onWorld = watchWorld(root, 'feat/watch-on', onTarget, 'ws-watch-on');
+      const onSeq = writeAgentSequence(onPane, [agentDoc('working', onPane), agentDoc('idle', onPane)]);
+      setEnv({
+        HERDR_STUB_WORKTREE_LIST: onWorld.worktreeList,
+        HERDR_STUB_PANE_LIST: onWorld.paneList,
+        HERDR_STUB_AGENT_GET_DIR: onSeq.dir,
+        HERDR_STUB_AGENT_GET_COUNT: onSeq.count,
+        HERDR_STUB_AGENT_GET_LAST: onSeq.last,
+      });
+      const on = await callSessionOpen(tools, { worktree: 'feat-watch-on' }, makeCtx(root));
+      assert.equal(on.isError, undefined, `expected success: ${resultText(on)}`);
+      assert.equal(on.details.notify, true);
+      await waitUntil(() => sent.length >= 1, 3000, 'the default subscription notification');
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0][0].details.outcome, 'finished');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('blocked then idle without working is never-started, never a finish', async () => {
+    const root = makeRepo('watch-blocked');
+    const target = addRegistered(root, 'feat/watch-blocked');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-watch-blk:p1';
+    const world = watchWorld(root, 'feat/watch-blocked', target, 'ws-watch-blk');
+    // `blocked` is the delegate waiting for input: it must not count as
+    // the `working` observation a finish requires.
+    const seq = writeAgentSequence(paneId, [
+      agentDoc('blocked', paneId),
+      agentDoc('blocked', paneId),
+      agentDoc('idle', paneId),
+    ]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-watch-blocked' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      await waitUntil(() => sent.length >= 1, 3000, 'the never-started notification');
+      assert.equal(sent.length, 1);
+      const [message, options] = sent[0];
+      assert.equal(message.customType, 'herdr-agent-sessions.finished');
+      assert.deepEqual(options, { deliverAs: 'followUp', triggerTurn: true });
+      assert.equal(message.details.outcome, 'never-started');
+      assert.ok(!/^worktree session finished:/.test(message.content), `a blocked delegate never finishes: ${message.content}`);
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('the T34 tool contracts still hold: exact text, nine details keys, exact agent-start argv', async () => {
+    const root = makeRepo('watch-t34');
+    const target = addRegistered(root, 'feat/watch-t34');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-watch-t34:p1';
+    const world = watchWorld(root, 'feat/watch-t34', target, 'ws-watch-t34');
+    // The delegate never answers: with production timing no poll fires
+    // before the assertions below run, and the registry is cleared after.
+    const seq = writeAgentSequence(paneId, [agentDoc('working', paneId)]);
+    const modeEnv = scratchModeEnv();
+    const env = watchEnv(modeEnv, herdr, world, seq);
+    delete env.GENTLE_WORKTREE_WATCH_INTERVAL_MS;
+    delete env.GENTLE_WORKTREE_WATCH_GRACE_MS;
+    delete env.GENTLE_WORKTREE_WATCH_MAX_MS;
+    setEnv(env);
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const { tools, sent } = loaded;
+      const result = await callSessionOpen(tools, { worktree: 'feat-watch-t34' }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.match(resultText(result), /^worktree session open: feat-watch-t34 [0-9a-f-]{36}$/);
+      assert.deepEqual(Object.keys(result.details).sort(), [
+        'agentName', 'branch', 'notify', 'paneId', 'path',
+        'resumed', 'sessionId', 'workspaceId', 'worktree',
+      ]);
+      assert.equal(result.details.paneId, paneId);
+      assert.equal(result.details.workspaceId, 'ws-watch-t34');
+      assert.equal(result.details.resumed, false);
+      assert.equal(result.details.agentName, 'feat-watch-t34');
+      assert.equal(result.details.notify, true);
+      const calls = shimArgv(herdr.log);
+      const [start] = calls.filter((line) => line.startsWith('agent start'));
+      assert.ok(start, 'agent start ran');
+      assert.ok(start.includes('--kind pi'), `kind pi: ${start}`);
+      assert.ok(start.includes(`--pane ${paneId}`), `pane: ${start}`);
+      const afterDash = start.split(' -- ').slice(1).join(' -- ');
+      assert.ok(afterDash.includes('--name feat-watch-t34'), `pi --name: ${afterDash}`);
+      assert.match(afterDash, /--session-id [0-9a-f-]{36}/i, 'a UUID is minted');
+      assert.ok(!afterDash.includes('--session-dir'), 'the pane cwd is the worktree');
+      assert.equal(sent.length, 0, 'no follow-up fires synchronously with the open');
+    } finally {
+      try {
+        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
+      } catch {}
+      restoreEnv();
+    }
+  });
+});

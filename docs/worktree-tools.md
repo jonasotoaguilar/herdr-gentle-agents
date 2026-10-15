@@ -534,6 +534,44 @@ refusals: never `--trust-repository`, never `--focus`. The version floor
 stays `0.9.4`: every one of those flags was run against the installed
 binary before the spec was written.
 
+### Finish subscription (S26)
+
+Opening a session subscribes the creator to that delegate's real finish:
+with `notify !== false` (the default) `worktree_session_open` starts ONE
+watcher for the pane it just opened; `notify: false` starts none and never
+polls. Watchers coexist in a registry keyed by pane id (opening a pane that
+already has a watcher replaces it).
+
+The watcher polls `herdr agent get <paneId>` — the pane id the tool returns
+in `details.paneId`, never the kind name — on a bounded interval, never a
+busy loop: every 15 s by default, with a 60 s launch grace window before
+anything is concluded (the delegate is idle right after `agent start`, so a
+finish inside it is impossible) and a 4 h maximum wait. The timer is cleared
+and unref'd when it ends.
+
+A finish is `agent_status` reading `idle` AFTER that same pane was observed
+`working` at least once. `blocked` is the delegate waiting for input and is
+not a finish. Exactly one of four outcomes is delivered:
+
+- `finished` — idle after working.
+- `never-started` — idle without ever reporting working.
+- `vanished` — the pane or agent disappeared (`agent_not_found`).
+- `timed-out` — the maximum wait passed with no finish.
+
+None of the last three claims a finish. Delivery is one custom message to
+the creating session — `customType` `herdr-agent-sessions.finished`, sent as
+`{deliverAs: "followUp", triggerTurn: true}`, the route incoming session
+messages already use, because the orchestrator has to act on it (verify,
+merge, report). The content states which outcome was observed and names the
+worktree, the pane and the session id; `details` carries the same facts as
+data (`{worktree, branch, path, paneId, workspaceId, sessionId, agentName,
+outcome, seenWorking}`).
+
+Honest limits, recorded not hidden: the watched state is another process's
+published view, so "never started" and "never reported anything" are
+indistinguishable — the never-started message says so — and a vanished pane
+is reported as vanished, never as a finish.
+
 ## Per-thread ownership
 
 One worktree per thread. Thread identity resolves from
