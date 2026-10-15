@@ -363,7 +363,7 @@ describe('worktree_list registration', { concurrency: false }, () => {
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const tools = await loadExtension();
-      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_create', 'worktree_list']);
+      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open']);
       const listParams = tools.get('worktree_list').parameters;
       assert.deepEqual(Object.keys(listParams.properties), ['all']);
       assert.equal(listParams.properties.all.type, 'boolean');

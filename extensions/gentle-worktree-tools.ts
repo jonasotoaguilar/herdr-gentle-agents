@@ -1,11 +1,13 @@
 // @ts-nocheck
-// gentle-worktree-tools.ts — agent worktree tools (Pi extension, P2-S4).
+// gentle-worktree-tools.ts — agent worktree tools (Pi extension, P2-S4,
+// plus the session opener T34/S25).
 //
-// Registers three tools: `worktree_create` (validate + herdr-first
+// Registers four tools: `worktree_create` (validate + herdr-first
 // creation with hooks), `worktree_list` (read-only, no approval prompt),
-// and `worktree_close` (remove the checkout, keep the branch). Create and
-// close prompt for approval when the host offers dialog UI; list never
-// mutates anything.
+// `worktree_close` (remove the checkout, keep the branch) and
+// `worktree_session_open` (open a Pi session inside a registered agent
+// worktree via Herdr). Create and close prompt for approval when the host
+// offers dialog UI; list never mutates anything.
 //
 // The file is plain JavaScript with a .ts extension (// @ts-nocheck, no
 // type annotations), exactly like extensions/gentle-herdr-state.ts, so the
@@ -14,6 +16,7 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1871,6 +1874,466 @@ const worktreeCloseTool = defineTool({
 });
 
 // ---------------------------------------------------------------------------
+// `worktree_session_open` (S25, T34): open a Pi session in a Herdr
+// worktree, and only in a worktree.
+//
+// Scope is enforced, not documented: the worktree resolves through the
+// S24 name resolver (`resolveCheckoutByName` — one resolver, never a
+// second one) against THIS repository's registered live worktrees only. A
+// branch spelling resolves through its flattened slug; an absolute or
+// relative PATH is refused with an actionable message naming the listing;
+// the principal checkout is refused because a session there delegates
+// nothing; a registered row whose checkout is gone is refused as stale.
+//
+// Launching is composed, because no single Herdr command starts a
+// worktree AND a command in it: the worktree's Herdr workspace comes
+// from `herdr worktree list --cwd <root>` (`open_workspace_id` for that
+// branch/path); when there is none, `herdr worktree open
+// --branch <b> --cwd <root> --no-focus` opens one and its
+// `root_pane.pane_id` / `workspace.workspace_id` are used; when there IS
+// one, `herdr pane list --workspace <id>` names the panes and the ROOT
+// pane (the lowest `<workspace>:pN` index, the convention every observed
+// workspace uses) is used. Then
+// `herdr agent start <name> --kind pi --pane <pane> --timeout <ms> --
+// <pi argv>` starts Pi in that pane, whose cwd is the worktree — so Pi's
+// own session directory is the worktree's and no `--session-dir` is
+// passed. The Pi argv is `--name <agent>` plus `--session <id>` when
+// resuming, or `--session-id <minted>` (a fresh UUID, valid in Pi's
+// `[A-Za-z0-9._-]` session-id charset) for a new session so the id is
+// known immediately and returned.
+//
+// `notify` (default true) is accepted and reported in `details`; the
+// finish subscription that honours it is T35/S26, not this tool.
+// ---------------------------------------------------------------------------
+
+// How long `herdr agent start` waits for interactive readiness (its own
+// `--timeout`; max 300000). Fixed so the argv is exact and testable.
+const AGENT_START_TIMEOUT_MS = 120000;
+
+function sessionSuccessText(worktree, sessionId) {
+  return `worktree session open: ${worktree} ${sessionId}`;
+}
+
+// A value that is unambiguously a filesystem path rather than a worktree
+// name: absolute, or explicitly relative (`.`, `..`, `./`, `../`). A bare
+// `foo/bar` is NOT refused here — it may be a branch spelling, which
+// resolves through its slug below — but when no name resolves and the
+// value carries a separator, it is refused as a path rather than reported
+// as an unknown name.
+function isExplicitPath(value) {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (path.isAbsolute(value)) return true;
+  if (value === "." || value === "..") return true;
+  if (value.startsWith("./") || value.startsWith("../")) return true;
+  return false;
+}
+
+function looksLikePath(value) {
+  if (isExplicitPath(value)) return true;
+  if (typeof value !== "string") return false;
+  return value.includes("/") || value.includes("\\");
+}
+
+function pathRefusal(value) {
+  return `worktree session open refuses ${JSON.stringify(value)}: pass the worktree NAME 'worktree list' prints, not a path`; 
+}
+
+// The Herdr workspace id for a worktree from `herdr worktree list` JSON
+// (`{result: {worktrees: [{path, branch, open_workspace_id, ...}]}}`,
+// with the same tolerant fallbacks `herdrWorkspaceId` uses). An entry
+// matches by resolved path identity (absolute entries directly, relative
+// entries against the repository root, never the process cwd) or by exact
+// branch equality. Returns `{id, matched}`: `matched` counts the entries
+// that named this worktree, so callers can tell "no workspace" (open
+// one) from "several disagreeing workspaces" (fail closed) apart.
+function sessionWorkspaceId(stdout, repoRoot, branch, targetCwd) {
+  const none = { id: null, matched: 0, claimed: 0, conflict: false };
+  let list = null;
+  try {
+    const doc = JSON.parse(stdout);
+    if (doc && doc.result && Array.isArray(doc.result.worktrees)) {
+      list = doc.result.worktrees;
+    } else if (doc && Array.isArray(doc.worktrees)) {
+      list = doc.worktrees;
+    } else if (doc && Array.isArray(doc.result)) {
+      list = doc.result;
+    }
+  } catch {
+    return { id: null, matched: 0, parseError: true };
+  }
+  if (!list) return none;
+  const ids = new Set();
+  let matched = 0;
+  let claimed = 0;
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    let hit = false;
+    if (typeof item.path === "string" && item.path.length > 0) {
+      try {
+        const resolved = path.isAbsolute(item.path)
+          ? path.resolve(item.path)
+          : path.resolve(repoRoot, item.path);
+        if (resolved === targetCwd) hit = true;
+      } catch {
+        // Unresolvable entries never match.
+      }
+    }
+    if (!hit && typeof item.branch === "string" && item.branch === branch) hit = true;
+    if (!hit) continue;
+    matched += 1;
+    let id = null;
+    for (const key of ["open_workspace_id", "workspace_id", "workspace", "id"]) {
+      if (typeof item[key] === "string" && item[key].length > 0) { id = item[key]; break; }
+    }
+    // A matching entry WITHOUT a workspace id is the normal shape of a
+    // worktree Herdr has not opened (`open_workspace_id` is simply absent),
+    // not a conflict: the caller opens one. Only two DIFFERENT workspace
+    // ids claiming the same worktree are a genuine disagreement.
+    if (id !== null) { claimed += 1; ids.add(id); }
+  }
+  if (matched === 0) return { id: null, matched: 0, claimed: 0, conflict: false };
+  if (ids.size > 1) return { id: null, matched, claimed, conflict: true };
+  if (claimed === 0) return { id: null, matched, claimed, conflict: false };
+  return { id: [...ids][0], matched, claimed, conflict: false };
+}
+
+// The workspace's ROOT pane from `herdr pane list` JSON
+// (`{result: {panes: [{pane_id, ...}]}}`, tolerant fallbacks): the lowest
+// `<workspace>:pN` index, the convention every observed workspace uses.
+// Entries without a parseable index sort last; null when no pane id is
+// present at all.
+function rootPaneId(stdout) {
+  let panes = null;
+  try {
+    const doc = JSON.parse(stdout);
+    if (doc && doc.result && Array.isArray(doc.result.panes)) {
+      panes = doc.result.panes;
+    } else if (doc && Array.isArray(doc.panes)) {
+      panes = doc.panes;
+    } else if (doc && Array.isArray(doc.result)) {
+      panes = doc.result;
+    }
+  } catch {
+    return null;
+  }
+  if (!panes) return null;
+  let best = null;
+  let bestN = Infinity;
+  for (const pane of panes) {
+    if (!pane || typeof pane !== "object") continue;
+    const id = typeof pane.pane_id === "string" && pane.pane_id.length > 0
+      ? pane.pane_id
+      : typeof pane.id === "string" && pane.id.length > 0 ? pane.id : null;
+    if (id === null) continue;
+    const match = /:p(\d+)$/.exec(id);
+    const n = match ? Number(match[1]) : Infinity;
+    if (n < bestN) {
+      bestN = n;
+      best = id;
+    }
+  }
+  return best;
+}
+
+// `root_pane.pane_id` and `workspace.workspace_id` from a `herdr worktree
+// open` reply — the same shape `worktree create` returns — with tolerant
+// fallbacks. Nulls when the reply names no usable pair.
+function openedWorkspace(stdout) {
+  let doc = null;
+  try {
+    doc = JSON.parse(stdout);
+  } catch {
+    return { workspaceId: null, paneId: null };
+  }
+  const result = doc && typeof doc === "object" ? (doc.result || doc) : null;
+  const workspace = result && typeof result.workspace === "object" ? result.workspace : null;
+  const rootPane = result && typeof result.root_pane === "object" ? result.root_pane : null;
+  const workspaceId = workspace && typeof workspace.workspace_id === "string" && workspace.workspace_id.length > 0
+    ? workspace.workspace_id
+    : typeof result.workspace_id === "string" && result.workspace_id.length > 0 ? result.workspace_id : null;
+  const paneId = rootPane && typeof rootPane.pane_id === "string" && rootPane.pane_id.length > 0
+    ? rootPane.pane_id
+    : typeof result.pane_id === "string" && result.pane_id.length > 0
+      ? result.pane_id
+      : typeof result.root_pane_id === "string" && result.root_pane_id.length > 0 ? result.root_pane_id : null;
+  return { workspaceId, paneId };
+}
+
+function herdrFailureText(call, status, reason) {
+  const detail = ((reason || "unknown error") + "").trim() || "unknown error";
+  return `'${call}' exited ${status} (${detail})`;
+}
+
+// Core of `worktree_session_open`. Exported for unit tests; the
+// registered tool calls it with the live Pi context.
+async function executeWorktreeSessionOpen(params, ctx) {
+  const git = libRequire("worktree-git.js");
+  const registry = libRequire("worktree-registry.js");
+  const mode = libRequire("worktree-mode.js");
+  const cwd = toolCwd(ctx);
+
+  // (a) Mode gate: missing means enabled, malformed never enables
+  // (lib/worktree-mode.js). A disabled tool names the toggle to re-enable.
+  let modeState;
+  try {
+    modeState = mode.readMode();
+  } catch {
+    modeState = { state: "malformed", enabled: false };
+  }
+  if (!modeState || modeState.enabled !== true) {
+    return errorResult(
+      "worktree tools are disabled; run /herdr-gentle:worktree enabled to enable them",
+      { state: modeState ? modeState.state : "unknown", tool: "worktree_session_open" },
+    );
+  }
+
+  const rawWorktree = params ? params.worktree : undefined;
+  const rawSession = params && typeof params.session === "string" && params.session.length > 0
+    ? params.session
+    : undefined;
+  const rawName = params && typeof params.name === "string" && params.name.length > 0
+    ? params.name
+    : undefined;
+  // T35 wires the behaviour; this tool only accepts and reports it.
+  const notify = !(params && params.notify === false);
+  if (typeof rawWorktree !== "string" || rawWorktree.length === 0) {
+    return errorResult(
+      "worktree_session_open requires a worktree name: pass the NAME 'worktree list' prints (or a branch name), not a path",
+      { worktree: rawWorktree },
+    );
+  }
+  // An explicit path is refused before any backend runs, so no command
+  // can ever run outside a worktree of this repository.
+  if (isExplicitPath(rawWorktree)) {
+    return errorResult(pathRefusal(rawWorktree), { worktree: rawWorktree });
+  }
+
+  let repo;
+  try {
+    repo = git.repoIdentity(cwd);
+  } catch (err) {
+    return errorResult(`not a git repository: ${cwd}`, { worktree: rawWorktree });
+  }
+  const read = registry.readRegistry(repo.root);
+  if (!read.ok) {
+    return errorResult(`cannot read worktree registry: ${read.error}`, { worktree: rawWorktree });
+  }
+  let live;
+  try {
+    live = git.listWorktrees(repo.root);
+  } catch (err) {
+    return errorResult(
+      `cannot list worktrees: ${(err && err.message) || err}`,
+      { worktree: rawWorktree },
+    );
+  }
+  // (b) Scope: the ONE name resolver (S24). A branch spelling resolves
+  // through its flattened slug; a value that resolves neither way but
+  // carries a separator is a path, refused with the actionable message.
+  const principal = principalForName(git, repo.root, repo, live);
+  let resolved = resolveCheckoutByName(rawWorktree, git, read, principal, live, repo.root);
+  if (!resolved.ok) {
+    let slug = null;
+    try {
+      slug = git.slugifyBranch(rawWorktree);
+    } catch {
+      slug = null;
+    }
+    if (typeof slug === "string" && slug.length > 0 && slug !== rawWorktree) {
+      const viaSlug = resolveCheckoutByName(slug, git, read, principal, live, repo.root);
+      if (viaSlug.ok) resolved = viaSlug;
+    }
+  }
+  if (!resolved.ok && looksLikePath(rawWorktree)) {
+    return errorResult(pathRefusal(rawWorktree), { worktree: rawWorktree });
+  }
+  if (!resolved.ok) {
+    return errorResult(resolved.error, { worktree: rawWorktree, candidates: resolved.candidates });
+  }
+  if (resolved.kind === "principal") {
+    return errorResult(
+      `cannot open a session in the principal checkout at ${resolved.path}: worktree_session_open only opens sessions in a registered agent worktree (a session in the principal delegates nothing); pass the NAME 'worktree list' prints`,
+      { worktree: rawWorktree, path: resolved.path, branch: resolved.branch },
+    );
+  }
+  // Only a registered, LIVE worktree of THIS repository is acceptable:
+  // the consolidated liveness predicate (exists AND is-a-directory AND
+  // resolved-identity membership), so a hand-deleted checkout git still
+  // records is stale and refused here.
+  const entryState = checkoutState(resolved.path, repo.root);
+  const targetCwd = entryState.real !== null ? entryState.real
+    : entryState.absolute !== null ? entryState.absolute
+    : path.resolve(resolved.path);
+  const liveIds = liveIdentities(live, repo.root);
+  const entryId = entryState.real !== null ? entryState.real : entryState.absolute;
+  const isLive = entryState.exists && entryState.isDirectory && entryId !== null && liveIds.has(entryId);
+  if (!isLive) {
+    return errorResult(
+      `no live worktree for "${resolved.name}" at ${resolved.path}: the registry entry is stale (the checkout is missing or git no longer records it); close or recreate the worktree and retry`,
+      { worktree: resolved.name, branch: resolved.branch, path: resolved.path },
+    );
+  }
+  const branch = resolved.entry ? resolved.entry.branch : resolved.branch;
+  const agentName = rawName || resolved.name;
+  const resumed = rawSession !== undefined;
+  const sessionId = resumed ? rawSession : randomUUID();
+  const piArgs = resumed
+    ? ["--name", agentName, "--session", sessionId]
+    : ["--name", agentName, "--session-id", sessionId];
+
+  // (c) The worktree's Herdr workspace: `herdr worktree list
+  // --cwd <root>`, reading `open_workspace_id` for that branch/path.
+  const listed = git.runArgv(herdrBinary(), git.herdrArgv("list", { cwd: repo.root }), {
+    cwd: repo.root,
+    timeoutMs: 60000,
+  });
+  if (listed.status !== 0) {
+    return errorResult(
+      `worktree session open failed: ${herdrFailureText("herdr worktree list", listed.status, listed.stderr || listed.error)}; no session was opened`,
+      { worktree: resolved.name, branch, path: targetCwd },
+    );
+  }
+  let found = sessionWorkspaceId(listed.stdout, repo.root, branch, targetCwd);
+  if (found.parseError) {
+    return errorResult(
+      `worktree session open failed: 'herdr worktree list' returned unparseable JSON; no session was opened`,
+      { worktree: resolved.name, branch, path: targetCwd },
+    );
+  }
+  let workspaceId = found.id;
+  let paneId = null;
+  let openedHere = false;
+  if (workspaceId !== null) {
+    // Reuse: the workspace's ROOT pane from `herdr pane list`.
+    const panes = git.runArgv(herdrBinary(), git.herdrArgv("pane-list", { workspace: workspaceId }), {
+      cwd: repo.root,
+      timeoutMs: 60000,
+    });
+    if (panes.status !== 0) {
+      return errorResult(
+        `worktree session open failed: ${herdrFailureText("herdr pane list", panes.status, panes.stderr || panes.error)} for workspace '${workspaceId}'; no session was opened`,
+        { worktree: resolved.name, branch, path: targetCwd, workspaceId },
+      );
+    }
+    paneId = rootPaneId(panes.stdout);
+    if (paneId === null) {
+      return errorResult(
+        `worktree session open failed: 'herdr pane list' for workspace '${workspaceId}' reported no panes; no session was opened`,
+        { worktree: resolved.name, branch, path: targetCwd, workspaceId },
+      );
+    }
+  } else if (found.conflict) {
+    // Two different workspace ids claim this worktree: fail closed rather
+    // than opening a second workspace blindly.
+    return errorResult(
+      `worktree session open failed: 'herdr worktree list' names ${found.claimed} different workspaces for '${branch}'; resolve it by hand and retry; no session was opened`,
+      { worktree: resolved.name, branch, path: targetCwd },
+    );
+  } else {
+    // Creation: open the workspace, then use its root pane. The open of
+    // an ALREADY-OPEN worktree is deliberately not assumed idempotent:
+    // when it fails, one fresh list decides whether a workspace appeared
+    // anyway (proceed through reuse) or the failure stands.
+    const opened = git.runArgv(herdrBinary(), git.herdrArgv("open", { branch, cwd: repo.root, noFocus: true }), {
+      cwd: repo.root,
+      timeoutMs: 60000,
+    });
+    if (opened.status !== 0) {
+      const relisted = git.runArgv(herdrBinary(), git.herdrArgv("list", { cwd: repo.root }), {
+        cwd: repo.root,
+        timeoutMs: 60000,
+      });
+      const retry = relisted.status === 0
+        ? sessionWorkspaceId(relisted.stdout, repo.root, branch, targetCwd)
+        : { id: null, matched: 0, claimed: 0, conflict: false };
+      if (retry.id !== null) {
+        workspaceId = retry.id;
+      } else {
+        return errorResult(
+          `worktree session open failed: ${herdrFailureText("herdr worktree open", opened.status, opened.stderr || opened.error)} for branch '${branch}'; no session was opened`,
+          { worktree: resolved.name, branch, path: targetCwd },
+        );
+      }
+    } else {
+      const pair = openedWorkspace(opened.stdout);
+      if (pair.workspaceId === null || pair.paneId === null) {
+        return errorResult(
+          `worktree session open failed: 'herdr worktree open' for branch '${branch}' succeeded but its output named no workspace/pane; no session was started`,
+          { worktree: resolved.name, branch, path: targetCwd },
+        );
+      }
+      workspaceId = pair.workspaceId;
+      paneId = pair.paneId;
+      openedHere = true;
+    }
+    if (paneId === null && workspaceId !== null) {
+      const panes = git.runArgv(herdrBinary(), git.herdrArgv("pane-list", { workspace: workspaceId }), {
+        cwd: repo.root,
+        timeoutMs: 60000,
+      });
+      if (panes.status !== 0) {
+        return errorResult(
+          `worktree session open failed: ${herdrFailureText("herdr pane list", panes.status, panes.stderr || panes.error)} for workspace '${workspaceId}'; the workspace '${workspaceId}' was opened by this call and no session was started in it`,
+          { worktree: resolved.name, branch, path: targetCwd, workspaceId },
+        );
+      }
+      paneId = rootPaneId(panes.stdout);
+      if (paneId === null) {
+        return errorResult(
+          `worktree session open failed: 'herdr pane list' for workspace '${workspaceId}' reported no panes; the workspace '${workspaceId}' was opened by this call and no session was started in it`,
+          { worktree: resolved.name, branch, path: targetCwd, workspaceId },
+        );
+      }
+    }
+  }
+
+  // (d) Start Pi in the pane. The pane's cwd is the worktree, so Pi's
+  // own session directory is the worktree's: no `--session-dir`.
+  const started = git.runArgv(herdrBinary(), git.herdrArgv("agent-start", {
+    name: agentName, kind: "pi", pane: paneId,
+    timeout: String(AGENT_START_TIMEOUT_MS), agentArgs: piArgs,
+  }), {
+    cwd: repo.root,
+    timeoutMs: AGENT_START_TIMEOUT_MS + 60000,
+  });
+  if (started.status !== 0) {
+    const createdNote = openedHere
+      ? `; the workspace '${workspaceId}' was opened by this call and no session was started in it`
+      : `; the workspace '${workspaceId}' already existed and no session was started in it`;
+    return errorResult(
+      `worktree session open failed: ${herdrFailureText("herdr agent start", started.status, started.stderr || started.error)} for agent '${agentName}' in pane '${paneId}'${createdNote}`,
+      {
+        worktree: resolved.name, branch, path: targetCwd,
+        paneId, workspaceId, sessionId, resumed, agentName, notify,
+      },
+    );
+  }
+  return textResult(
+    sessionSuccessText(resolved.name, sessionId),
+    {
+      worktree: resolved.name, branch, path: targetCwd,
+      paneId, workspaceId, sessionId, resumed, agentName, notify,
+    },
+    false,
+  );
+}
+
+const worktreeSessionOpenTool = defineTool({
+  name: "worktree_session_open",
+  label: "Worktree Session Open",
+  description: "Open a Pi session inside a registered agent worktree via Herdr (workspace only, never a path): pass the worktree NAME 'worktree list' prints (or a branch name) and optionally a session id to resume. A new session id is minted when resuming is not asked.",
+  parameters: Type.Object({
+    worktree: Type.String({ description: "Name of the registered worktree to open the session in (the flattened branch slug, or a branch name)" }),
+    session: opt(Type.String({ description: "Pi session id or path to resume; absent means a new session" })),
+    name: opt(Type.String({ description: "Agent/pane name; defaults to the worktree name" })),
+    notify: opt(Type.Boolean({ description: "Subscribe the creator to the delegate finish notification (default true)" })),
+  }),
+  async execute(toolCallId, params, signal, onUpdate, ctx) {
+    return executeWorktreeSessionOpen(params, ctx);
+  },
+});
+
+// ---------------------------------------------------------------------------
 // Automatic odd/ capture (S5, D7).
 //
 // The extension observes the Pi tool pipeline for the `read`, `edit` and
@@ -2559,6 +3022,7 @@ export default function (pi) {
     pi.registerTool(worktreeCreateTool);
     pi.registerTool(worktreeListTool);
     pi.registerTool(worktreeCloseTool);
+    pi.registerTool(worktreeSessionOpenTool);
   }
   // Automatic odd/ capture (S5, D7): observe the tool pipeline for the
   // read/edit/write tools. Guarded so hosts (and the older unit-test
@@ -2569,4 +3033,4 @@ export default function (pi) {
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, emitOsc7 };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, emitOsc7, executeWorktreeSessionOpen };

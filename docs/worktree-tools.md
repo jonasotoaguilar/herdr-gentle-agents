@@ -1,14 +1,15 @@
 # Agent worktree tools (`worktree_*`)
 
-Three Pi extension tools plus one mode command, so an agent can manage its
+Four Pi extension tools plus one mode command, so an agent can manage its
 own checkout the way `~/.pi/agent/AGENTS.md` prescribes — one worktree per
-thread — without hand-rolled `git worktree` argv. Everything below is
+thread — and open delegated Pi sessions inside those checkouts —
+without hand-rolled `git worktree` argv. without hand-rolled `git worktree` argv. Everything below is
 checkable against `extensions/gentle-worktree-tools.ts` and
 `lib/worktree-*.js`; nothing here is plan, only code.
 
 ## Tools
 
-All three are registered with `pi.registerTool()` from
+All four are registered with `pi.registerTool()` from
 `extensions/gentle-worktree-tools.ts` (listed in the Pi package's
 `pi.extensions`). Failures return `isError: true` with structured
 `details`; success output is terse, one line per worktree at most. The
@@ -17,7 +18,8 @@ the version this code has actually been exercised against: `0.9.4`,
 verified read-only (`herdr --version`, `herdr plugin list --json`, and
 `--help` for every command the plugin depends on — `plugin list`,
 `plugin install`, `plugin update`, `worktree list`, `worktree create`,
-`worktree remove`, `worktree open` — all present with the flags the
+`worktree remove`, `worktree open`, `pane list`, `agent start`, `agent get`,
+`agent list` — all present with the flags the
 allowlist uses). It is never lowered to a version that cannot be tested.
 
 | Tool | Parameters | Approval | Success text |
@@ -25,6 +27,7 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 | `worktree_create` | `branch: string` (required), `issues: number[]` (required, at least one) | Prompts via `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`); non-interactive sessions proceed without it, and a refusal mutates nothing | `worktree create: <path>` |
 | `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | The session's own checkout first — the principal or a registered worktree — then the principal line when the session is not in it, then the remaining `worktree list: …` agent rows |
 | `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector), `force?: boolean` | Same `ctx.ui.confirm` gate as create; a refusal keeps checkout and entry | `worktree close: <path>` |
+| `worktree_session_open` | `worktree: string` (required — the NAME `worktree list` prints, or a branch name), `session?: string` (a Pi session id to RESUME; absent means a new session), `name?: string` (the agent/pane name, defaulting to the worktree name), `notify?: boolean` (default true; accepted and reported here, honoured by the finish subscription) | None — worktree-scoped by construction (see scope guard) | `worktree session open: <worktree> <session-id>` |
 
 The session moves between checkouts through the mode command's `warp` verb (`/herdr-gentle:worktree warp <name>`, never a tool — the platform keeps session control on the command context). Success text is `worktree warp: <name> -> <path>`; warping to the checkout the session already runs in reports `worktree warp: <name> (already there)` and changes nothing.
 
@@ -74,6 +77,16 @@ Structured `details` on success:
   only for the `worktree warp: <name> (already there)` no-op; `cancelled`
   is `true` only when the session switch was cancelled, in which case the
   forked target session file was removed and nothing else changed.
+- session open: `{worktree, branch, path, paneId, workspaceId, sessionId,
+  resumed, agentName, notify}` — exactly these nine keys. `worktree` is
+  the printed NAME (the slug, even when a branch spelling was passed);
+  `sessionId` is the resumed id or the minted UUID; `resumed` tells which;
+  `agentName` is `name` or the worktree-name default; `notify` is the
+  accepted subscription flag (`true` unless `notify: false` was passed).
+  Failures are errors, never partial successes: each names the herdr call
+  that failed and its exit, and a failure after the workspace was opened
+  by this call names that workspace id so no half-created workspace goes
+  unmentioned.
 
 List line format (pinned by the tool tests):
 
@@ -469,6 +482,57 @@ only each agent's `cwd` and `foreground_cwd`) — while the emission itself is
 unit-tested for its exact bytes and its TTY guard. The open interactive
 shell never changes directory: a child process cannot change its parent
 shell's cwd.
+
+## Session open (S25)
+
+`worktree_session_open` opens a Pi session in a Herdr worktree, and only
+in a worktree. The scope guard is enforced, not documented: the `worktree`
+value resolves through the S24 name resolver (`resolveCheckoutByName` in
+`extensions/gentle-worktree-tools.ts` — one resolver, never a second
+one) against THIS repository's registered live worktrees only. A branch
+spelling resolves through its flattened slug; an absolute or relative
+PATH is refused before any backend runs with `pass the worktree NAME
+'worktree list' prints, not a path`, so no command can ever run outside a
+worktree of this repo. The principal checkout is refused (a session there
+delegates nothing), an unknown name fails closed naming the known ones,
+and a registered row whose checkout is gone is refused as stale — only a
+registered, live worktree proceeds.
+
+Launching is composed, because no single Herdr command starts a worktree
+AND a command in it (`herdr worktree create`/`open` and `herdr pane
+split` take no command, while `herdr agent start <NAME> --kind <KIND>
+--pane <ID> [OPTIONS] [-- [AGENT_ARG]...]` starts an interactive agent in
+an EXISTING pane at a shell prompt):
+
+1. `herdr worktree list --cwd <repoRoot>`; the worktree's workspace is the
+   entry matching that branch/path, read as `open_workspace_id`.
+2. When there is none, `herdr worktree open --branch <branch> --cwd
+   <root> --no-focus` opens one, and `root_pane.pane_id` plus
+   `workspace.workspace_id` from its JSON (the same shape `worktree
+   create` returns) are used. When the open of an already-open worktree
+   fails, one fresh list decides whether a workspace appeared anyway
+   (proceed) or the failure stands — the open is deliberately not assumed
+   idempotent, because that was never tested against the live binary.
+3. When there IS one, `herdr pane list --workspace <id>` names the panes
+   and the ROOT pane — the lowest `<workspace>:pN` index, the convention
+   every observed workspace uses — is used.
+4. `herdr agent start <agentName> --kind pi --pane <paneId> --timeout
+   <ms> -- <pi argv>`, where the Pi argv is `--name <agentName>` plus
+   `--session <id>` when resuming or `--session-id <minted>` for a new
+   session. The id is minted as a UUID (`crypto.randomUUID()`), valid in
+   Pi's `[A-Za-z0-9._-]` session-id charset, so it is known immediately
+   and returned. The pane's cwd is the worktree, so Pi's own session
+directory is the worktree's: no `--session-dir` is ever passed.
+
+Success text is exactly `worktree session open: <worktree> <session-id>`.
+The `herdrArgv` allowlist (`lib/worktree-git.js`) gains exactly the
+commands and flags this uses — `worktree open` (`--branch`, `--cwd`,
+`--no-focus`), `pane list` (`--workspace`), `agent start` (positional
+name, `--kind`, `--pane`, `--timeout`, `--` plus the Pi argv), `agent get`
+(positional target) and `agent list` (no flags) — and keeps its two
+refusals: never `--trust-repository`, never `--focus`. The version floor
+stays `0.9.4`: every one of those flags was run against the installed
+binary before the spec was written.
 
 ## Per-thread ownership
 
