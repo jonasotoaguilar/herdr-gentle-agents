@@ -1654,7 +1654,9 @@ describe('worktree_session_open adversarial regressions', { concurrency: false }
     const docs = fs.readFileSync(path.resolve(LIB_DIR, '..', 'docs', 'worktree-tools.md'), 'utf8');
     assert.ok(!docs.includes('so no command can ever run outside a'),
       'the scope sentence must not promise more than the name guard enforces');
-    assert.ok(docs.includes('checked to be the worktree'),
+    assert.ok(docs.includes("The pane's id must carry the worktree's workspace"),
+      'the pane claim must say the id carries its workspace');
+    assert.ok(docs.includes('must be the worktree or inside it'),
       'the pane cwd claim must say it is checked');
     assert.ok(!docs.includes('never `--focus`'),
       'the allowlist accepts --focus for the calls that predate the session tool');
@@ -1864,6 +1866,133 @@ describe('worktree_session_open adversarial regressions (round 2)', { concurrenc
       try {
         if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
       } catch {}
+      restoreEnv();
+    }
+  });
+});
+
+// Round 3 of the same verification: the binding matcher was still a SUFFIX
+// test, so a resume id that is only an underscore-suffix of the published
+// id (`session: "def"` against `..._abc_def.jsonl`) or a stem-shaped id
+// claimed a finish for a different session — both on a normal resume. The
+// id is now compared against the SEGMENT the file names.
+
+describe('worktree_session_open adversarial regressions (round 3)', { concurrency: false }, () => {
+  const settle = (tag, bindingId, session) => ({
+    root: makeRepo(tag),
+    bindingId,
+    session,
+  });
+
+  async function openAndRead({ root, bindingId, session, worktree, workspaceId, paneId }) {
+    const target = addRegistered(root, worktree);
+    const herdr = makeWatchHerdrStub();
+    const world = watchWorld(root, worktree, target, workspaceId);
+    const seq = writeAgentSequence(paneId, [boundDoc('working', paneId, bindingId), boundDoc('idle', paneId, bindingId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    const loaded = await loadExtensionWithSender();
+    const result = await callSessionOpen(loaded.tools, { worktree: worktree.replace(/\//g, '-'), session }, makeCtx(root));
+    if (result.isError) return { result, loaded };
+    await waitUntil(() => loaded.sent.length >= 1, 3000, 'the outcome');
+    return { result, loaded };
+  }
+
+  test('a session id that is only an underscore-suffix of the published id is not a finish', async () => {
+    const ctx = settle('adv3-suffix', 'abc_def', 'def');
+    const { result, loaded } = await openAndRead({ ...ctx, worktree: 'feat/adv3-suffix', workspaceId: 'ws-adv3-suffix', paneId: 'ws-adv3-suffix:p1' });
+    try {
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.notEqual(loaded.sent[0][0].details.outcome, 'finished', 'abc_def is a different session than def');
+    } finally {
+      try { if (loaded.mod && loaded.mod.clearSessionWatchers) loaded.mod.clearSessionWatchers(); } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a session id equal to the file stem is not that file session', async () => {
+    const real = '9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f';
+    const stem = `2026-01-01T00-00-00-000Z_${real}`;
+    const { result, loaded } = await openAndRead({
+      root: makeRepo('adv3-stem'), bindingId: real, session: stem,
+      worktree: 'feat/adv3-stem', workspaceId: 'ws-adv3-stem', paneId: 'ws-adv3-stem:p1',
+    });
+    try {
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.notEqual(loaded.sent[0][0].details.outcome, 'finished', 'the file names the id, not the stem');
+    } finally {
+      try { if (loaded.mod && loaded.mod.clearSessionWatchers) loaded.mod.clearSessionWatchers(); } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a resume id that itself contains an underscore still matches its own file', async () => {
+    const { result, loaded } = await openAndRead({
+      root: makeRepo('adv3-own'), bindingId: 'abc_def', session: 'abc_def',
+      worktree: 'feat/adv3-own', workspaceId: 'ws-adv3-own', paneId: 'ws-adv3-own:p1',
+    });
+    try {
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.equal(loaded.sent[0][0].details.outcome, 'finished', 'an id containing _ is still its own file');
+    } finally {
+      try { if (loaded.mod && loaded.mod.clearSessionWatchers) loaded.mod.clearSessionWatchers(); } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('an open reply whose root pane reports another workspace is refused', async () => {
+    const root = makeRepo('adv3-panews');
+    const target = addRegistered(root, 'feat/adv3-panews');
+    const herdr = makeWatchHerdrStub();
+    const world = createWorld(root, 'feat/adv3-panews', target, {
+      result: {
+        workspace: { workspace_id: 'ws-new3' },
+        root_pane: { pane_id: 'ws-new3:p1', cwd: target, workspace_id: 'other-ws' },
+      },
+    });
+    const seq = writeAgentSequence('ws-new3:p1', [agentDoc('working', 'ws-new3:p1')]);
+    const modeEnv = scratchModeEnv();
+    setEnv({ ...watchEnv(modeEnv, herdr, world, seq), HERDR_STUB_WORKTREE_OPEN: world.openFile });
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender();
+      mod = loaded.mod;
+      const result = await callSessionOpen(loaded.tools, { worktree: 'feat/adv3-panews' }, makeCtx(root));
+      assert.equal(result.isError, true, `expected a refusal: ${resultText(result)}`);
+      assert.equal(startCount(herdr.log), 0, 'nothing is started when the reply disagrees with itself');
+    } finally {
+      try { if (mod && mod.clearSessionWatchers) mod.clearSessionWatchers(); } catch {}
+      restoreEnv();
+    }
+  });
+
+  test('a send that never settles stops the watcher at the maximum wait', async () => {
+    const root = makeRepo('adv3-hang');
+    const target = addRegistered(root, 'feat/adv3-hang');
+    const herdr = makeWatchHerdrStub();
+    const paneId = 'ws-adv3-hang:p1';
+    const world = watchWorld(root, 'feat/adv3-hang', target, 'ws-adv3-hang');
+    const seq = writeAgentSequence(paneId, [agentDoc('working', paneId), agentDoc('idle', paneId)]);
+    const modeEnv = scratchModeEnv();
+    setEnv(watchEnv(modeEnv, herdr, world, seq));
+    let mod;
+    try {
+      const loaded = await loadExtensionWithSender({ sendMessage: () => new Promise(() => {}) });
+      mod = loaded.mod;
+      assert.equal(typeof mod.startAgentSessionWatcher, 'function', 'the watcher is exported for tests');
+      const timer = mod.startAgentSessionWatcher(
+        {
+          paneId, worktree: 'feat-adv3-hang', branch: 'feat/adv3-hang', sessionId: 'session-adv3',
+          agentName: 'feat-adv3-hang', workspaceId: 'ws-adv3-hang', path: target, repoRoot: root,
+        },
+        { intervalMs: 25, graceMs: 10, maxWaitMs: 150 },
+      );
+      await sleep(700);
+      // `_idleTimeout` is -1 once the interval is cleared: a host whose send
+      // never settles must not leave the watcher ticking forever.
+      assert.equal(timer._idleTimeout, -1, 'the watcher stopped at the maximum wait');
+    } finally {
+      try { if (mod && mod.clearSessionWatchers) mod.clearSessionWatchers(); } catch {}
       restoreEnv();
     }
   });

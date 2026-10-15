@@ -522,12 +522,12 @@ an EXISTING pane at a shell prompt):
    `--session <id>` when resuming or `--session-id <minted>` for a new
    session. The id is minted as a UUID (`crypto.randomUUID()`), valid in
    Pi's `[A-Za-z0-9._-]` session-id charset, so it is known immediately
-   and returned. The pane is checked to belong to the workspace Herdr
-reports for that worktree, and its cwd — when the pane reports one — is
-checked to be the worktree or inside it, before Pi starts, so Pi's own
-session directory is the worktree's: no `--session-dir` is ever passed. A
-pane whose shell moved elsewhere is refused, because a session started
-there would not be in the worktree.
+   and returned. The pane's id must carry the worktree's workspace — and the
+owner a pane reports, when it reports one, must agree with it — and its
+cwd, when the pane reports one, must be the worktree or inside it, before
+Pi starts, so Pi's own session directory is the worktree's: no
+`--session-dir` is ever passed. A pane whose shell moved elsewhere is
+refused, because a session started there would not be in the worktree.
 
 Success text is exactly `worktree session open: <worktree> <session-id>`.
 The `herdrArgv` allowlist (`lib/worktree-git.js`) gains exactly the

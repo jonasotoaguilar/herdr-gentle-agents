@@ -1995,16 +1995,22 @@ function sessionWatchContent(outcome, { worktree, paneId, sessionId, maxWaitMs }
 }
 
 // Is this published binding OUR session? The value is the session file
-// this plugin reports (`<timestamp>_<session-id>.jsonl`), so the id is
-// matched at the END of the file name, never as a substring: a substring
-// match calls another session ours — `session: "abc"` would accept
-// `..._xabc.jsonl`, and `session: "."` would accept any path at all.
+// this plugin reports, named `<timestamp>_<session-id>.jsonl`, so the id
+// is compared against the SEGMENT the file names — never against the
+// whole name as a substring or a suffix. Both would call another session
+// ours: `session: "def"` matches `..._abc_def.jsonl`, `session: "."`
+// matches any path, and a stem-shaped id matches the whole basename. The
+// timestamp prefix is stripped only when it has the shape Pi writes, so an
+// id that itself contains `_` still matches its own file.
+const SESSION_FILE_STEM = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_/;
 function bindingNamesSession(value, sessionId) {
   if (typeof value !== "string" || value.length === 0) return false;
   if (typeof sessionId !== "string" || sessionId.length === 0) return false;
   if (value === sessionId) return true;
   const base = path.basename(value);
-  return base.endsWith(`_${sessionId}.jsonl`) || base === `${sessionId}.jsonl`;
+  if (!base.endsWith(".jsonl")) return false;
+  const stem = base.slice(0, -6);
+  return stem.replace(SESSION_FILE_STEM, "") === sessionId;
 }
 
 // Read one `herdr agent get` reply: `{status, vanished, bound, foreign}`.
@@ -2169,6 +2175,12 @@ function startAgentSessionWatcher({ paneId, worktree, branch, sessionId, agentNa
   };
   const timer = setInterval(() => {
     if (pendingOutcome !== null) {
+      // A host whose send never settles must not keep the watcher alive past
+      // its maximum wait: the outcome is dropped, and the timer with it.
+      if (delivering && Date.now() - pendingAt >= maxWaitMs) {
+        stop();
+        return;
+      }
       attemptDelivery();
       return;
     }
@@ -2420,7 +2432,7 @@ function openedWorkspace(stdout) {
   try {
     doc = JSON.parse(stdout);
   } catch {
-    return { workspaceId: null, paneId: null, paneCwd: null };
+    return { workspaceId: null, paneId: null, paneCwd: null, paneWorkspace: null };
   }
   const result = doc && typeof doc === "object" ? (doc.result || doc) : null;
   const workspace = result && typeof result.workspace === "object" ? result.workspace : null;
@@ -2439,7 +2451,10 @@ function openedWorkspace(stdout) {
   const paneCwd = rootPane && typeof rootPane.cwd === "string" && rootPane.cwd.length > 0
     ? rootPane.cwd
     : typeof result.cwd === "string" && result.cwd.length > 0 ? result.cwd : null;
-  return { workspaceId, paneId, paneCwd };
+  const paneWorkspace = rootPane && typeof rootPane.workspace_id === "string" && rootPane.workspace_id.length > 0
+    ? rootPane.workspace_id
+    : null;
+  return { workspaceId, paneId, paneCwd, paneWorkspace };
 }
 
 function herdrFailureText(call, status, reason) {
@@ -2675,6 +2690,15 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
       if (!pair.paneId.startsWith(`${pair.workspaceId}:`)) {
         return errorResult(
           `worktree session open failed: 'herdr worktree open' named workspace '${pair.workspaceId}' but pane '${pair.paneId}', which does not belong to it; no session was started`,
+          { worktree: resolved.name, branch, path: targetCwd, workspaceId: pair.workspaceId, paneId: pair.paneId },
+        );
+      }
+      // The pane's own workspace, when the reply reports one, must agree
+      // with the workspace the reply names: the reuse path refuses that
+      // disagreement, so this path does too.
+      if (pair.paneWorkspace !== null && pair.paneWorkspace !== pair.workspaceId) {
+        return errorResult(
+          `worktree session open failed: 'herdr worktree open' named workspace '${pair.workspaceId}' but its root pane reports workspace '${pair.paneWorkspace}'; no session was started`,
           { worktree: resolved.name, branch, path: targetCwd, workspaceId: pair.workspaceId, paneId: pair.paneId },
         );
       }
