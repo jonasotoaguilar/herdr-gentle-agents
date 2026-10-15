@@ -448,11 +448,17 @@ Honest scope of the move: the SESSION cwd changes and the tools operate in
 the target, while the PROCESS cwd does not (Pi never calls `process.chdir`).
 After a successful switch the command emits OSC-7
 (`ESC ] 7 ; file://<cwd> ESC \`, only when the output stream is a TTY) so
-the TERMINAL learns the new cwd, and Herdr follows it natively — it embeds
-ghostty-vt, which parses OSC 7 into its pane pwd, so new panes, tabs and
-workspaces with `new_cwd = "follow"` inherit it; no cmux-style socket protocol
-is needed. The open interactive shell never changes directory: a child process
-cannot change its parent shell's cwd.
+the TERMINAL learns the new cwd, and Herdr follows it natively: it embeds
+ghostty-vt, whose `pwd_changed` callback is documented as fired by OSC 7,
+so its pane pwd tracks the emission and new panes, tabs and workspaces with
+`new_cwd = "follow"` inherit it; no cmux-style socket protocol is needed.
+That Herdr leg is documented from herdr's own source and changelog and is
+NOT exercised end to end here — herdr's CLI offers no way to inject bytes
+into a pane and no field for the terminal pwd (`herdr api snapshot` reports
+only each agent's `cwd` and `foreground_cwd`) — while the emission itself is
+unit-tested for its exact bytes and its TTY guard. The open interactive
+shell never changes directory: a child process cannot change its parent
+shell's cwd.
 
 ## Per-thread ownership
 
