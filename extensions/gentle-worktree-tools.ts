@@ -1380,7 +1380,10 @@ function prefixScore(query, slug) {
 // Live checkouts git lists that no registry row owns, by resolved identity.
 // `all: true` prints them, so a name they share with a registered row is
 // ambiguous to the reader even though only the registered row is selectable.
-function liveUnregisteredEntries(rows, live, repoRoot) {
+// The principal checkout is NOT one of them: it prints as `principal`, never
+// by its branch, so a branch whose slug happens to equal the principal's own
+// branch slug leaves the name unique instead of colliding with it.
+function liveUnregisteredEntries(rows, live, repoRoot, principal) {
   const owned = new Set();
   for (const row of rows) {
     if (!row || typeof row.path !== "string" || row.path.length === 0) continue;
@@ -1388,12 +1391,18 @@ function liveUnregisteredEntries(rows, live, repoRoot) {
     if (st.absolute !== null) owned.add(st.absolute);
     if (st.real !== null) owned.add(st.real);
   }
+  let principalId = null;
+  if (principal && typeof principal.path === "string" && principal.path.length > 0) {
+    const st = checkoutState(principal.path, repoRoot);
+    principalId = st.real !== null ? st.real : st.absolute;
+  }
   const out = [];
   for (const entry of live || []) {
     if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
     const st = checkoutState(entry.path, repoRoot);
     const id = st.real !== null ? st.real : st.absolute;
     if (id === null || owned.has(id)) continue;
+    if (principalId !== null && id === principalId) continue;
     out.push({ path: id, branch: entry.branch || "(detached)" });
   }
   return out;
@@ -1401,7 +1410,7 @@ function liveUnregisteredEntries(rows, live, repoRoot) {
 
 function resolveCheckoutByName(name, git, read, principal, live, repoRoot) {
   const rows = read && Array.isArray(read.worktrees) ? read.worktrees : [];
-  const extras = liveUnregisteredEntries(rows, live, repoRoot);
+  const extras = liveUnregisteredEntries(rows, live, repoRoot, principal);
   const knownNames = [];
   if (principal) knownNames.push("principal");
   const seen = new Set();

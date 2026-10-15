@@ -1186,4 +1186,27 @@ describe('S24: worktree_close accepts name (T33 RED)', { concurrency: false }, (
       restoreEnv();
     }
   });
+
+  test('a name is not ambiguous merely because the principal branch flattens to it', async () => {
+    const root = makeRepo('close-principal-slug');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      // The principal prints as `principal`, never by its branch, so a branch
+      // whose slug equals the principal's own branch slug leaves the name
+      // unique. The principal branch is renamed first because `git worktree
+      // add -b` cannot reuse a branch that is already checked out.
+      git(root, ['branch', '-m', 'release/1']);
+      const target = addRegistered(root, 'release-1', { thread: 'thread-1', issues: [35] });
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { name: 'release-1' }, ctx);
+      assert.equal(result.isError, undefined, `the name is unique in the listing: ${resultText(result)}`);
+      assert.equal(resultText(result), `worktree close: ${target}`);
+    } finally {
+      restoreEnv();
+    }
+  });
 });
