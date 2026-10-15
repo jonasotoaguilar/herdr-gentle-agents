@@ -297,10 +297,12 @@ shell string is ever built. Issues are verified to exist through `gh
 issue view <n> --json number,title,state` (see limitations).
 
 A pre-existing entry of ANY kind at the target path — an empty or
-non-empty directory, a file, a FIFO, a symlink, a dangling symlink — is
-refused before any backend runs: `target path <path> is occupied by a
-<kind>: remove it by hand or pick another branch; the registry was left
-untouched`. Git's raw `fatal: '<path>' already exists` never surfaces
+non-empty directory, a file, a FIFO, a socket, or a symlink — is refused
+before any backend runs: `target path <path> is occupied by a <kind>:
+remove it by hand or pick another branch; the registry was left
+untouched`. `<kind>` names what is actually there: a symlink reports
+`symlink to a file` or `symlink to a directory` when its referent
+resolves, and a bare `symlink` when it dangles. Git's raw `fatal: '<path>' already exists` never surfaces
 (and the empty directory is refused precisely because git would silently
 adopt it), and no registry row is written, so removing the occupant lets
 the next create at the same path succeed. The single exception is the
@@ -340,11 +342,6 @@ warning and never aborts the remaining steps.
   sync`, `Cargo.toml` → `cargo fetch`, `go.mod` → `go mod download`. A
   missing binary is `skipped`, never a failure. No lockfile at all is one
   `skipped` install step.
-- **Symlinks.** `odd/` always — created in the principal checkout first
-  when absent — `.agents/` and `.claude/` only when present in the
-  principal. Never `.codegraph/`: each worktree gets a fresh index.
-  Existing worktree paths are never replaced; links are relative so the
-  layout survives a move.
 - **`codegraph init`** when the CLI is on `PATH` (`skipped` with a reason
   when absent). The tools do not index for you beyond this.
 
@@ -353,12 +350,14 @@ no `odd/`, `.agents/`, `.claude/` or any other link is created, and `odd/`
 is no longer created in the principal checkout either — that directory
 existed only to be linked. What remains is unchanged: untracked env
 copies, stack-detected dependency installs, and `codegraph init` when
-available. Two consequences are recorded rather than hidden: the odd
-capture below stays, but a worktree no longer has a reachable `odd/`, so
-it can only associate documents a session reaches by their absolute path
-in the principal; and closing a tool-created checkout still needs `force`
-wherever env copies or a `codegraph init` leave untracked files (a
-checkout with neither closes without `force`).
+available. Two consequences are recorded rather than hidden: a worktree
+reaches `odd/` only when the repository tracks it — a tracked `odd/` is
+checked out as a real directory, so a session there finds it both as the
+worktree-relative `odd/…` and as the principal's absolute path, while an
+untracked `odd/` is reachable in the principal alone; and closing a
+tool-created checkout still needs `force` wherever env copies or a
+`codegraph init` leave untracked files (a checkout with neither closes
+without `force`).
 
 The principal checkout is recovered from the shared common dir (for a
 normal repository, `<principal>/.git` is the common dir), not assumed
@@ -442,12 +441,12 @@ each call it resolves the touched `.md` path against the principal
 checkout's `odd/` directory and associates it with the worktree of the
 **agent's context** — the invoking context's working directory matched to
 the longest enclosing registry entry — never from the file path itself.
-Since S21 removed the creation symlinks, a worktree no longer has a
-reachable `odd/` of its own: the per-call leg associates `.md` documents
-the session reaches by their absolute path in the principal checkout
-(which still resolves against the shared `odd/` root); the re-scan leg
-below only converges documents when the worktree has an `odd/` directory
-at all (for example recreated by hand). A call running in the principal checkout itself
+Since S21 removed the creation symlinks, a worktree reaches an `odd/` of
+its own only when the repository tracks one: the per-call leg resolves
+the touched path against the principal checkout's `odd/`, so a tracked
+`odd/` is associated both as the worktree-relative document and as the
+principal's absolute path; the re-scan leg below only converges documents
+when the worktree has an `odd/` directory at all. A call running in the principal checkout itself
 associates nothing; associations are idempotent (`addOddDoc` records each
 `odd/<rel>` once, same relative name from every worktree).
 
