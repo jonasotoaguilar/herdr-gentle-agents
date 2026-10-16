@@ -24,8 +24,9 @@
 # herdr-plugin/, tools/, scripts/ or odd/ and does contain
 # extensions/gentle-herdr-state.ts. No publishing happens here; the npm
 # publish for the pi series lives in .github/workflows/release.yml and
-# authenticates with trusted publishing (OIDC) — no token exists anywhere —
-# and never runs on a herdr-v tag.
+# authenticates with trusted publishing (OIDC) — no npm token exists anywhere,
+# in the workflow or in the `release` environment — and never runs on a
+# herdr-v tag.
 #
 # Environment (set by release.yml; overridable for local checks):
 #   RELEASE_TAG         tag being released, e.g. pi-v0.1.0 (required)

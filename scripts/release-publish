@@ -16,8 +16,8 @@
 # it: a failure during upload leaves a draft, which releases/latest ignores.
 # No npm publishing, no registry uploads, no other asset builds here: the
 # pi-series npm publish lives in the workflow and authenticates with trusted
-# publishing (OIDC) — no token exists anywhere — and never runs on a herdr-v
-# tag. Base notes
+# publishing (OIDC) — no npm token exists anywhere, in the workflow or in the
+# `release` environment — and never runs on a herdr-v tag. Base notes
 # are curated afterwards by editing the published release in place.
 #
 # Repair path: when a release for the tag already exists and is a draft, only
