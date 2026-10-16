@@ -15,6 +15,7 @@
     "type": "git",
     "url": "git+https://github.com/jonasotoaguilar/herdr-gentle-agents.git"
   },
+  "license": "MIT",
   "engines": {
     "node": ">=18"
   },

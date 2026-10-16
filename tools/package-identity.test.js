@@ -73,6 +73,14 @@ describe('Pi package identity', () => {
     );
   });
 
+  it('declares the license the published package is bound to', () => {
+    // A published version is immutable, so the license has to be right BEFORE
+    // the first publish: npm shows it on the package page and nothing can
+    // correct it afterwards.
+    assert.equal(PKG.license, 'MIT', 'package.json must declare the license');
+    assert.ok(fs.existsSync(path.join(REPO_ROOT, 'LICENSE')), 'LICENSE must exist at the repository root');
+  });
+
   it('no longer carries the Herdr plugin manifest at the repository root', () => {
     assert.equal(fs.existsSync(path.join(REPO_ROOT, 'herdr-plugin.toml')), false);
   });
