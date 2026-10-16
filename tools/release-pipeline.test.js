@@ -628,6 +628,7 @@ describe('release workflow npm routing (S4)', () => {
     const job = jobBlock(yml(), 'release');
     const piGate = /\n {8}if: startsWith\(github\.ref_name, 'pi-v'\)\n/;
     const setup = stepBlock(job, 'Setup Node for npm publish');
+    assert.match(setup, piGate, 'the Node setup exists only for the publish, so the herdr series must not run it');
     assert.ok(setup.includes('registry-url: https://registry.npmjs.org'), 'the publish target registry must be set');
     const install = stepBlock(job, 'Install npm 12 (trusted publishing requirement)');
     assert.match(install, piGate, 'the npm install must be gated to the pi series, which the herdr series never needs');

@@ -106,15 +106,17 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node for npm publish
+        if: startsWith(github.ref_name, 'pi-v')
         uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
       # Pi series only, like the publish itself: the herdr series never touches
-      # npm, and a registry outage must not fail its GitHub Release. Trusted
-      # publishing needs npm >= 11.5.1, and the pinned major requires Node
-      # ^22.22.2 || ^24.15.0 || >=26, which `node-version: 22` tracks today.
+      # npm — no npm command, no registry access — so a registry outage must not
+      # fail its GitHub Release. Trusted publishing needs npm >= 11.5.1, and the
+      # pinned major requires Node ^22.22.2 || ^24.15.0 || >=26, which
+      # `node-version: 22` tracks today.
       - name: Install npm 12 (trusted publishing requirement)
         if: startsWith(github.ref_name, 'pi-v')
         run: npm install -g npm@12
