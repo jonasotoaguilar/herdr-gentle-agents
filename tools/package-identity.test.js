@@ -46,12 +46,39 @@ describe('Pi package identity', () => {
 
   it('ships only Pi-side surfaces in the npm tarball', () => {
     assert.ok(Array.isArray(PKG.files) && PKG.files.length > 0, 'package.json must declare files[]');
-    for (const required of ['extensions', 'bin', 'lib', 'docs', 'README.md', 'DESIGN.md']) {
+    for (const required of ['extensions', 'bin', 'lib', 'docs', 'rules', 'README.md', 'DESIGN.md']) {
       assert.ok(PKG.files.includes(required), `files[] must include ${required}`);
     }
     for (const excluded of ['herdr-plugin', 'tools', 'scripts', 'odd']) {
       assert.ok(!PKG.files.includes(excluded), `files[] must not include ${excluded}`);
     }
+  });
+
+  it('ships the worktree rules file, which the package injects only when asked', () => {
+    assert.ok(PKG.files.includes('rules'), 'files[] must include rules, or rules/worktrees.md never ships');
+    assert.ok(fs.existsSync(path.join(REPO_ROOT, 'rules', 'worktrees.md')), 'rules/worktrees.md must exist');
+  });
+
+  it('declares the repository a provenance attestation binds to', () => {
+    // npm provenance — and the trusted publisher that generates it — binds a
+    // publish to a PUBLIC repository that package.json names, case-sensitively.
+    // A published version is immutable, so the field has to be right before the
+    // first publish rather than after it.
+    const url = PKG.repository && PKG.repository.url ? String(PKG.repository.url) : '';
+    const normalized = url.replace(/^git\+/, '').replace(/\.git$/, '');
+    assert.equal(
+      normalized,
+      'https://github.com/jonasotoaguilar/herdr-gentle-agents',
+      `repository.url must name this repository, got: ${url}`,
+    );
+  });
+
+  it('declares the license the published package is bound to', () => {
+    // A published version is immutable, so the license has to be right BEFORE
+    // the first publish: npm shows it on the package page and nothing can
+    // correct it afterwards.
+    assert.equal(PKG.license, 'MIT', 'package.json must declare the license');
+    assert.ok(fs.existsSync(path.join(REPO_ROOT, 'LICENSE')), 'LICENSE must exist at the repository root');
   });
 
   it('no longer carries the Herdr plugin manifest at the repository root', () => {
