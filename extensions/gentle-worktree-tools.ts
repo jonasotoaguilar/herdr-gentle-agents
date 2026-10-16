@@ -3662,6 +3662,398 @@ function registerWorktreeCommand(pi, toolsRegistered) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// `/herdr-gentle:customize` panel (customize-command T1: S1, S2, S3, S5,
+// S6, S10, S12).
+//
+// One panel for the three toggles (sidebar, moshi, worktree): no argument
+// opens the two-pane view through ctx.ui.custom with the exact overlay
+// options S2 pins; `customize status` keeps the read-only reporting as one
+// terse line per switch and writes nothing. The sidebar and moshi actions
+// stay inline in extensions/gentle-herdr-state.ts and are reached through
+// the single in-process provider slot below — nothing is reimplemented or
+// extracted here. The worktree switch writes the mode file through
+// libRequire("worktree-mode.js"), like the `/herdr-gentle:worktree`
+// command above.
+//
+// S10: @earendil-works/pi-tui is resolved LAZILY inside the handler
+// through the injectable customizeTuiLoader seam (tests inject a stub;
+// production defaults to a lazy import), never a top-level import — a
+// top-level import would force a stub line into twelve test loaders. When
+// the helpers cannot be loaded, or ctx.ui.custom is missing, the command
+// falls back to the plain ctx.ui.select menu (category, then value) and
+// says nothing about /reload. No string anywhere asks the user to run
+// /reload (S5): the notification says what changed and the command
+// reloads itself when the change reported needsReload.
+// ---------------------------------------------------------------------------
+
+// Injectable seam for the TUI helpers: defaults to the lazy import so no
+// test loader needs a new stub line. Tests replace it per load.
+let customizeTuiLoader = () => import("@earendil-works/pi-tui");
+
+function setCustomizeTuiLoader(loader) {
+  customizeTuiLoader = loader;
+}
+
+const CUSTOMIZE_CATEGORIES = [
+  {
+    id: "sidebar",
+    title: "Agentes sidebar",
+    rows: [
+      { id: "gentle", label: "Gentle (this extension)", detail: "publishes agent state and SessionChanges from Gentle" },
+      { id: "native", label: "Native Herdr", detail: "hands the pane back to Herdr's own agent state" },
+    ],
+  },
+  {
+    id: "moshi",
+    title: "Moshi notifications",
+    rows: [
+      { id: "on", label: "On", detail: "notifies ask and finish episodes through Moshi" },
+      { id: "off", label: "Off", detail: "leaves notifications to the host" },
+    ],
+  },
+  {
+    id: "worktree",
+    title: "Worktree tools",
+    rows: [
+      { id: "enabled", label: "Enabled", detail: "agents can create, list, close and open sessions in agent worktrees" },
+      { id: "disabled", label: "Disabled", detail: "the worktree tools are not registered" },
+    ],
+  },
+];
+
+function customizeReadSlot() {
+  try {
+    const slot = globalThis[Symbol.for("herdr-gentle.customize.v1")];
+    if (slot && typeof slot === "object") return slot;
+  } catch {
+    // A hostile globalThis never breaks the command: fail closed below.
+  }
+  return null;
+}
+
+function customizeProviderValue(slot, name, ids) {
+  try {
+    const provider = slot ? slot[name] : null;
+    if (!provider || typeof provider !== "object") return { available: false, active: null };
+    if (typeof provider.read !== "function" || typeof provider.apply !== "function") {
+      return { available: false, active: null };
+    }
+    const value = provider.read();
+    if (!ids.includes(value)) return { available: false, active: null };
+    return { available: true, active: value };
+  } catch {
+    return { available: false, active: null };
+  }
+}
+
+function customizeWorktreeValue() {
+  try {
+    return libRequire("worktree-mode.js").readMode().enabled === true ? "enabled" : "disabled";
+  } catch {
+    return "disabled";
+  }
+}
+
+function customizePanelModel() {
+  const slot = customizeReadSlot();
+  const sidebar = customizeProviderValue(slot, "sidebar", ["gentle", "native"]);
+  const moshi = customizeProviderValue(slot, "moshi", ["on", "off"]);
+  const worktreeActive = customizeWorktreeValue();
+  const byId = (id) => CUSTOMIZE_CATEGORIES.find((entry) => entry.id === id);
+  return [
+    { ...byId("sidebar"), available: sidebar.available, active: sidebar.active },
+    { ...byId("moshi"), available: moshi.available, active: moshi.active },
+    { ...byId("worktree"), available: true, active: worktreeActive },
+  ];
+}
+
+function customizeKeyMatches(helpers, key, names) {
+  for (const name of names) {
+    try {
+      if (helpers && typeof helpers.matchesKey === "function" && helpers.matchesKey(key, name)) return true;
+    } catch {
+      // A throwing matcher never matches; the string fallback below decides.
+    }
+  }
+  const text = typeof key === "string" ? key : (key && (key.name || key.key)) || "";
+  const lower = String(text).toLowerCase();
+  return names.some((name) => lower === String(name).toLowerCase());
+}
+
+// Kitty key-release guard (gentle-shell guards the same way): an event the
+// helper module classifies as a key release must change nothing. Without
+// the helper there is nothing to guard on.
+function customizeIsKeyRelease(helpers, data) {
+  try {
+    if (helpers && typeof helpers.isKeyRelease === "function") return helpers.isKeyRelease(data) === true;
+  } catch {
+    // A throwing classifier never releases; fall through to normal handling.
+  }
+  return false;
+}
+
+function customizeTruncate(helpers, text, width) {
+  try {
+    if (helpers && typeof helpers.truncateToWidth === "function") return helpers.truncateToWidth(text, width);
+  } catch {
+    // Fall through to the plain slice.
+  }
+  const chars = [...String(text)];
+  return chars.length > width ? chars.slice(0, width).join("") : String(text);
+}
+
+// The host component contract (pi-coding-agent
+// examples/extensions/overlay-qa-tests.ts plus
+// dist/core/extensions/types.d.ts `custom`): the factory receives
+// (hostTui, theme, keybindings, done) and returns
+// { render(width), handleInput(data), invalidate() }. Selection keys only
+// move local state and ask the host to repaint through
+// hostTui.requestRender(); Esc finishes with done(null) and Enter with
+// done({categoryId, valueId}) — done() resolves ctx.ui.custom() and
+// disposes the overlay. handleInput therefore never writes state,
+// notifies, or reloads: the single apply path runs after custom()
+// resolves (S6 ordering: the panel is gone before any notification or
+// runtime rebuild).
+function createCustomizePanel({ helpers, hostTui, model, done }) {
+  const state = {
+    pane: "categories",
+    cat: 0,
+    row: model.map((category) => {
+      const at = category.rows.findIndex((row) => row.id === category.active);
+      return at >= 0 ? at : 0;
+    }),
+  };
+  function focused() {
+    const category = model[state.cat];
+    return { category, row: category.rows[state.row[state.cat]] || null };
+  }
+  function render(width) {
+    const w = typeof width === "number" && width > 0 ? width : 80;
+    const lines = [];
+    lines.push(customizeTruncate(helpers, "Customize · Gentle Herdr", w));
+    // Left pane: the three switches. Right pane: the focused category's
+    // two rows, headed by the category name (S2).
+    lines.push(customizeTruncate(helpers, "CATEGORIES", w));
+    for (let index = 0; index < model.length; index += 1) {
+      const category = model[index];
+      const cursor = index === state.cat ? "> " : "  ";
+      const suffix = category.available ? "" : " (unavailable)";
+      lines.push(customizeTruncate(helpers, `${cursor}${category.title}${suffix}`, w));
+    }
+    lines.push(customizeTruncate(helpers, model[state.cat].title, w));
+    for (const row of model[state.cat].rows) {
+      const marker = row.id === model[state.cat].active ? "→ " : "  ";
+      lines.push(customizeTruncate(helpers, `${marker}${row.label}`, w));
+      lines.push(customizeTruncate(helpers, `   ${row.detail}`, w));
+    }
+    if (!model[state.cat].available) {
+      lines.push(customizeTruncate(helpers, "   (unavailable in this session)", w));
+    }
+    const current = focused();
+    const effect = current.row ? current.row.detail : "unavailable";
+    lines.push(customizeTruncate(helpers, `Preview · ${current.category.title} · ${effect}`, w));
+    lines.push(customizeTruncate(helpers, "←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close", w));
+    return lines;
+  }
+  function requestPaint() {
+    try {
+      if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
+    } catch {
+      // A repaint failure never breaks navigation.
+    }
+  }
+  function handleInput(data) {
+    if (customizeIsKeyRelease(helpers, data)) return;
+    if (customizeKeyMatches(helpers, data, ["escape", "ctrl+c"])) {
+      done(null);
+      return;
+    }
+    if (customizeKeyMatches(helpers, data, ["left", "right", "tab"])) {
+      state.pane = state.pane === "categories" ? "values" : "categories";
+      requestPaint();
+      return;
+    }
+    if (customizeKeyMatches(helpers, data, ["up"])) {
+      if (state.pane === "categories") state.cat = (state.cat + model.length - 1) % model.length;
+      else {
+        const count = model[state.cat].rows.length;
+        state.row[state.cat] = (state.row[state.cat] + count - 1) % count;
+      }
+      requestPaint();
+      return;
+    }
+    if (customizeKeyMatches(helpers, data, ["down"])) {
+      if (state.pane === "categories") state.cat = (state.cat + 1) % model.length;
+      else {
+        const count = model[state.cat].rows.length;
+        state.row[state.cat] = (state.row[state.cat] + 1) % count;
+      }
+      requestPaint();
+      return;
+    }
+    if (customizeKeyMatches(helpers, data, ["enter", "return"])) {
+      const current = focused();
+      done({ categoryId: current.category.id, valueId: current.row ? current.row.id : null });
+      return;
+    }
+  }
+  function invalidate() {}
+  return { render, handleInput, invalidate, state };
+}
+
+// One shared apply path for the panel and the fallback menu. Returns the
+// verdict; notifies exactly once (providers run against a capturing ctx
+// so an inline notify never double-posts) and reloads only when the
+// change reported needsReload.
+async function applyCustomizeChoice(categoryId, valueId, ctx, toolsRegistered) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const category = CUSTOMIZE_CATEGORIES.find((entry) => entry.id === categoryId);
+  const title = category ? category.title : String(categoryId);
+  if (categoryId === "worktree") {
+    const enabled = valueId === "enabled";
+    const mode = libRequire("worktree-mode.js");
+    try {
+      mode.writeMode(enabled, process.env);
+    } catch (err) {
+      if (typeof notify === "function") notify(`Could not write ${mode.modePath(process.env)}: ${(err && err.message) || err}; nothing was changed.`, "error");
+      return { changed: false, needsReload: false };
+    }
+    // S6: reload only when the runtime's registration must change, i.e.
+    // enabling while the runtime loaded disabled or vice versa.
+    const needsReload = enabled !== toolsRegistered;
+    if (typeof notify === "function") {
+      notify(`Worktree tools ${enabled ? "enabled" : "disabled"}.${needsReload ? " Reloading now to apply the change." : ""}`, "info");
+    }
+    if (needsReload && ctx && typeof ctx.reload === "function") await ctx.reload();
+    return { changed: true, needsReload };
+  }
+  const slot = customizeReadSlot();
+  const provider = slot ? slot[categoryId] : null;
+  if (!provider || typeof provider !== "object" || typeof provider.apply !== "function") {
+    if (typeof notify === "function") notify(`${title} is unavailable in this session; nothing was changed.`, "info");
+    return { changed: false, needsReload: false };
+  }
+  const seen = [];
+  const capture = ctx && typeof ctx === "object"
+    ? { ...ctx, ui: { ...((ctx.ui) ?? {}), notify: (message, level) => { seen.push([message, level]); } } }
+    : ctx;
+  let result = null;
+  try {
+    result = await provider.apply(valueId, capture);
+  } catch (err) {
+    result = { changed: false, needsReload: false, text: `Could not update ${title}: ${(err && err.message) || err}; nothing was changed.` };
+  }
+  if (!result || typeof result !== "object") {
+    result = { changed: false, needsReload: false, text: `${title}: the provider returned no verdict; nothing was changed.` };
+  }
+  const text = typeof result.text === "string" && result.text.length > 0
+    ? result.text
+    : (seen.length > 0 ? String(seen[seen.length - 1][0]) : `${title} updated.`);
+  const needsReload = result.needsReload === true;
+  if (typeof notify === "function") {
+    notify(`${text}${needsReload ? " Reloading now to apply the change." : ""}`, "info");
+  }
+  if (needsReload && ctx && typeof ctx.reload === "function") await ctx.reload();
+  return { changed: result.changed === true, needsReload };
+}
+
+async function runCustomizeFallback(ctx, toolsRegistered) {
+  const select = ctx && ctx.ui ? ctx.ui.select : undefined;
+  if (typeof select !== "function") return;
+  const model = customizePanelModel();
+  let picked = null;
+  try {
+    picked = await select("Customize · Gentle Herdr", model.map((category) => category.title));
+  } catch {
+    picked = undefined;
+  }
+  if (picked === undefined || picked === null) return;
+  const category = model.find((entry) => entry.title === picked);
+  if (!category) return;
+  if (!category.available) {
+    if (ctx && ctx.ui && typeof ctx.ui.notify === "function") {
+      ctx.ui.notify(`${category.title} is unavailable in this session; nothing was changed.`, "info");
+    }
+    return;
+  }
+  let choice = null;
+  try {
+    choice = await select(category.title, category.rows.map((row) => row.label));
+  } catch {
+    choice = undefined;
+  }
+  if (choice === undefined || choice === null) return;
+  const row = category.rows.find((entry) => entry.label === choice);
+  if (!row) return;
+  await applyCustomizeChoice(category.id, row.id, ctx, toolsRegistered);
+}
+
+async function executeCustomize(rawArgs, ctx, toolsRegistered) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const raw = String(rawArgs ?? "").trim();
+  const parts = raw.split(/\s+/).filter((part) => part.length > 0);
+  const head = (parts[0] || "").toLowerCase();
+  if (head === "status") {
+    // S12: one terse line per switch, pinned for headless use. Writes nothing.
+    const slot = customizeReadSlot();
+    const sidebar = customizeProviderValue(slot, "sidebar", ["gentle", "native"]);
+    const moshi = customizeProviderValue(slot, "moshi", ["on", "off"]);
+    const worktree = customizeWorktreeValue();
+    if (typeof notify === "function") {
+      notify(`customize status: sidebar=${sidebar.available ? sidebar.active : "unknown"} moshi=${moshi.available ? moshi.active : "unknown"} worktree=${worktree}`, "info");
+    }
+    return;
+  }
+  if (head !== "") {
+    if (typeof notify === "function") notify(`Unknown option "${raw}". Use /herdr-gentle:customize or /herdr-gentle:customize status.`, "error");
+    return;
+  }
+  // `helpers` is the lazily loaded pi-tui module (measurement and key
+  // matching through the injectable seam); `hostTui` is the live host
+  // object from the factory arguments, used only for requestRender().
+  let helpers = null;
+  try {
+    helpers = await customizeTuiLoader();
+  } catch {
+    helpers = null;
+  }
+  if (helpers && ctx && ctx.ui && typeof ctx.ui.custom === "function") {
+    const model = customizePanelModel();
+    let choice = null;
+    try {
+      choice = await ctx.ui.custom(
+        (hostTui, theme, _keybindings, done) => createCustomizePanel({ helpers, hostTui, model, done }),
+        {
+          overlay: true,
+          overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" },
+        },
+      );
+    } catch {
+      // A host that rejects the overlay degrades to the menu below.
+      await runCustomizeFallback(ctx, toolsRegistered);
+      return;
+    }
+    // Esc (null) does nothing at all: no notification, no write, no
+    // reload. Anything else runs the single apply path once the overlay
+    // is disposed and the interaction is over (S6 ordering).
+    if (!choice || typeof choice !== "object") return;
+    await applyCustomizeChoice(choice.categoryId, choice.valueId, ctx, toolsRegistered);
+    return;
+  }
+  await runCustomizeFallback(ctx, toolsRegistered);
+}
+
+function registerCustomizeCommand(pi, toolsRegistered) {
+  if (typeof pi?.registerCommand !== "function") return;
+  pi.registerCommand("herdr-gentle:customize", {
+    description: "Customize Gentle Herdr in one panel: agent sidebar, Moshi notifications and worktree tools",
+    handler: async (args, ctx) => {
+      await executeCustomize(args, ctx, toolsRegistered);
+    },
+  });
+}
+
 export default function (pi) {
   // The S26 delivery route: watchers started by `worktree_session_open`
   // notify through this host object.
@@ -3679,6 +4071,7 @@ export default function (pi) {
   }
   registerWorktreeCommand(pi, toolsRegistered);
   registerWarpCommand(pi);
+  registerCustomizeCommand(pi, toolsRegistered);
   if (toolsRegistered) {
     pi.registerTool(worktreeCreateTool);
     pi.registerTool(worktreeListTool);
@@ -3694,4 +4087,4 @@ export default function (pi) {
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader };
