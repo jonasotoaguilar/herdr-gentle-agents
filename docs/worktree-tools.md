@@ -29,7 +29,7 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 | `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector), `force?: boolean` | Same `ctx.ui.confirm` gate as create; a refusal keeps checkout and entry | `worktree close: <path>` |
 | `worktree_session_open` | `worktree: string` (required — the NAME `worktree list` prints, or a branch name), `session?: string` (a Pi session id to RESUME; absent means a new session), `name?: string` (the agent/pane name, defaulting to the worktree name), `notify?: boolean` (default true; accepted and reported here, honoured by the finish subscription) | None — worktree-scoped by construction (see scope guard) | `worktree session open: <worktree> <session-id>` |
 
-The session moves between checkouts through the mode command's `warp` verb (`/herdr-gentle:worktree warp <name>`, never a tool — the platform keeps session control on the command context). Success text is `worktree warp: <name> -> <path>`; warping to the checkout the session already runs in reports `worktree warp: <name> (already there)` and changes nothing.
+The session moves between checkouts through `/herdr-gentle:warp <name>` (its own command, never a tool — the platform keeps session control on the command context). Success text is `worktree warp: <name> -> <path>`; warping to the checkout the session already runs in reports `worktree warp: <name> (already there)` and changes nothing.
 
 Structured `details` on success:
 
@@ -72,7 +72,7 @@ Structured `details` on success:
   rows flattening to one name are ambiguous and fail closed naming both,
   never picking one. `principal` cannot be closed — it is not a registered
   agent worktree.
-- warp (command verb, not a tool): `{name, path, branch, kind, alreadyThere,
+- warp (its own command, not a tool): `{name, path, branch, kind, alreadyThere,
   cancelled}` — `kind` is `principal` or `agent`; `alreadyThere` is `true`
   only for the `worktree warp: <name> (already there)` no-op; `cancelled`
   is `true` only when the session switch was cancelled, in which case the
@@ -99,7 +99,7 @@ worktree list: <name> <branch> unregistered        # only with all: true
 
 The FIRST column is the NAME (S24): the flattened branch slug
 (`feat/worktree-warp` → `feat-worktree-warp`), or `principal` for the
-principal checkout — the identifier the warp verb accepts and the close
+principal checkout — the identifier the warp command accepts and the close
 `name` selector takes for every registered row and for the principal. The
 absolute path is not dropped: it stays in `details.worktrees[].path`
 (alongside `details.worktrees[].name`). Two cases are printed but NOT
@@ -407,13 +407,9 @@ The principal checkout is recovered from the shared common dir (for a
 normal repository, `<principal>/.git` is the common dir), not assumed
 from the caller's checkout.
 
-## Mode command
+## Mode switch (`/herdr-gentle:customize` — `Worktree tools` rows)
 
-`/herdr-gentle:worktree enabled|disabled|status|warp <name>` follows the
-`/herdr-gentle:sidebar` pattern. `enable`/`disable` are accepted as
-aliases; anything else (including a missing verb) prints `Unknown option
-"<raw>". Use /herdr-gentle:worktree enabled|disabled|status|warp <name>.` and mutates
-nothing. `status` never writes. Writing the mode refuses a symlinked or
+`Enabled` / `Disabled` in the customize panel flip the shared mode file (the old `/herdr-gentle:worktree enabled|disabled|status` command is removed; `customize status` is its read-only replacement and writes nothing). Writing the mode refuses a symlinked or
 non-regular mode path with a clear error and touches nothing (the normal
 path stays atomic: a sibling temp file created exclusively with an
 unpredictable suffix and renamed into place, retrying a new name a
@@ -429,21 +425,23 @@ plugin state directory — `GENTLE_STATUS_STATE_DIR`, else
 sidebar's. Missing means **enabled**; malformed never enables.
 
 Gating is two-level: at load, the tools register only when the mode reads
-enabled (the command itself always registers, so the mode can be flipped
+enabled (the panel itself always registers, so the mode can be flipped
 back); at execution, each tool re-reads the mode and fails with
-`worktree tools are disabled; run /herdr-gentle:worktree enabled to
-enable them` when disabled. Registration changes need **`/reload`**: the
-`status` verb reports mode state, whether the tools are registered in this
-session, and whether `/reload` is needed, e.g. `Worktree tools are
-enabled (default; no mode file) (tools registered: yes; /reload needed:
-no). Use /herdr-gentle:worktree enabled|disabled|status|warp <name>.`
+`worktree tools are disabled; open /herdr-gentle:customize and apply the
+Worktree tools Enabled row to enable them` when disabled. Registration
+changes reload the extension runtime automatically when the registration
+must change; `customize status` reports mode state, whether the tools are
+registered in this session, and whether a reload ran, e.g. `customize
+status: sidebar=gentle moshi=off worktree=enabled`.
 
-### Warp verb (S23)
+### Warp command (`/herdr-gentle:warp`, S23)
 
-`/herdr-gentle:worktree warp <name>` moves the session to the named
+`/herdr-gentle:warp <name>` moves the session to the named
 checkout, where `<name>` is the flattened branch slug the listing prints
-(`feat/worktree-warp` → `feat-worktree-warp`), or `principal`. It is a
-command verb, never a `worktree_warp` tool: session control
+(`feat/worktree-warp` → `feat-worktree-warp`), or `principal`. With no
+argument it opens a selector of the project's other live checkouts (the
+active checkout travels in the title as text, never as an option); an
+explicit `<name>` skips the selector. It is its own command, never a `worktree_warp` tool: session control
 (`waitForIdle`/`switchSession`) lives on the extension command context, so
 a tool context cannot do this. The name resolves through the same resolver
 as close-by-name — one place, never two: an unknown name fails closed

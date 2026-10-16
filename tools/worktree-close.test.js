@@ -517,7 +517,7 @@ describe('worktree_list output', { concurrency: false }, () => {
       const disabled = await callList(tools, {}, ctx);
       assert.equal(disabled.isError, true);
       assert.ok(
-        resultText(disabled).includes('/herdr-gentle:worktree enabled'),
+        resultText(disabled).includes('/herdr-gentle:customize'),
         `names the toggle: ${resultText(disabled)}`,
       );
 
@@ -525,7 +525,7 @@ describe('worktree_list output', { concurrency: false }, () => {
       const malformed = await callList(tools, { all: true }, ctx);
       assert.equal(malformed.isError, true, 'malformed mode never enables');
       assert.ok(
-        resultText(malformed).includes('/herdr-gentle:worktree enabled'),
+        resultText(malformed).includes('/herdr-gentle:customize'),
         `names the toggle: ${resultText(malformed)}`,
       );
     } finally {
@@ -837,7 +837,7 @@ describe('worktree_close', { concurrency: false }, () => {
       const disabled = await callClose(tools, { branch: 'feat/gated-close' }, ctx);
       assert.equal(disabled.isError, true);
       assert.ok(
-        resultText(disabled).includes('/herdr-gentle:worktree enabled'),
+        resultText(disabled).includes('/herdr-gentle:customize'),
         `names the toggle: ${resultText(disabled)}`,
       );
 
@@ -845,7 +845,7 @@ describe('worktree_close', { concurrency: false }, () => {
       const malformed = await callClose(tools, { branch: 'feat/gated-close' }, ctx);
       assert.equal(malformed.isError, true, 'malformed mode never enables');
       assert.ok(
-        resultText(malformed).includes('/herdr-gentle:worktree enabled'),
+        resultText(malformed).includes('/herdr-gentle:customize'),
         `names the toggle: ${resultText(malformed)}`,
       );
 

@@ -5,7 +5,8 @@
 // Contract under test (observable behavior only — the select/custom calls,
 // the exact notified text, the mode file bytes, and whether ctx.reload was
 // called; never internal function names):
-// - registered unconditionally next to the old commands (which stay);
+// - registered unconditionally next to /herdr-gentle:warp (the three old
+//   commands are gone — S7);
 // - no argument opens the two-pane panel through ctx.ui.custom with the
 //   exact overlay options, and writes nothing until Enter;
 // - Esc closes with zero writes;
@@ -280,15 +281,16 @@ describe('customize command registration', { concurrency: false }, () => {
     }
   });
 
-  test('the three old commands are still registered (T2 owns their removal)', async () => {
+  test('the three old commands are gone and the two new ones are registered (S7)', async () => {
     const modeEnv = scratchStateEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
     const hadSlot = setSlot(undefined);
     try {
       modeLib().writeMode(true, process.env);
       const { commands } = await loadExtension();
-      assert.ok(commands.has('herdr-gentle:worktree'), 'worktree toggle must not disappear in this commit');
-      assert.ok(commands.has('herdr-gentle:warp'), 'warp must not disappear in this commit');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the worktree toggle is removed outright (S7)');
+      assert.ok(commands.has('herdr-gentle:warp'), 'warp stays registered');
+      assert.ok(commands.has('herdr-gentle:customize'), 'customize stays registered');
     } finally {
       setSlot(hadSlot);
       restoreEnv();
@@ -566,6 +568,46 @@ describe('customize panel', { concurrency: false }, () => {
     } finally {
       setSlot(hadSlot);
       restoreEnv();
+    }
+  });
+
+  test('loaded while disabled, worktree Enabled reloads to register and Disabled does not', async () => {
+    // Carried over from the removed mode-command suite: the
+    // `enabled !== toolsRegistered` predicate in the other direction.
+    for (const pick of ['enabled', 'disabled']) {
+      const modeEnv = scratchStateEnv();
+      setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+      const { slot } = stubSlot();
+      const hadSlot = setSlot(slot);
+      try {
+        modeLib().writeMode(false, process.env);
+        const { commands, mod } = await loadExtension();
+        installTuiLoader(mod, async () => stubTui);
+        const host = makeHostTui();
+        // worktree rows: Enabled first, Disabled second; loaded disabled
+        // means the cursor starts on Disabled.
+        const keys = pick === 'enabled'
+          ? ['down', 'down', 'right', 'up', 'enter']
+          : ['down', 'down', 'right', 'enter'];
+        const { ctx, notes, seq } = makeCtx({
+          customImpl: async (factory) => (await driveContract(factory, host, keys)).result,
+        });
+        await customizeDef(commands).handler('', ctx);
+        assert.equal(
+          modeBytes(),
+          pick === 'enabled' ? '{"version":1,"enabled":true}\n' : '{"version":1,"enabled":false}\n',
+          'the mode file is written either way',
+        );
+        assert.equal(notes.length, 1);
+        if (pick === 'enabled') {
+          assert.deepEqual(seq, [`notify:${notes[0][0]}`, 'reload'], 'enabling an unregistered runtime reloads after notify');
+        } else {
+          assert.ok(!seq.includes('reload'), 'repeating the unregistered state needs no reload');
+        }
+      } finally {
+        setSlot(hadSlot);
+        restoreEnv();
+      }
     }
   });
 

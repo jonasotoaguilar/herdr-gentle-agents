@@ -554,7 +554,7 @@ describe('worktree_create', { concurrency: false }, () => {
       const disabled = await callCreate(tools, { branch: 'feat/off', issues: [35] }, ctx);
       assert.equal(disabled.isError, true);
       assert.ok(
-        resultText(disabled).includes('/herdr-gentle:worktree enabled'),
+        resultText(disabled).includes('/herdr-gentle:customize'),
         `names the toggle: ${resultText(disabled)}`,
       );
 
@@ -562,7 +562,7 @@ describe('worktree_create', { concurrency: false }, () => {
       const malformed = await callCreate(tools, { branch: 'feat/off', issues: [35] }, ctx);
       assert.equal(malformed.isError, true, 'malformed mode never enables');
       assert.ok(
-        resultText(malformed).includes('/herdr-gentle:worktree enabled'),
+        resultText(malformed).includes('/herdr-gentle:customize'),
         `names the toggle: ${resultText(malformed)}`,
       );
 
