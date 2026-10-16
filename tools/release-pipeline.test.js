@@ -632,7 +632,7 @@ describe('release workflow npm routing (S4)', () => {
     assert.ok(setup.includes('registry-url: https://registry.npmjs.org'), 'the publish target registry must be set');
     const install = stepBlock(job, 'Install npm 12 (trusted publishing requirement)');
     assert.match(install, piGate, 'the npm install must be gated to the pi series, which the herdr series never needs');
-    assert.match(install, /\n {8}run: npm install -g npm@(?:1[1-9]|[2-9]\d)\n/,
+    assert.match(install, /\n {8}run: npm install -g npm@(?:1[1-9]|[2-9]\d)(?:\.\d+){0,2}\n/,
       'the npm install must pin a major that supports trusted publishing (>= 11.5.1)');
     const publish = stepBlock(job, 'Publish Pi package to npm');
     assert.match(publish, piGate, 'the publish must be gated to the pi series');
@@ -649,6 +649,22 @@ describe('release workflow npm routing (S4)', () => {
     // stance on purpose. Both spellings are covered.
     assert.ok(!/secrets[.[]/.test(y), 'no secret may be read in the workflow, dotted or bracketed');
     assert.ok(!y.includes('NODE_AUTH_TOKEN:'), 'no npm token may be injected into a step');
+    assert.ok(!/_authToken/.test(y), 'no registry token may be written into an npm config');
+    assert.ok(!/npm config set\b/.test(y), 'the workflow must not configure npm credentials');
+  });
+
+  it('keeps the skip on the npm-view failure path, as a warning', (t) => {
+    void t;
+    const publish = stepBlock(jobBlock(yml(), 'release'), 'Publish Pi package to npm');
+    // The exact guard, in one block: a version the registry already has takes
+    // the warning branch and the publish stays in the else, so neither a
+    // silent skip nor an unconditional publish can pass unnoticed.
+    assert.match(publish, /\n {10}if npm view "\$\{name\}@\$\{version\}" version >\/dev\/null 2>&1; then\n {12}echo "::warning::npm already has \$\{name\}@\$\{version\}: publishing is skipped and the GitHub Release is still created"\n {10}else\n {12}npm publish --access public --provenance\n {10}fi\n/,
+      'the publish step must run exactly the npm-view guard, warning and publish');
+    assert.equal((publish.match(/\n {10}else\n/g) || []).length, 1,
+      'exactly one guard, so the publish cannot run unconditionally');
+    assert.ok(!publish.includes('::notice::'), 'a skipped publish must stay visible as a warning');
+    assert.ok(!publish.includes('<<'), 'the publish command must not hide inside a heredoc');
   });
 
   it('never publishes to npm on a herdr tag', (t) => {

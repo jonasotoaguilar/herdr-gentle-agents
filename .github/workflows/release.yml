@@ -11,8 +11,11 @@ name: Release
 #                 with the installer assets.
 #   herdr-vX.Y.Z  the Herdr plugin (herdr-plugin/herdr-plugin.toml). Runs the
 #                 same shared gate and creates the GitHub Release with the
-#                 installer assets only; never touches npm. The bare v* series
-#                 is rejected.
+#                 installer assets only. Its release job runs no npm command and
+#                 reaches no registry — every npm step is gated to the pi series
+#                 — though the shared preflight still runs `npm pack --dry-run`
+#                 for both series to check the tarball surface, which needs no
+#                 registry access. The bare v* series is rejected.
 # Either series attaches install.sh + install.sh.sha256 so the stable
 # releases/latest/download/install.sh entrypoint keeps resolving.
 #
@@ -112,10 +115,10 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      # Pi series only, like the publish itself: the herdr series never touches
-      # npm — no npm command, no registry access — so a registry outage must not
-      # fail its GitHub Release. Trusted publishing needs npm >= 11.5.1, and the
-      # pinned major requires Node ^22.22.2 || ^24.15.0 || >=26, which
+      # Pi series only, like the publish itself: the herdr series runs no npm
+      # command in this job and reaches no registry, so a registry outage must
+      # not fail its GitHub Release. Trusted publishing needs npm >= 11.5.1, and
+      # the pinned major requires Node ^22.22.2 || ^24.15.0 || >=26, which
       # `node-version: 22` tracks today.
       - name: Install npm 12 (trusted publishing requirement)
         if: startsWith(github.ref_name, 'pi-v')
