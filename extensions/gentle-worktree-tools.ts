@@ -3384,6 +3384,189 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
 }
 
 // ---------------------------------------------------------------------------
+// `/herdr-gentle:warp` (customize-command S11): move the SESSION to another
+// checkout of the project through a popup selector, or by explicit `<name>`.
+//
+// WHY its own command instead of a `warp` verb only: S11 wants the
+// project's checkouts offered as a selector with the active checkout shown
+// as text, and an explicit `<name>` keeps the scripted path. Both paths end
+// in the SAME `executeWorktreeWarp` above — one resolver, one mover — so a
+// name carried by more than one live checkout keeps failing closed here
+// exactly as it does for the `worktree` verb, and the notification, the
+// cancelled outcome and the OSC-7 behaviour stay byte for byte. Session
+// control (`waitForIdle`, `switchSession`) exists only on a command
+// context, which is why this is a command and never a tool.
+// ---------------------------------------------------------------------------
+
+// Live, selectable checkouts for the warp selector (S11): the principal
+// checkout first, then the registry rows in registry order — every entry
+// live through the ONE liveness predicate (`checkoutState`: something
+// exists there AND it is a directory AND git still lists it), so a
+// hand-deleted checkout or a path replaced by a file is never offered.
+// Only registered checkouts and the principal are offered: a live checkout
+// git lists that the registry does not own stays out, exactly as
+// `resolveCheckoutByName` refuses to act on one.
+function warpOfferedCheckouts(git, read, principal, live, repoRoot) {
+  const liveIds = liveIdentities(live, repoRoot);
+  const offered = [];
+  if (principal) {
+    offered.push({ name: "principal", path: principal.path, branch: principal.branch });
+  }
+  const rows = read && Array.isArray(read.worktrees) ? read.worktrees : [];
+  for (const row of rows) {
+    if (!row || typeof row.path !== "string" || !path.isAbsolute(row.path)) continue;
+    const st = checkoutState(row.path, repoRoot);
+    if (!st.exists || !st.isDirectory) continue;
+    const id = st.real !== null ? st.real : st.absolute;
+    if (id === null || !liveIds.has(id)) continue;
+    const name = slugOf(git, row.branch);
+    if (name === null) continue;
+    offered.push({ name, path: id, branch: typeof row.branch === "string" ? row.branch : "(detached)" });
+  }
+  return offered;
+}
+
+// The active checkout for the warp selector (S11): the checkout containing
+// or equal to the command context's cwd, deepest match winning, the
+// principal as a candidate — the SAME rule the listing (S19) and the warp
+// already-there check use, never a second notion. Identity is the resolved
+// realpath with an absolute fallback on both legs (never the process cwd
+// and never a lexical resolve alone), so a symlink spelling of a checkout
+// still matches it. Returns the identity string, or null when the session
+// sits outside every checkout.
+function warpActiveIdentity(live, repoRoot, principal, fromCwd) {
+  const sessionState = checkoutState(fromCwd, repoRoot);
+  const sessionId = sessionState.real !== null ? sessionState.real : sessionState.absolute;
+  if (sessionId === null) return null;
+  const ids = [];
+  if (principal && typeof principal.path === "string" && principal.path.length > 0) ids.push(principal.path);
+  for (const entry of live || []) {
+    if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
+    const st = checkoutState(entry.path, repoRoot);
+    const id = st.real !== null ? st.real : st.absolute;
+    if (id !== null && !ids.includes(id)) ids.push(id);
+  }
+  let active = null;
+  for (const id of ids) {
+    if (sessionId === id || sessionId.startsWith(id + path.sep)) {
+      if (active === null || id.length > active.length) active = id;
+    }
+  }
+  return active;
+}
+
+// The title entry for the warp selector (S11): the active checkout as
+// `{name, path}`, resolved against the offered rows first (so the title
+// spells the checkout exactly as the options would), then against the live
+// listing for a checkout the registry does not own. A session outside
+// every checkout titles itself honestly instead of inventing one.
+function warpTitleEntry(git, offered, live, repoRoot, active, fromCwd) {
+  const current = offered.find((entry) => entry.path === active);
+  if (current) return current;
+  if (active !== null) {
+    for (const entry of live || []) {
+      if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
+      const st = checkoutState(entry.path, repoRoot);
+      const id = st.real !== null ? st.real : st.absolute;
+      if (id === active) {
+        return { name: slugOf(git, entry.branch) || "worktree", path: active };
+      }
+    }
+  }
+  return { name: "unknown", path: fromCwd };
+}
+
+// Registered before any gate on purpose, exactly like the `worktree`
+// toggle: the switch belongs to the Pi session, so it must exist even
+// while the worktree tools themselves are unregistered. Hosts without
+// commands simply skip it.
+function registerWarpCommand(pi) {
+  if (typeof pi?.registerCommand !== "function") return;
+  pi.registerCommand("herdr-gentle:warp", {
+    description: "Move this session to another checkout of the project: pick from a selector, or warp <name>",
+    handler: async (args, ctx) => {
+      const notify = ctx?.ui?.notify;
+      const raw = String(args ?? "").trim();
+      // An explicit name skips the selector: the scripted path, reusing
+      // `executeWorktreeWarp` unchanged (its notifications, its cancelled
+      // outcome, its OSC-7 behaviour).
+      if (raw !== "") {
+        const parts = raw.split(/\s+/).filter((part) => part.length > 0);
+        if (parts.length !== 1) {
+          notify?.("worktree warp needs exactly one name: use /herdr-gentle:warp <name> (the flattened branch slug, or principal).", "error");
+          return;
+        }
+        const out = await executeWorktreeWarp(parts[0], ctx);
+        notify?.(out.text, out.isError ? "error" : "info");
+        return;
+      }
+      // No argument: offer the project's checkouts as a selector. The
+      // listing is read fresh here (never cached): a checkout created or
+      // closed since the session started still shows up correctly. Any
+      // listing failure fails closed with an actionable message and
+      // changes nothing — no selector, no switch.
+      const git = libRequire("worktree-git.js");
+      const registry = libRequire("worktree-registry.js");
+      const fromCwd = typeof ctx?.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+      let repo;
+      try {
+        repo = git.repoIdentity(fromCwd);
+      } catch (err) {
+        notify?.(`warp: not a git repository: ${fromCwd}`, "error");
+        return;
+      }
+      const read = registry.readRegistry(repo.root);
+      if (!read.ok) {
+        notify?.(`warp: cannot read worktree registry: ${read.error}`, "error");
+        return;
+      }
+      let live;
+      try {
+        live = git.listWorktrees(repo.root);
+      } catch (err) {
+        notify?.(`warp: cannot list worktrees: ${(err && err.message) || err}`, "error");
+        return;
+      }
+      const principal = principalForName(git, repo.root, repo, live);
+      const offered = warpOfferedCheckouts(git, read, principal, live, repo.root);
+      const active = warpActiveIdentity(live, repo.root, principal, fromCwd);
+      // The active checkout is never an option: it stays out of the list
+      // and travels in the title as text instead.
+      const others = offered.filter((entry) => entry.path !== active);
+      if (others.length === 0) {
+        notify?.("warp: no other checkout to move the session to", "info");
+        return;
+      }
+      // The host `select` primitive has no non-selectable rows, so the
+      // active checkout travels in the title and `Esc`/undefined is the
+      // cancel path.
+      const current = warpTitleEntry(git, offered, live, repo.root, active, fromCwd);
+      const title = `Warp session · current: ${current.name} ${current.path}`;
+      const options = others.map((entry) => `${entry.name} — ${entry.path}`);
+      if (typeof ctx?.ui?.select !== "function") {
+        notify?.("warp: the host UI cannot open a checkout selector here; pass a name instead: /herdr-gentle:warp <name>.", "error");
+        return;
+      }
+      let picked;
+      try {
+        picked = await ctx.ui.select(title, options);
+      } catch {
+        picked = undefined;
+      }
+      // `Esc` cancels silently: no notification, no write, no switch.
+      if (picked === undefined) return;
+      const chosen = others.find((entry) => `${entry.name} — ${entry.path}` === picked);
+      if (!chosen) {
+        notify?.(`warp: unknown checkout selection ${JSON.stringify(picked)}; nothing was moved.`, "error");
+        return;
+      }
+      const out = await executeWorktreeWarp(chosen.name, ctx);
+      notify?.(out.text, out.isError ? "error" : "info");
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // `/herdr-gentle:worktree` mode command (S10, D9).
 //
 // Follows the `/herdr-gentle:sidebar` pattern with the shared mode file in
@@ -3495,6 +3678,7 @@ export default function (pi) {
     toolsRegistered = false;
   }
   registerWorktreeCommand(pi, toolsRegistered);
+  registerWarpCommand(pi);
   if (toolsRegistered) {
     pi.registerTool(worktreeCreateTool);
     pi.registerTool(worktreeListTool);
