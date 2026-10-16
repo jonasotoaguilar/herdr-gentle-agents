@@ -17,9 +17,10 @@
 # downloads the install.sh release asset and fails unless its sha256 equals
 # the tagged ./install.sh. The shared gate for both series is the GitHub
 # Release plus the installer asset; the pi series additionally gates on the
-# npm version above. (The workflow's pi-series npm publish step needs the
-# NPM_TOKEN repository secret via NODE_AUTH_TOKEN and fails closed when it
-# is absent; this script's npm view check itself needs no token.)
+# npm version above. (The workflow's pi-series npm publish step authenticates
+# with trusted publishing (OIDC) and holds no npm token, in the workflow or in
+# the `release` environment; this script's npm view check itself needs no token
+# either, and its GH_TOKEN is GitHub's, not npm's.)
 #
 # Environment (set by release.yml):
 #   RELEASE_TAG         tag to verify, e.g. pi-v0.1.0 or herdr-v0.1.0

@@ -463,3 +463,7 @@ and limitations — lives in
   against them.
 - Live sidebar eyeball with subagents/`ask` remains the final acceptance check
   (see Verification above).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

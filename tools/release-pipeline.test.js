@@ -581,6 +581,24 @@ describe('release-verify verdicts', () => {
 describe('release workflow npm routing (S4)', () => {
   const yml = () => fs.readFileSync(RELEASE_YML, 'utf8');
 
+  // The release job's own block, read where the shape is declared: pins that
+  // scan the whole file can be satisfied by prose elsewhere in it, which is how
+  // an earlier version of these pins stayed green while the real permission
+  // line, command and gate were free to change.
+  const jobBlock = (y, name) => {
+    const start = y.indexOf(`\n  ${name}:\n`);
+    assert.ok(start !== -1, `the workflow must define the ${name} job`);
+    const rest = y.slice(start + 1);
+    const next = /\n {2}\S/.exec(rest.slice(1));
+    return next ? rest.slice(0, next.index + 1) : rest;
+  };
+  const stepBlock = (job, name) => {
+    const steps = job.split(/\n {6}- name: /).slice(1);
+    const step = steps.find((s) => s.startsWith(`${name}\n`));
+    assert.ok(step, `the release job must have a step named "${name}"`);
+    return step;
+  };
+
   it('triggers on both series and ends the bare v* series', (t) => {
     void t;
     const y = yml();
@@ -589,26 +607,70 @@ describe('release workflow npm routing (S4)', () => {
     assert.ok(!y.match(/^\s*-\s*"v\*"/m), 'bare v* trigger must be gone');
   });
 
-  it('gates npm publish to the pi series with the registry token', (t) => {
+  it('grants the release job exactly the two write permissions it needs', (t) => {
     void t;
     const y = yml();
-    assert.ok(y.includes("startsWith(github.ref_name, 'pi-v')"), 'npm publish must be gated on pi-v');
-    assert.ok(y.includes('NPM_TOKEN'), 'workflow must use the NPM_TOKEN secret');
-    assert.ok(y.includes('NODE_AUTH_TOKEN'), 'workflow must pass the token via NODE_AUTH_TOKEN');
-    assert.ok(y.includes('registry-url: https://registry.npmjs.org'), 'workflow must set the npm registry');
-    assert.ok(y.includes('npm publish --access public'), 'workflow must publish with public access');
+    const defaults = y.match(/\npermissions:\n((?: {2}\S.*\n)+)/);
+    assert.ok(defaults, 'the workflow must declare default permissions');
+    assert.equal(defaults[1].trim(), 'contents: read', 'the workflow default must stay contents: read');
+    const declared = jobBlock(y, 'release').match(/\n {4}permissions:\n((?: {6}\S.*\n)+)/);
+    assert.ok(declared, 'the release job must declare its own permissions');
+    const granted = declared[1].split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith('#'))
+      .sort();
+    assert.deepEqual(granted, ['contents: write', 'id-token: write'],
+      `the release job must grant exactly contents: write and id-token: write, got ${granted.join(', ')}`);
   });
 
-  it('fails closed with a clear message when the token is absent', (t) => {
+  it('installs npm for the pi series only, and publishes there with provenance', (t) => {
+    void t;
+    const job = jobBlock(yml(), 'release');
+    const piGate = /\n {8}if: startsWith\(github\.ref_name, 'pi-v'\)\n/;
+    const setup = stepBlock(job, 'Setup Node for npm publish');
+    assert.match(setup, piGate, 'the Node setup exists only for the publish, so the herdr series must not run it');
+    assert.ok(setup.includes('registry-url: https://registry.npmjs.org'), 'the publish target registry must be set');
+    const install = stepBlock(job, 'Install npm 12 (trusted publishing requirement)');
+    assert.match(install, piGate, 'the npm install must be gated to the pi series, which the herdr series never needs');
+    assert.match(install, /\n {8}run: npm install -g npm@(?:1[1-9]|[2-9]\d)(?:\.\d+){0,2}\n/,
+      'the npm install must pin a major that supports trusted publishing (>= 11.5.1)');
+    const publish = stepBlock(job, 'Publish Pi package to npm');
+    assert.match(publish, piGate, 'the publish must be gated to the pi series');
+    assert.match(publish, /\n {10}else\n {12}npm publish --access public --provenance\n {10}fi\n/,
+      'the publish command must sit in the else branch of the guard, with public access and provenance');
+    assert.ok(publish.includes('npm view "${name}@${version}"'),
+      'the publish must check the registry for the version first, so a re-run is safe');
+  });
+
+  it('carries no npm credential, so a broken binding fails loudly', (t) => {
     void t;
     const y = yml();
-    assert.match(y, /NPM_TOKEN.*required|required.*NPM_TOKEN/i);
+    // The absence of the USAGE, not of the words: the header explains the
+    // stance on purpose. Both spellings are covered.
+    assert.ok(!/secrets[.[]/.test(y), 'no secret may be read in the workflow, dotted or bracketed');
+    assert.ok(!y.includes('NODE_AUTH_TOKEN:'), 'no npm token may be injected into a step');
+    assert.ok(!/_authToken/.test(y), 'no registry token may be written into an npm config');
+    assert.ok(!/npm config set\b/.test(y), 'the workflow must not configure npm credentials');
+  });
+
+  it('keeps the skip on the npm-view failure path, as a warning', (t) => {
+    void t;
+    const publish = stepBlock(jobBlock(yml(), 'release'), 'Publish Pi package to npm');
+    // The exact guard, in one block: a version the registry already has takes
+    // the warning branch and the publish stays in the else, so neither a
+    // silent skip nor an unconditional publish can pass unnoticed.
+    assert.match(publish, /\n {10}if npm view "\$\{name\}@\$\{version\}" version >\/dev\/null 2>&1; then\n {12}echo "::warning::npm already has \$\{name\}@\$\{version\}: publishing is skipped and the GitHub Release is still created"\n {10}else\n {12}npm publish --access public --provenance\n {10}fi\n/,
+      'the publish step must run exactly the npm-view guard, warning and publish');
+    assert.equal((publish.match(/\n {10}else\n/g) || []).length, 1,
+      'exactly one guard, so the publish cannot run unconditionally');
+    assert.ok(!publish.includes('::notice::'), 'a skipped publish must stay visible as a warning');
+    assert.ok(!publish.includes('<<'), 'the publish command must not hide inside a heredoc');
   });
 
   it('never publishes to npm on a herdr tag', (t) => {
     void t;
     const y = yml();
-    const cmds = y.split('\n').filter((l) => /^\s*npm publish --access public\s*$/.test(l));
+    const cmds = y.split('\n').filter((l) => /^\s*npm publish\b/.test(l));
     assert.equal(cmds.length, 1, `exactly one npm publish command, got ${cmds.length}`);
     const before = y.slice(0, y.indexOf(cmds[0]));
     const gateIdx = before.lastIndexOf("startsWith(github.ref_name, 'pi-v')");
