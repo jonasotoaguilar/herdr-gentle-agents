@@ -2165,7 +2165,162 @@ function lastFinishedLabel(taskMap) {
   return clean || undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Customize panel providers (customize-command S6, T1).
+//
+// The sidebar and moshi actions stay inline above — nothing is extracted
+// or rewritten here. This block only registers the two actions once at
+// load into the single cross-extension provider slot the worktree
+// extension reads when the panel opens. `Symbol.for` yields the same
+// symbol in both modules without a shared import, so the key literal is
+// the contract: it must stay byte-identical in both files (a test asserts
+// it). Provider contract: read() returns the active value id;
+// apply(value, ctx) returns {changed, needsReload, text} through the
+// existing sidebarEnable/sidebarDisable and writeMoshiFlag/
+// setMoshiExclusion/moshiFlagEnabled paths unchanged. No text here ever
+// asks the user to run /reload (S5): the command notifies once itself
+// and reloads on its own when the verdict says so.
+// ---------------------------------------------------------------------------
+
+function customizeSidebarRead() {
+  try {
+    return readSidebarMode().publish ? "gentle" : "native";
+  } catch {
+    return "native";
+  }
+}
+
+async function customizeSidebarApply(value, ctx) {
+  if (value !== "gentle" && value !== "native") {
+    return { changed: false, needsReload: false, text: `Unknown sidebar value ${JSON.stringify(value)}; nothing was changed.` };
+  }
+  let current = null;
+  try {
+    current = customizeSidebarRead();
+  } catch {
+    current = null;
+  }
+  if (current === value) {
+    return {
+      changed: false,
+      needsReload: false,
+      text: value === "gentle"
+        ? "Gentle sidebar already enabled (ours); nothing was changed."
+        : "Native sidebar already active; nothing was changed.",
+    };
+  }
+  // The existing enable/disable paths notify through ctx while the panel
+  // notifies once itself, so they run against a capturing ctx here and
+  // only their outcome — the re-read mode — decides the verdict.
+  const seen = [];
+  const capture = ctx && typeof ctx === "object"
+    ? { ...ctx, ui: { ...((ctx.ui) ?? {}), notify: (message, level) => { seen.push([message, level]); } } }
+    : ctx;
+  try {
+    if (value === "gentle") await sidebarEnable(capture);
+    else await sidebarDisable(capture);
+  } catch (err) {
+    return { changed: false, needsReload: false, text: `Could not update the sidebar: ${(err && err.message) || err}; nothing was changed.` };
+  }
+  let after = null;
+  try {
+    after = customizeSidebarRead();
+  } catch {
+    after = null;
+  }
+  if (after !== value) {
+    return {
+      changed: false,
+      needsReload: false,
+      text: seen.length > 0 ? String(seen[seen.length - 1][0]) : "Could not update the sidebar; nothing was changed.",
+    };
+  }
+  // S6 reload matrix: the Pi settings exclusion and the native sidebar
+  // only take effect on the next Pi extension load, so a successful
+  // switch ALWAYS reloads.
+  return {
+    changed: true,
+    needsReload: true,
+    text: value === "gentle"
+      ? "Gentle sidebar enabled (ours)."
+      : "Gentle sidebar disabled (native renders again).",
+  };
+}
+
+function customizeMoshiRead() {
+  try {
+    return moshiFlagEnabled(moshiFlagPath()) ? "on" : "off";
+  } catch {
+    return "off";
+  }
+}
+
+async function customizeMoshiApply(value, ctx) {
+  if (value !== "on" && value !== "off") {
+    return { changed: false, needsReload: false, text: `Unknown Moshi value ${JSON.stringify(value)}; nothing was changed.` };
+  }
+  let current = null;
+  try {
+    current = customizeMoshiRead();
+  } catch {
+    current = null;
+  }
+  if (current === value) {
+    return {
+      changed: false,
+      needsReload: false,
+      text: `Moshi notifications already ${value === "on" ? "on" : "off"}; nothing was changed.`,
+    };
+  }
+  const want = value === "on";
+  const file = moshiFlagPath();
+  let exclusionBefore = null;
+  try {
+    exclusionBefore = moshiExclusionPresent();
+  } catch {
+    exclusionBefore = null;
+  }
+  try {
+    writeMoshiFlag(file, want);
+  } catch (err) {
+    return { changed: false, needsReload: false, text: `Could not write ${file}: ${(err && err.message) || err}; nothing was changed.` };
+  }
+  let exclusion = { ok: true, note: "settings.json untouched." };
+  try {
+    exclusion = setMoshiExclusion(want);
+  } catch (err) {
+    exclusion = { ok: false, note: `could not update the Moshi hook exclusion: ${(err && err.message) || err}.` };
+  }
+  let exclusionAfter = null;
+  try {
+    exclusionAfter = moshiExclusionPresent();
+  } catch {
+    exclusionAfter = null;
+  }
+  // S6 reload matrix: the flag is re-read per event (hot, immediate), so
+  // a reload is only needed when the exclusion entry actually changed —
+  // it applies at the next Pi load.
+  return {
+    changed: true,
+    needsReload: exclusionBefore !== exclusionAfter,
+    text: `Moshi notifications ${want ? "enabled" : "disabled"}. ${exclusion.note}`,
+  };
+}
+
+function registerCustomizeProviders() {
+  try {
+    globalThis[Symbol.for("herdr-gentle.customize.v1")] = {
+      sidebar: { read: customizeSidebarRead, apply: customizeSidebarApply },
+      moshi: { read: customizeMoshiRead, apply: customizeMoshiApply },
+    };
+  } catch {
+    // Fail closed: without the slot the panel renders both categories
+    // unavailable instead of throwing at load.
+  }
+}
+
 export default function (pi) {
+  registerCustomizeProviders();
   registerMoshiToggle(pi);
   registerSidebarToggle(pi);
   if (!enabled()) return;
