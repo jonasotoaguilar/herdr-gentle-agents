@@ -589,26 +589,36 @@ describe('release workflow npm routing (S4)', () => {
     assert.ok(!y.match(/^\s*-\s*"v\*"/m), 'bare v* trigger must be gone');
   });
 
-  it('gates npm publish to the pi series with the registry token', (t) => {
+  it('gates npm publish to the pi series and authenticates with OIDC', (t) => {
     void t;
     const y = yml();
     assert.ok(y.includes("startsWith(github.ref_name, 'pi-v')"), 'npm publish must be gated on pi-v');
-    assert.ok(y.includes('NPM_TOKEN'), 'workflow must use the NPM_TOKEN secret');
-    assert.ok(y.includes('NODE_AUTH_TOKEN'), 'workflow must pass the token via NODE_AUTH_TOKEN');
     assert.ok(y.includes('registry-url: https://registry.npmjs.org'), 'workflow must set the npm registry');
-    assert.ok(y.includes('npm publish --access public'), 'workflow must publish with public access');
+    assert.ok(y.includes('npm publish --access public --provenance'), 'workflow must publish with public access and provenance');
+    assert.ok(y.includes('id-token: write'), 'trusted publishing needs id-token: write');
+    assert.match(y, /npm install -g npm@\d+/, 'trusted publishing needs npm >= 11.5.1, so npm is pinned');
   });
 
-  it('fails closed with a clear message when the token is absent', (t) => {
+  it('carries no npm credential, so a broken binding fails loudly', (t) => {
     void t;
     const y = yml();
-    assert.match(y, /NPM_TOKEN.*required|required.*NPM_TOKEN/i);
+    // The absence of the USAGE, not of the words: the header explains the
+    // stance on purpose.
+    assert.ok(!y.includes('secrets.NPM_TOKEN'), 'no npm token secret may be read');
+    assert.ok(!y.includes('NODE_AUTH_TOKEN:'), 'no npm token may be injected into a step');
+  });
+
+  it('keeps publishing idempotent per version, because npm cannot republish', (t) => {
+    void t;
+    const y = yml();
+    assert.ok(y.includes('npm view "${name}@${version}"'), 'the publish step must check the registry for the version');
+    assert.ok(y.includes('already has'), 'a version the registry already has must be reported, not published');
   });
 
   it('never publishes to npm on a herdr tag', (t) => {
     void t;
     const y = yml();
-    const cmds = y.split('\n').filter((l) => /^\s*npm publish --access public\s*$/.test(l));
+    const cmds = y.split('\n').filter((l) => /^\s*npm publish\b/.test(l));
     assert.equal(cmds.length, 1, `exactly one npm publish command, got ${cmds.length}`);
     const before = y.slice(0, y.indexOf(cmds[0]));
     const gateIdx = before.lastIndexOf("startsWith(github.ref_name, 'pi-v')");

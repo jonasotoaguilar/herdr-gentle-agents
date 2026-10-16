@@ -15,9 +15,9 @@
 # so gh creates the release as a draft, uploads the assets, then publishes
 # it: a failure during upload leaves a draft, which releases/latest ignores.
 # No npm publishing, no registry uploads, no other asset builds here: the
-# pi-series npm publish lives in the workflow and needs the NPM_TOKEN
-# repository secret via NODE_AUTH_TOKEN (fail closed when absent; never on a
-# herdr-v tag). Base notes
+# pi-series npm publish lives in the workflow and authenticates with trusted
+# publishing (OIDC) — no token exists anywhere — and never runs on a herdr-v
+# tag. Base notes
 # are curated afterwards by editing the published release in place.
 #
 # Repair path: when a release for the tag already exists and is a draft, only

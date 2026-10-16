@@ -23,9 +23,9 @@
 # --dry-run --json assertion that the tarball contains no path under
 # herdr-plugin/, tools/, scripts/ or odd/ and does contain
 # extensions/gentle-herdr-state.ts. No publishing happens here; the npm
-# publish for the pi series lives in .github/workflows/release.yml and needs
-# the NPM_TOKEN repository secret via NODE_AUTH_TOKEN (fail closed when
-# absent; never on a herdr-v tag).
+# publish for the pi series lives in .github/workflows/release.yml and
+# authenticates with trusted publishing (OIDC) — no token exists anywhere —
+# and never runs on a herdr-v tag.
 #
 # Environment (set by release.yml; overridable for local checks):
 #   RELEASE_TAG         tag being released, e.g. pi-v0.1.0 (required)
