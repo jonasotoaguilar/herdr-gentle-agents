@@ -585,11 +585,11 @@ describe('install.sh two-package behavior', () => {
     assert.equal(readStateJson(fx.stateFile).pi_source, PI_GIT_SPEC);
   });
 
-  it('unresolvable Pi root warns naming /herdr-gentle:sidebar enable and continues', (t) => {
+  it('unresolvable Pi root warns naming /herdr-gentle:customize and continues', (t) => {
     const fx = setup(t, { fakeEnv: { FAKE_PI_LIST_MODE: 'absent' } });
     const r = run(['--ref', 'herdr-v0.2.0'], fx.env);
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
-    assert.match(r.stderr, /\/herdr-gentle:sidebar enable/);
+    assert.match(r.stderr, /\/herdr-gentle:customize/);
     assert.match(readLog(fx.herdrLog), /plugin install/);
     assert.match(readLog(fx.piLog), /install/);
     assert.equal(readStateJson(fx.stateFile).ref, 'herdr-v0.2.0');

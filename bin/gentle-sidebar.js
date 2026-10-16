@@ -4,7 +4,7 @@
 // Package-side CLI for the Gentle/native sidebar switch (S7):
 //   node bin/gentle-sidebar.js (enable|disable|status|toggle) [--json]
 //
-// Same contract as `/herdr-gentle:sidebar` in the Pi extension; see
+// Same contract as the sidebar rows of `/herdr-gentle:customize` in the Pi extension; see
 // lib/gentle-sidebar.js and docs/sidebar-control.md. Isolated use:
 //   GENTLE_STATUS_STATE_DIR=/tmp/s PI_CODING_AGENT_DIR=/tmp/a
 //   HERDR_CONFIG_PATH=/tmp/c.toml node bin/gentle-sidebar.js status

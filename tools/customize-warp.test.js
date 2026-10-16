@@ -248,7 +248,7 @@ describe('herdr-gentle:warp command (S11)', { concurrency: false }, () => {
       modeLib().writeMode(false, process.env);
       const { tools, commands } = await loadExtension();
       assert.ok(commands.has('herdr-gentle:warp'), `exact name, got ${JSON.stringify([...commands.keys()])}`);
-      assert.ok(commands.has('herdr-gentle:worktree'), 'the existing command still registers');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
       assert.deepEqual([...tools.keys()], [], 'the worktree tools stay gated while disabled');
     } finally {
       restoreEnv();
@@ -828,20 +828,12 @@ describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, ()
     }
   });
 
-  test('the command exposes warp alongside the existing verbs', async () => {
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
-    try {
-      const { commands } = await loadExtension();
-      const def = commands.get('herdr-gentle:worktree');
-      assert.ok(def, 'command registered');
-      const notes = [];
-      const ctx = { ui: { notify: (message, level) => { notes.push([message, level]); } }, cwd: process.cwd() };
-      await def.handler('warp', ctx);
-      assert.match(notes[notes.length - 1][0], /warp.*needs a name|warp <name>/i, 'missing name is a usage error');
-    } finally {
-      restoreEnv();
-    }
-  });
+  // NOTE (customize-command T2/S7): the `warp` verb of the removed
+  // `/herdr-gentle:worktree` command died with it. Its usage-error
+  // coverage lives on `/herdr-gentle:warp`: no argument opens the
+  // selector ('with only the active checkout...', 'outside a git
+  // repository...') and more than one name is a usage error
+  // ('more than one name is a usage error that moves nothing').
 
   test('warp refuses the reserved name principal when a branch shares it', async () => {
     const root = makeRepo('principal-clash');
