@@ -926,3 +926,100 @@ describe('S24: the listing identifies checkouts by NAME (T33 RED)', { concurrenc
     }
   });
 });
+
+describe('S14 list tolerates missing issues (T7)', { concurrency: false }, () => {
+  test('an entry with issues:[] lists without failure as issues= empty', async () => {
+    const root = makeRepo('s14-list-empty');
+    setEnv(stdEnv());
+    try {
+      addRegistered(root, 'feat/noissue', { thread: 'thread-1', issues: [] });
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.ok(text.includes('worktree list: feat-noissue feat/noissue thread=thread-1 issues='), `lists with empty issues: ${text}`);
+      const row = result.details.worktrees.find((item) => item.branch === 'feat/noissue');
+      assert.deepEqual(row.issues, []);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an entry whose issues field is absent lists without failure and invents nothing', async () => {
+    const root = makeRepo('s14-list-absent');
+    setEnv(stdEnv());
+    try {
+      const target = addRegistered(root, 'feat/absent', { thread: 'thread-1', issues: [35] });
+      const registryLib = require('../lib/worktree-registry.js');
+      const read = registryLib.readRegistry(root);
+      assert.equal(read.ok, true);
+      const file = registryLib.registryPath(root);
+      const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+      delete doc.worktrees[0].issues;
+      fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.ok(text.includes('worktree list: feat-absent feat/absent thread=thread-1 issues='), `lists with empty issues: ${text}`);
+      const row = result.details.worktrees.find((item) => item.branch === 'feat/absent');
+      assert.deepEqual(row.issues, []);
+      assert.equal(row.path, target);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S19: list keeps every row for the agent', { concurrency: false }, () => {
+  test('every registered checkout surfaces as its own line; nothing is hidden', async () => {
+    const root = makeRepo('s19-rows');
+    setEnv(stdEnv());
+    try {
+      const one = addRegistered(root, 'feat/s19-one', { thread: 'thread-1', issues: [35] });
+      const two = addRegistered(root, 'feat/s19-two', { thread: 'thread-2', issues: [35, 7] });
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const text = resultText(result);
+      const lines = text.split('\n');
+      // The agent keeps the full terse line-based rows it parses today.
+      const branch = git(root, ['branch', '--show-current']);
+      assert.ok(lines.includes(`worktree list: principal ${branch} principal`), `principal row kept: ${text}`);
+      assert.ok(lines.includes('worktree list: feat-s19-one feat/s19-one thread=thread-1 issues=35'), `row one kept: ${text}`);
+      assert.ok(lines.includes('worktree list: feat-s19-two feat/s19-two thread=thread-2 issues=35,7'), `row two kept: ${text}`);
+      assert.equal(result.details.count, 3);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [root, one, two]);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('worktree_list shows the CURRENT git branch over a stale row (S39)', { concurrency: false }, () => {
+  test('a stale registry branch prints the live branch in text and details', async () => {
+    const root = makeRepo('s39-branch');
+    setEnv(stdEnv());
+    try {
+      const target = addRegistered(root, 'feat/live-branch', { thread: 'thread-1', issues: [35] });
+      const registryLib = require('../lib/worktree-registry.js');
+      const file = registryLib.registryPath(root);
+      const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.equal(doc.worktrees.length, 1, 'one registered row to stale');
+      doc.worktrees[0].branch = 'feat/stale-branch';
+      fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-s39', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.ok(text.includes('feat/live-branch'), `the listing names the CURRENT branch: ${text}`);
+      assert.ok(!text.includes('stale'), `no stale branch leaks: ${text}`);
+      const row = result.details.worktrees.find((item) => item.path === target);
+      assert.ok(row, 'the row is still listed');
+      assert.equal(row.branch, 'feat/live-branch', 'details carry the CURRENT branch');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
