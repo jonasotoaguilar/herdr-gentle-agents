@@ -1901,6 +1901,11 @@ describe('the inline name input (S52 Back on every field)', { concurrency: false
     assert.ok(!text.includes('Type') || !text.includes('Issues'), 'no joint Type Name Issues Odd header groups the panels');
     assert.ok(!text.includes('Odd'), 'the name panel leaks no Odd tab');
     assert.ok(text.includes('New worktree change name'), 'the panel keeps only its own title');
+    assert.match(text, /enter.*confirm/i, 'Enter confirms');
+    assert.match(text, /tab.*back/i, 'Tab goes back');
+    assert.match(text, /esc.*cancel/i, 'Esc cancels');
+  });
+
   test('the name field starts truly empty: no example text in the rendered input', () => {
     const { view } = open();
     assert.equal(view.state.value, '', 'the initial value is empty, not prefilled');
@@ -1946,10 +1951,6 @@ describe('the inline name input (S52 Back on every field)', { concurrency: false
     view.handleInput('tab');
     assert.deepEqual(finished, [{ back: true, value: 'picked' }], 'Tab alone goes back carrying the typed value');
     assert.equal(view.state.value, 'picked', 'the typed value is kept for the return trip');
-  });
-    assert.match(text, /enter.*confirm/i, 'Enter confirms');
-    assert.match(text, /tab.*back/i, 'Tab goes back');
-    assert.match(text, /esc.*cancel/i, 'Esc cancels');
   });
 
   test('typing appends (spaces included), Enter submits, Esc cancels, Tab goes back', () => {
