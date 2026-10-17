@@ -1,19 +1,19 @@
-# Sidebar control (`/herdr-gentle:sidebar`)
+# Sidebar control (`/herdr-gentle:customize` — `Agentes sidebar` rows)
 
 Switch the Herdr Agents-panel integration between OUR sidebar and the
 native Herdr sidebar. This controls sidebar wiring only, never Pi
-subagent execution.
+subagent execution. (The old `/herdr-gentle:sidebar` command is removed;
+`customize status` is its read-only replacement.)
 
-| Verb | Meaning |
+| Row | Meaning |
 | --- | --- |
-| `toggle` | Flip the current state (missing mode counts as enabled). |
-| `enable` | Use OUR sidebar. |
-| `disable` | Use the NATIVE sidebar. |
-| `status` | Report the current state. Reads only, writes nothing. |
+| `Gentle (this extension)` | Use OUR sidebar. |
+| `Native Herdr` | Use the NATIVE sidebar. |
 
-Run with no argument to pick Enable / Disable / Status from a selector
-(same UX as `/herdr-gentle:moshi`); `on`/`off` work as aliases for
-`enable`/`disable`. Anything else is rejected with no state changed.
+Open `/herdr-gentle:customize` with no argument for the two-pane panel
+(CATEGORIES on the left, the focused category's rows on the right) and
+apply the row with `Enter`; `Esc` closes without writing. `customize
+status` reports all three switches as one terse line and writes nothing.
 
 ## What enable and disable do
 
@@ -26,7 +26,7 @@ Run with no argument to pick Enable / Disable / Status from a selector
   `extensions` list, with the ownership marker from the installer) and
   writes the shared mode file
   (`gentle-sidebar-mode.json`, `{version:1,enabled:true}`). A zero exit
-  alone never commits state: without the verified row effect the command
+  alone never commits state: without the verified row effect the apply
   fails with mode and exclusion unchanged.
 - **Disable (native):** same proof in reverse (`--uninstall`, rows must
   be absent), then removes only the plugin-owned exclusion (a
@@ -40,10 +40,11 @@ never read, written, or deleted.
 
 ## Reload rule
 
-Row changes apply to Herdr through the synchronous configure run, but a
-running Pi session keeps its already-loaded extension list: **run
-`/reload` (or restart Pi)** after enable/disable. The command says so
-every time; no automatic Pi reload is attempted, and success is only
+Row changes apply to Herdr through the synchronous configure run, and the
+panel reloads the Pi extension runtime itself after every successful
+switch — the Pi settings exclusion and the native sidebar only take
+effect on the next extension load. No surface ever asks you to run
+`/reload`, and success is only
 reported after the managed-row effect is verified — never on a queued
 acceptance.
 
@@ -62,7 +63,7 @@ the lifecycle owner (`herdr-plugin/bin/gentle-status.js`); the producer just sto
 ## Recovery
 
 Every failure names the recoverable next step: fix the cause, then
-re-run the same verb to converge. Completion runs before any local
+re-apply the same row from the panel to converge. Completion runs before any local
 mutation, so a failed configure leaves mode and exclusion untouched; if
 rows were stranded by a failed reload they are restored through the
 marker-scoped reverse operation (only our own markers are ever removed,
@@ -70,7 +71,7 @@ so user tables and concurrent edits outside them survive). If the mode
 file itself cannot be written after the rows already flipped, the message
 says exactly that. When the ownership
 record names another entry or another settings file, resolve it
-manually (delete the record or the entry) — the command never adopts it.
+manually (delete the record or the entry) — the apply never adopts it.
 
 ## Package-side equivalent
 
