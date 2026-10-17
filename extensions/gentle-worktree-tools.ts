@@ -37,9 +37,26 @@ function libRequire(name) {
 
 // The herdr binary honors the documented HERDR_BIN_PATH override (tests),
 // else `herdr` on PATH — the same convention lib/gentle-diagnostics.js uses.
+// Under the test harness (GENTLE_WORKTREE_LIB_DIR set by the test loaders)
+// with no explicit binary injected, fail closed instead of spawning live
+// herdr: lib/worktree-git.js resolveHerdrBinary is the single authority.
 function herdrBinary() {
+  try {
+    const git = libRequire("worktree-git.js");
+    if (git && typeof git.resolveHerdrBinary === "function") {
+      return git.resolveHerdrBinary(process.env);
+    }
+  } catch {
+    // Fall through to the inline check below; a missing helper never
+    // silently reaches a live binary from a test process.
+  }
   const bin = process.env.HERDR_BIN_PATH;
-  return typeof bin === "string" && bin.length > 0 ? bin : "herdr";
+  if (typeof bin === "string" && bin.length > 0) return bin;
+  const harness = process.env.GENTLE_WORKTREE_LIB_DIR;
+  if (typeof harness === "string" && harness.length > 0) {
+    throw new Error('herdr binary is not injected: set HERDR_BIN_PATH in tests (refusing to run live herdr)');
+  }
+  return "herdr";
 }
 
 function toolCwd(ctx) {
@@ -137,6 +154,18 @@ function isLiveGitRecord(entry, repoRoot) {
 // export, but older test doubles stub only the constructors `worktree_create`
 // needed; falling back to the bare schema keeps the module loadable there
 // while production still gets true optionals.
+// Older test doubles stub only the constructors the tools needed;
+// Type.Union is the production shape for string-or-array options, so
+// the one option that needs it degrades to a bare string schema when
+// the host Type has no Union (tests) instead of failing the load.
+function unionSchema(schemas, opts) {
+  try {
+    if (Type && typeof Type.Union === 'function') return Type.Union(schemas, opts);
+  } catch {
+    // Fall through to the stub-compatible shape below.
+  }
+  return Type.String();
+}
 function opt(schema) {
   if (Type && typeof Type.Optional === "function") return Type.Optional(schema);
   return schema;
@@ -177,21 +206,158 @@ function errorResult(text, details) {
   return textResult(text, details || {}, true);
 }
 
-function successText(target) {
-  return `worktree create: ${target}`;
+// S19 bounded agent text: short ordered lines in the warp moved/to
+// spirit. Branch names, paths and session ids reach the transcript
+// through these builders only, cleaned by the shared warpClean helper
+// (defined below; hoisted) so the text and the card never drift into
+// two notions of cleaning. Failure texts are untouched and stay
+// byte-identical. `slugOf` mirrors lib/worktree-git.js slugifyBranch —
+// the flattened slug the listing prints and warp accepts — so the agent
+// text and the card agree without a new import. (Named slugPart: slugOf
+// already names the git-backed resolver further below.)
+function slugPart(branch) {
+  try {
+    const slug = String(branch ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return slug === '' ? 'worktree' : slug;
+  } catch {
+    return 'worktree';
+  }
+}
+
+function issueListOf(issues) {
+  return Array.isArray(issues) ? issues.filter((n) => typeof n === 'number') : [];
+}
+
+function createSuccessText(branch, target, issues, alreadyExists, odd) {
+  const name = warpClean(branch, 'worktree');
+  const head = alreadyExists === true
+    ? `created: ${slugPart(branch)} · ${name} · already exists`
+    : alreadyExists === 'updated'
+      ? `updated: ${slugPart(branch)} · ${name}`
+      : `created: ${slugPart(branch)} · ${name}`;
+  const lines = [head, `path: ${warpClean(target, '(unknown path)')}`];
+  const nums = issueListOf(issues);
+  if (nums.length > 0) lines.push(`issues: ${nums.join(',')}`);
+  const docs = Array.isArray(odd) ? odd.filter((o) => typeof o === 'string' && o.length > 0) : [];
+  if (docs.length > 0) lines.push(`odd: ${docs.join(',')}`);
+  return lines.join('\n');
+}
+
+function closeSuccessText(branch, branchKept) {
+  const name = warpClean(branch, 'worktree');
+  return `removed: ${slugPart(branch)} · ${name}\n${branchKept === false ? 'branch deleted' : 'branch kept'}`;
+}
+
+// Worktree tool card wiring (customize-command T6/S13): each registered
+// tool draws the compact/expandable native card from lib/worktree-card.js
+// through its own renderShell/renderCall/renderResult, so execute,
+// schemas, content and details stay exactly as they are. Width helpers
+// resolve lazily here — never a top-level package import (S6/S10: every
+// test loader stubs only the two package import lines) — preferring the
+// real pi-tui measurement (emoji/wide-char aware) and degrading to the
+// lib's local fallback when the host has no such module. keyHint rides
+// along only when the coding-agent module resolves; otherwise the lib's
+// static ctrl+o hint stands in. Renderers are cached per helpers
+// identity because Pi re-renders every visible card each frame.
+let worktreeCardHelpersOverride;
+let worktreeCardCache = null;
+// The runtime resolution below runs once per process: rebuilding the
+// helpers object on every render would defeat the per-identity card
+// cache above (a fresh identity busts it each time). The injectable seam
+// still wins whenever set, and resetting it returns to this stable
+// resolution — never to a fresh rebuild.
+let worktreeCardAutoHelpers;
+let worktreeCardAutoResolved = false;
+
+function setWorktreeCardHelpers(helpers) {
+  worktreeCardHelpersOverride = helpers;
+  worktreeCardCache = null;
+}
+
+function loadRuntimeCardHelpers() {
+  try {
+    const tui = require("@earendil-works/pi-tui");
+    const helpers = {};
+    if (tui && typeof tui.visibleWidth === "function") helpers.visibleWidth = tui.visibleWidth;
+    if (tui && typeof tui.truncateToWidth === "function") {
+      helpers.truncateToWidth = (text, width, ellipsis) => tui.truncateToWidth(text, width, ellipsis);
+    }
+    try {
+      const agent = require("@earendil-works/pi-coding-agent");
+      if (agent && typeof agent.keyHint === "function") helpers.keyHint = agent.keyHint;
+    } catch {
+      // keyHint stays on the lib's static fallback; never fatal.
+    }
+    return helpers;
+  } catch {
+    return null;
+  }
+}
+
+function resolveWorktreeCardHelpers() {
+  if (worktreeCardHelpersOverride !== undefined) return worktreeCardHelpersOverride || null;
+  if (!worktreeCardAutoResolved) {
+    worktreeCardAutoResolved = true;
+    worktreeCardAutoHelpers = loadRuntimeCardHelpers();
+  }
+  return worktreeCardAutoHelpers;
+}
+
+function worktreeCardFor(toolName) {
+  const helpers = resolveWorktreeCardHelpers() || undefined;
+  if (!worktreeCardCache || worktreeCardCache.helpers !== helpers) {
+    worktreeCardCache = { helpers, cards: new Map() };
+  }
+  let card = worktreeCardCache.cards.get(toolName);
+  if (!card) {
+    card = libRequire("worktree-card.js").createWorktreeCardRenderer(toolName, helpers);
+    worktreeCardCache.cards.set(toolName, card);
+  }
+  return card;
+}
+
+// Spreads nothing and keeps the defineTool identity: the card hooks are
+// assigned onto the definition, so a failure anywhere above returns the
+// tool untouched and execution never depends on rendering. The hooks
+// resolve the cached card per invocation (one Map hit) so an injected
+// helpers seam set after load still reaches every render.
+function withWorktreeCardRenderer(tool) {
+  try {
+    const card = worktreeCardFor(tool.name);
+    tool.renderShell = card.renderShell;
+    tool.renderCall = (...args) => worktreeCardFor(tool.name).renderCall(...args);
+    tool.renderResult = (...args) => worktreeCardFor(tool.name).renderResult(...args);
+  } catch {
+    // Rendering stays generic; the tool itself is unaffected.
+  }
+  return tool;
 }
 
 // Core of `worktree_create`: validation (S2, S3) then herdr-first creation
 // with a git fallback. Exported for unit tests; the registered tool calls
 // it with the live Pi context.
-async function executeWorktreeCreate(params, ctx) {
+async function executeWorktreeCreate(params, ctx, opts) {
   const git = libRequire("worktree-git.js");
   const registry = libRequire("worktree-registry.js");
   const mode = libRequire("worktree-mode.js");
   const issuesLib = libRequire("worktree-issues.js");
 
+  // S53 git-only route (create-from-warp): the wizard creates a plain
+  // git checkout plus the registry row and nothing else — never a Herdr
+  // workspace (`herdr worktree create/open` is what materialized the
+  // stray Herdr worktree the user never asked for). The route reuses
+  // every validation and the registry machinery below; only the
+  // backends change. Subprocesses run through the async runner here so
+  // a hanging child aborts on its bound instead of freezing the
+  // interactive session on the main thread.
+  const gitOnly = !!(opts && opts.gitOnly === true);
+  const runGit = gitOnly && typeof git.runArgvAsync === "function"
+    ? (bin, argv, runOpts) => git.runArgvAsync(bin, argv, runOpts)
+    : (bin, argv, runOpts) => git.runArgv(bin, argv, runOpts);
+
   const branch = params ? params.branch : undefined;
   const issues = params ? params.issues : undefined;
+  const oddParam = params ? params.odd : undefined;
   const cwd = toolCwd(ctx);
 
   // (a) Mode gate: missing means enabled, malformed never enables
@@ -230,12 +396,48 @@ async function executeWorktreeCreate(params, ctx) {
   }
   const thread = identity.thread;
 
-  // (c) Issues are mandatory and verified to exist (D5, S3).
-  const verified = issuesLib.verifyIssues(issues, { cwd });
-  if (!verified.ok) {
-    return errorResult(verified.reason, { branch, issues, code: verified.code });
+  // (c) Issues are optional (customize-command S14): an omitted or empty
+  // issues field means issues:[] with no verification; supplied issues
+  // keep the exact existing verification (D5, S3) — awaited
+  // asynchronously on the gitOnly/wizard path so a slow `gh` never
+  // blocks the interactive session, synchronously everywhere else
+  // (unchanged contract for the tool and its callers).
+  const issuesOmitted = issues === undefined || (Array.isArray(issues) && issues.length === 0);
+  const issuesSupplied = issues !== undefined;
+  let issueNumbers = [];
+  if (!issuesOmitted) {
+    const verified = (gitOnly && issuesLib && typeof issuesLib.verifyIssuesAsync === "function")
+      ? await issuesLib.verifyIssuesAsync(issues, { cwd })
+      : issuesLib.verifyIssues(issues, { cwd });
+    if (!verified.ok) {
+      return errorResult(verified.reason, { branch, issues, code: verified.code });
+    }
+    issueNumbers = verified.issues.map((issue) => issue.number);
   }
-  const issueNumbers = verified.issues.map((issue) => issue.number);
+
+  // (c2) S26: `odd` is optional exactly like `issues`: omitted means
+  // "leave untouched", a supplied value (path string, array of paths,
+  // or an empty value for removal) must name existing `.md` files and
+  // replaces the stored value. A missing file fails closed here, before
+  // any checkout or registry write.
+  const oddSupplied = oddParam !== undefined;
+  let oddNames = null;
+  if (oddSupplied) {
+    let oddLib;
+    try {
+      oddLib = libRequire("worktree-odd.js");
+    } catch (err) {
+      return errorResult(
+        `cannot validate odd document: ${(err && err.message) || err}`,
+        { branch, issues: issueNumbers },
+      );
+    }
+    const checked = oddLib.validateOddParam(oddParam, cwd);
+    if (!checked.ok) {
+      return errorResult(checked.reason, { branch, issues: issueNumbers, odd: oddParam });
+    }
+    oddNames = checked.odd;
+  }
 
   // (d) Repository identity and target path.
   let repo;
@@ -244,7 +446,9 @@ async function executeWorktreeCreate(params, ctx) {
   } catch (err) {
     return errorResult(`not a git repository: ${cwd}`, { branch, issues: issueNumbers });
   }
-  const target = git.worktreePath(repo.root, branch);
+  const target = opts && opts.principalLayout && typeof git.canonicalWorktreePath === "function"
+    ? git.canonicalWorktreePath(repo.root, branch)
+    : git.worktreePath(repo.root, branch);
   const resolvedTarget = path.resolve(target);
   let listed;
   try {
@@ -253,6 +457,108 @@ async function executeWorktreeCreate(params, ctx) {
     return errorResult(
       `cannot list worktrees: ${(err && err.message) || err}`,
       { branch, issues: issueNumbers },
+    );
+  }
+
+  // Principal identity for the S31 edit path: the live listing entry
+  // whose resolved identity equals the main root recovered from the
+  // shared common dir (the same recovery the list uses). Null when git
+  // names no principal.
+  let principalInfo = null;
+  try {
+    if (typeof repo.commonDir === "string" && path.basename(repo.commonDir) === ".git") {
+      const rawPrincipal = path.resolve(path.dirname(repo.commonDir));
+      const pst = checkoutState(rawPrincipal, repo.root);
+      const pid = pst.real !== null ? pst.real : pst.absolute;
+      if (pid !== null) {
+        for (const entry of listed) {
+          if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
+          const st = checkoutState(entry.path, repo.root);
+          const id = st.real !== null ? st.real : st.absolute;
+          if (id === pid && st.exists && st.isDirectory) {
+            principalInfo = { path: pid, branch: entry.branch || "(detached)" };
+            break;
+          }
+        }
+      }
+    }
+  } catch {
+    principalInfo = null;
+  }
+  // Display names for supplied odd files: `odd/<rel>` when they live
+  // under a known `odd/` root, else the resolved absolute path.
+  if (oddSupplied && oddNames !== null) {
+    try {
+      const oddLib = libRequire("worktree-odd.js");
+      const principalRoot = (typeof repo.commonDir === "string" && path.basename(repo.commonDir) === ".git")
+        ? path.dirname(repo.commonDir)
+        : repo.root;
+      oddNames = oddNames.map((abs) => oddLib.normalizeOddName(abs, { worktreePath: target, principalRoot }));
+    } catch {
+      // Keep the validated names as they are.
+    }
+  }
+
+  // (d0) S31: the principal checkout is editable but never created by
+  // this tool. When the requested branch is the principal's own live
+  // branch, no checkout is created: the principal's registration record
+  // is created on demand and the supplied fields overwrite it (empty
+  // removes, omitted stays untouched). Any other branch falls through
+  // to the normal create flow below.
+  if (principalInfo !== null && branch === principalInfo.branch && (issuesSupplied || oddSupplied)) {
+    const patch = {};
+    if (issuesSupplied) patch.issues = issuesOmitted ? [] : issueNumbers.slice();
+    if (oddSupplied) patch.odd = oddNames.slice();
+    let existing = null;
+    try {
+      existing = registry.findByPath(repo.root, principalInfo.path) || registry.findByBranch(repo.root, branch);
+      if (existing && typeof existing.path === "string" && path.isAbsolute(existing.path)) {
+        const est = checkoutState(existing.path, repo.root);
+        const eid = est.real !== null ? est.real : est.absolute;
+        if (eid !== principalInfo.path) existing = null;
+      } else if (existing) {
+        existing = null;
+      }
+    } catch {
+      existing = null;
+    }
+    let stored;
+    try {
+      if (existing) {
+        const updated = registry.updateWorktree(repo.root, existing.path, patch);
+        if (!updated.ok) {
+          return errorResult(
+            `cannot update the principal checkout at ${principalInfo.path}: ${updated.error}`,
+            { branch, issues: issueNumbers, odd: oddNames, path: principalInfo.path },
+          );
+        }
+        stored = updated.entry;
+      } else {
+        const created = registry.upsertWorktree(repo.root, {
+          branch,
+          path: principalInfo.path,
+          thread,
+          issues: patch.issues || [],
+          odd: patch.odd || [],
+        });
+        if (!created.ok) {
+          return errorResult(
+            `cannot update the principal checkout at ${principalInfo.path}: ${created.error}`,
+            { branch, issues: issueNumbers, odd: oddNames, path: principalInfo.path },
+          );
+        }
+        stored = created.entry;
+      }
+    } catch (err) {
+      return errorResult(
+        `cannot update the principal checkout at ${principalInfo.path}: ${(err && err.message) || err}`,
+        { branch, issues: issueNumbers, odd: oddNames, path: principalInfo.path },
+      );
+    }
+    return textResult(
+      createSuccessText(branch, stored.path, stored.issues, "updated", stored.odd),
+      { path: stored.path, branch, issues: stored.issues, odd: stored.odd, created: false, updated: true },
+      false,
     );
   }
 
@@ -282,8 +588,8 @@ async function executeWorktreeCreate(params, ctx) {
       && liveIdentities(listed, repo.root).has(ownedState.real);
     if (stillLive) {
       return textResult(
-        successText(owned.path),
-        { path: owned.path, branch: owned.branch, issues: owned.issues, created: false },
+        createSuccessText(owned.branch, owned.path, owned.issues, true, owned.odd),
+        { path: owned.path, branch: owned.branch, issues: owned.issues, odd: Array.isArray(owned.odd) ? owned.odd.slice() : [], created: false },
         false,
       );
     }
@@ -310,6 +616,61 @@ async function executeWorktreeCreate(params, ctx) {
     return st.absolute !== null && st.absolute === resolvedTarget;
   });
   const liveTargetRecords = targetRecords.filter((entry) => isLiveGitRecord(entry, repo.root));
+  // (d2) S27 create-or-update: when the requested branch already owns a
+  // LIVE checkout exactly at its agreed sibling target path and the
+  // caller supplied `issues` and/or `odd`, this is an update, not a
+  // create: the supplied fields (including empty values, which remove)
+  // overwrite the stored ones while omitted fields stay untouched. The
+  // branch, the path and every unsupplied value survive. A same-branch
+  // row pointing at a DIFFERENT live checkout keeps the historical
+  // append-and-warn flow below; without supplied fields — or when no
+  // registry row owns the checkout at the target — the historical
+  // refusals below stay byte-identical.
+  if ((issuesSupplied || oddSupplied)) {
+    const sameTarget = liveBranchRecords.find((entry) => {
+      const st = checkoutState(entry.path, repo.root);
+      return st.absolute !== null && st.absolute === resolvedTarget;
+    });
+    if (sameTarget) {
+      const liveIdsForUpdate = liveIdentities(listed, repo.root);
+      let row = null;
+      try {
+        const reread = registry.readRegistry(repo.root);
+        const rows = reread && reread.ok === true && Array.isArray(reread.worktrees) ? reread.worktrees : [];
+        for (const candidate of rows) {
+          if (!candidate || candidate.branch !== branch) continue;
+          if (typeof candidate.path !== "string" || !path.isAbsolute(candidate.path)) continue;
+          const cst = checkoutState(candidate.path, repo.root);
+          if (!cst.exists || !cst.isDirectory || cst.absolute === null || cst.absolute !== resolvedTarget) continue;
+          const cid = cst.real !== null ? cst.real : cst.absolute;
+          if (cid !== null && liveIdsForUpdate.has(cid)) {
+            row = candidate;
+            break;
+          }
+        }
+      } catch {
+        row = null;
+      }
+      if (row) {
+        const patch = {};
+        if (issuesSupplied) patch.issues = issuesOmitted ? [] : issueNumbers.slice();
+        if (oddSupplied) patch.odd = oddNames.slice();
+        try {
+          const updated = registry.updateWorktree(repo.root, row.path, patch);
+          if (updated.ok) {
+            const stored = updated.entry;
+            return textResult(
+              createSuccessText(branch, stored.path, stored.issues, "updated", stored.odd),
+              { path: stored.path, branch, issues: stored.issues, odd: stored.odd, created: false, updated: true },
+              false,
+            );
+          }
+        } catch {
+          // Fall through to the historical refusals below.
+        }
+      }
+    }
+  }
   // Stale records recovered below; reported in details.pruned and in the
   // create warnings so the caller can name what `git worktree prune` took.
   let prunedStale = [];
@@ -320,7 +681,7 @@ async function executeWorktreeCreate(params, ctx) {
       const st = checkoutState(entry.path, repo.root);
       if (st.absolute !== null && !stalePaths.includes(st.absolute)) stalePaths.push(st.absolute);
     }
-    const pruned = git.runArgv("git", ["worktree", "prune"], { cwd: repo.root });
+    const pruned = await runGit("git", ["worktree", "prune"], { cwd: repo.root });
     if (pruned.status !== 0) {
       const reason = ((pruned.stderr || pruned.error || "unknown error") + "").trim();
       return errorResult(
@@ -485,14 +846,14 @@ async function executeWorktreeCreate(params, ctx) {
   // is the repository's current HEAD.
   let base = null;
   try {
-    const head = git.runArgv("git", ["rev-parse", "HEAD"], { cwd: repo.root });
+    const head = await runGit("git", ["rev-parse", "HEAD"], { cwd: repo.root });
     if (head.status === 0 && head.stdout.trim().length > 0) base = head.stdout.trim();
   } catch {
     base = null;
   }
   let branchExists = false;
   try {
-    const ref = git.runArgv("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repo.root });
+    const ref = await runGit("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repo.root });
     branchExists = ref.status === 0;
   } catch {
     branchExists = false;
@@ -506,7 +867,7 @@ async function executeWorktreeCreate(params, ctx) {
     // Adopt: check out the existing branch at the fresh path. No `-b`
     // (the ref already exists), no base (checking out the branch IS the
     // base) — the ref is never created, rewritten or deleted.
-    const adopted = git.runArgv("git", ["worktree", "add", target, branch], { cwd: repo.root, timeoutMs: 120000 });
+    const adopted = await runGit("git", ["worktree", "add", target, branch], { cwd: repo.root, timeoutMs: 120000 });
     if (adopted.status === 0) {
       createdBy = "git";
       branchCreated = false;
@@ -514,8 +875,11 @@ async function executeWorktreeCreate(params, ctx) {
         `adopted existing branch '${branch}' at ${target}: the worktree checks out that branch as-is, the branch ref was left untouched`,
       );
       // Best-effort Herdr workspace association: reported, never fatal.
+      // Skipped on the git-only route: that checkout is git plus the
+      // registry row by design, so no association is expected.
+      if (!gitOnly) {
       try {
-        const opened = git.runArgv(herdrBinary(), git.herdrArgv("open", { cwd: repo.root, path: target }), {
+        const opened = await runGit(herdrBinary(), git.herdrArgv("open", { cwd: repo.root, path: target }), {
           cwd: repo.root,
           timeoutMs: 60000,
         });
@@ -528,23 +892,31 @@ async function executeWorktreeCreate(params, ctx) {
           `herdr workspace association failed for ${target} ('herdr worktree open' did not succeed): the checkout itself is fine, associate it by hand when needed`,
         );
       }
+      }
     } else {
       createError = ((adopted.stderr || adopted.error || "unknown error") + "").trim();
     }
   } else {
+  // The git-only route skips the herdr-first attempt outright: no
+  // `herdr worktree create` runs, so no Herdr workspace is ever
+  // materialized from the wizard. The tool path keeps herdr-first
+  // with the git fallback below, byte-identical.
+  let herdrRes = null;
+  if (!gitOnly) {
   const createParams = { cwd: repo.root, branch, path: target };
   if (base) createParams.base = base;
-  const herdrRes = git.runArgv(herdrBinary(), git.herdrArgv("create", createParams), {
+  herdrRes = await runGit(herdrBinary(), git.herdrArgv("create", createParams), {
     cwd: repo.root,
     timeoutMs: 120000,
   });
-  if (herdrRes.status === 0) {
+  }
+  if (herdrRes !== null && herdrRes.status === 0) {
     createdBy = "herdr";
     branchCreated = true;
   } else {
     const fallbackArgv = ["worktree", "add", "-b", branch, target];
     if (base) fallbackArgv.push(base);
-    const fallback = git.runArgv("git", fallbackArgv, { cwd: repo.root, timeoutMs: 120000 });
+    const fallback = await runGit("git", fallbackArgv, { cwd: repo.root, timeoutMs: 120000 });
     if (fallback.status === 0) {
       createdBy = "git";
       branchCreated = true;
@@ -555,9 +927,9 @@ async function executeWorktreeCreate(params, ctx) {
       // Checking out the existing branch at the fresh path is the
       // recovery — the same adoption semantics, reported the same way;
       // anything else keeps the backend's own error.
-      const ref = git.runArgv("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repo.root });
+      const ref = await runGit("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repo.root });
       if (ref.status === 0) {
-        const retry = git.runArgv("git", ["worktree", "add", target, branch], { cwd: repo.root, timeoutMs: 120000 });
+        const retry = await runGit("git", ["worktree", "add", target, branch], { cwd: repo.root, timeoutMs: 120000 });
         if (retry.status === 0) {
           createdBy = "git";
           branchCreated = false;
@@ -695,7 +1067,7 @@ async function executeWorktreeCreate(params, ctx) {
       path: target,
       thread,
       issues: issueNumbers,
-      odd: [],
+      odd: oddSupplied ? oddNames.slice() : [],
     };
     if (conflictLive) {
       stored = registry.appendWorktree(repo.root, recorded);
@@ -719,7 +1091,9 @@ async function executeWorktreeCreate(params, ctx) {
 
   // (i2) Creation hooks (S8 as narrowed by S21, P2-S3): copy unversioned
   // files, install by detected stack, codegraph init when available.
-  // S21 creates no symlinks of any kind. Hooks never turn a
+  // The hooks themselves create no symlinks of any kind (the
+  // `.agents`/`.claude`/`.odd` principal links are the separate silent
+  // step (k) below). Hooks never turn a
   // successful creation into an error: every outcome, including a thrown
   // hook, is reported inside `details.hooks`, and the exact success text
   // stays unchanged. A failed step stays visible via steps + warnings.
@@ -733,12 +1107,40 @@ async function executeWorktreeCreate(params, ctx) {
     const principalRoot = path.basename(repo.commonDir) === ".git"
       ? path.dirname(repo.commonDir)
       : repo.root;
-    hooks = hooksLib.runCreationHooks({
-      principalRoot,
-      worktreePath: target,
-      root: repo.root,
-      env: process.env,
-    });
+    if (gitOnly) {
+      // S63: the wizard path never runs the blocking sync hooks. The async
+      // twin owns every child until settle (timeout/abort SIGTERMs, waits a
+      // bounded grace for close, then SIGKILLs and reaps — POSIX group-wide)
+      // while the event loop stays responsive, and awaiting it here preserves
+      // ready-before-warp ordering (hooks settle before the warp) without
+      // blocking Pi input/render. No fallback to the sync runner: a missing
+      // async helper fails safe before the slow work with a useful error.
+      if (typeof hooksLib.runCreationHooksAsync !== 'function') {
+        throw new Error('creation hooks async runner is unavailable (runCreationHooksAsync missing)');
+      }
+      const runAsync = (bin, argv, runOpts) => git.runArgvAsync(bin, argv, {
+        ...runOpts,
+        // Abort reaches the effective runner only when the caller supplies
+        // a signal (the wizard currently passes none, so none is claimed).
+        ...(opts && opts.signal ? { signal: opts.signal } : {}),
+      });
+      hooks = await hooksLib.runCreationHooksAsync({
+        principalRoot,
+        worktreePath: target,
+        root: repo.root,
+        env: process.env,
+        runAsync,
+        ...(opts && opts.signal ? { signal: opts.signal } : {}),
+        ...(opts && Number.isFinite(opts.killGraceMs) && opts.killGraceMs > 0 ? { killGraceMs: opts.killGraceMs } : {}),
+      });
+    } else {
+      hooks = hooksLib.runCreationHooks({
+        principalRoot,
+        worktreePath: target,
+        root: repo.root,
+        env: process.env,
+      });
+    }
   } catch (err) {
     const message = `creation hooks failed: ${(err && err.message) || err}`;
     hooks = {
@@ -769,25 +1171,63 @@ async function executeWorktreeCreate(params, ctx) {
   // association happened. The checkout succeeding never depends on herdr.
   const adoptionDetails = { branchCreated };
   if (herdrAssociated !== null) adoptionDetails.herdrAssociated = herdrAssociated;
+  // (k) T42/S51 principal dot-dir symlinks (silent hook): `.agents`,
+  // `.claude` and `.odd` from the PRINCIPAL checkout — recovered from
+  // the shared common dir exactly like the hooks above, never the
+  // current checkout — with the all-or-nothing tracked gate. Adds
+  // NOTHING to the output text in any branch; outcomes travel in
+  // details only. Never fails the create.
+  let symlinkDetails = { created: [], skippedTracked: [] };
+  try {
+    const symlinksLib = libRequire("worktree-symlinks.js");
+    const principalForLinks = path.basename(repo.commonDir) === ".git"
+      ? path.dirname(repo.commonDir)
+      : repo.root;
+    const applied = symlinksLib.applyWorktreeSymlinks({ principalRoot: principalForLinks, worktreePath: target });
+    if (applied && Array.isArray(applied.created) && Array.isArray(applied.skippedTracked)) {
+      symlinkDetails = { created: applied.created.slice(), skippedTracked: applied.skippedTracked.slice() };
+    }
+  } catch {
+    // Best effort only; the create stands regardless.
+  }
+  // (l) T41/S50 changes registration: register the checkout just
+  // created on the CURRENT session through gentle-shell's
+  // `session_worktree_register` host tool, but ONLY when that tool is
+  // actually available (listed in ctx.tools and callable through
+  // ctx.executeTool — the injectable seam). On success the output ends
+  // with ONE short line so the agent does not repeat the call; when
+  // the tool is unavailable, the call fails, or anything throws, do
+  // nothing and append nothing — the create never fails because of this.
+  let changesRegistered = false;
+  try {
+    const registerLib = libRequire("session-worktree-register.js");
+    if (registerLib && typeof registerLib.registerSessionWorktree === "function") {
+      changesRegistered = await registerLib.registerSessionWorktree(ctx, target) === true;
+    }
+  } catch {
+    changesRegistered = false;
+  }
+  const successText = createSuccessText(branch, target, issueNumbers, false, oddSupplied ? oddNames : []);
   return textResult(
-    successText(target),
-    { path: target, branch, issues: issueNumbers, created: true, hooks, warnings, pruned: prunedStale, replacedRows: replacedRows.map((r) => ({ branch: r.branch, path: r.path })), ...adoptionDetails, ...backupDetails },
+    changesRegistered ? `${successText}\nchanges: already registered for this session` : successText,
+    { path: target, branch, issues: issueNumbers, odd: oddSupplied ? oddNames.slice() : [], created: true, hooks, warnings, pruned: prunedStale, replacedRows: replacedRows.map((r) => ({ branch: r.branch, path: r.path })), symlinks: symlinkDetails, changesRegistered, ...adoptionDetails, ...backupDetails },
     false,
   );
 }
 
-const worktreeCreateTool = defineTool({
+const worktreeCreateTool = withWorktreeCardRenderer(defineTool({
   name: "worktree_create",
   label: "Worktree Create",
-  description: "Create an agent worktree for a branch at the flattened worktree path, associated with at least one verified GitHub issue. The calling thread owns the checkout.",
+  description: "Create an agent worktree for a branch at the flattened worktree path, optionally associated with verified GitHub issues. The calling thread owns the checkout.",
   parameters: Type.Object({
     branch: Type.String({ description: "Branch name to create the worktree for" }),
-    issues: Type.Array(Type.Number(), { description: "Associated GitHub issue numbers (at least one, each verified to exist)" }),
+    issues: opt(Type.Array(Type.Number(), { description: "Associated GitHub issue numbers (optional; when given, each must verify to exist)" })),
+    odd: opt(Type.String({ description: "Path of the odd .md document to associate (optional; must exist). When the worktree already exists, supplied issues/odd overwrite the stored values." })),
   }),
   async execute(toolCallId, params, signal, onUpdate, ctx) {
     return executeWorktreeCreate(params, ctx);
   },
-});
+}));
 
 // `worktree_list` output contract (S6, S9, S19, S24) — terse, one line per
 // checkout, pinned in tools/worktree-list.test.js. The FIRST column is the
@@ -923,6 +1363,11 @@ async function executeWorktreeList(params, ctx) {
   }
   const agentRows = [];
   const deadPaths = [];
+  // S39 current branch from git (shared helper); the registry field is
+  // the fallback. Sole claimants print the live branch; shared checkouts
+  // keep their stored names so the ambiguity keeps resolving.
+  const liveBranchById = liveBranchMap(live, repo.root);
+  const claimCounts = registryClaimCounts(read.worktrees, repo.root);
   for (const entry of read.worktrees) {
     const isAbsoluteRow = typeof entry.path === "string" && path.isAbsolute(entry.path);
     const st = isAbsoluteRow ? checkoutState(entry.path, repo.root) : null;
@@ -947,18 +1392,36 @@ async function executeWorktreeList(params, ctx) {
       ? entry.thread
       : "unknown";
     const status = liveHit ? "live" : "missing";
+    // S25: every entry carries the checkout's odd document,
+    // auto-detected from inside that worktree (never hand-bookkept):
+    // the stored names plus whatever `odd/*.md` the checkout holds now.
+    let oddDocs = [];
+    try {
+      const oddLib = libRequire("worktree-odd.js");
+      const stored = Array.isArray(entry.odd) ? entry.odd.slice() : [];
+      oddDocs = typeof oddLib.oddDocsForCheckout === "function"
+        ? oddLib.oddDocsForCheckout(stored, entry.path)
+        : stored.slice();
+    } catch {
+      oddDocs = Array.isArray(entry.odd) ? entry.odd.slice() : [];
+    }
     // S24: the first column is the NAME (flattened branch slug); the
     // absolute path stays in details, never in the printed line.
+    // S39: a sole claimant shows the CURRENT git branch, not the stale row.
+    const rowId = st && st.absolute !== null ? (st.real !== null ? st.real : st.absolute) : null;
+    const liveShown = rowId !== null && (claimCounts.get(rowId) || 0) === 1 ? liveBranchById.get(rowId) : undefined;
+    const shownBranch = liveShown || entry.branch;
     let rowName = "worktree";
     try {
-      rowName = git.slugifyBranch(typeof entry.branch === "string" ? entry.branch : "worktree");
+      rowName = git.slugifyBranch(typeof shownBranch === "string" ? shownBranch : "worktree");
     } catch {
       rowName = "worktree";
     }
     agentRows.push({
-      line: `worktree list: ${rowName} ${entry.branch} thread=${thread} issues=${issues.join(",")}`
-        + (liveHit ? "" : " missing"),
-      item: { name: rowName, path: entry.path, branch: entry.branch, thread, issues, status, kind: "agent" },
+      line: `worktree list: ${rowName} ${shownBranch} thread=${thread} issues=${issues.join(",")}`
+        + (liveHit ? "" : " missing")
+        + (oddDocs.length > 0 ? ` odd=${oddDocs.join(",")}` : ""),
+      item: { name: rowName, path: entry.path, branch: shownBranch, thread, issues, odd: oddDocs, status, kind: "agent" },
     });
   }
   // Prune exactly the dead rows in one atomic registry write, best
@@ -1416,7 +1879,81 @@ function liveUnregisteredEntries(rows, live, repoRoot, principal) {
   return out;
 }
 
-function resolveCheckoutByName(name, git, read, principal, live, repoRoot) {
+// S29 name-or-path resolution shared by close (and, through its own
+// call below, session open): the SAME field accepts a name OR a path —
+// the name first (the caller tries `resolveCheckoutByName`), then the
+// path. A path resolves only when it exists, is a directory, and belongs
+// to this project's worktrees: it must match a registered row by
+// resolved identity AND be a live checkout in git's listing. Anything
+// else yields null so the caller fails closed with the name error.
+function resolveClosePathEntry(raw, git, read, live, repoRoot) {
+  try {
+    if (typeof raw !== "string" || raw.length === 0) return null;
+    const st = checkoutState(raw, repoRoot);
+    if (st.absolute === null || !st.exists || !st.isDirectory) return null;
+    const id = st.real !== null ? st.real : st.absolute;
+    if (id === null) return null;
+    if (!liveIdentities(live, repoRoot).has(id)) return null;
+    const rows = read && Array.isArray(read.worktrees) ? read.worktrees : [];
+    for (const row of rows) {
+      if (!row || typeof row.path !== "string" || !path.isAbsolute(row.path)) continue;
+      const rst = checkoutState(row.path, repoRoot);
+      const rid = rst.real !== null ? rst.real : rst.absolute;
+      if (rid !== null && rid === id) return row;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// S39 current branch, shared by the resolver, the listing, the selector
+// and the warp: map each live checkout identity to its CURRENT branch from
+// git. The registry row keeps the branch recorded at creation time, so this
+// map is the refresh source and the registry field is the fallback only.
+function liveBranchMap(live, repoRoot) {
+  const map = new Map();
+  try {
+    for (const record of live || []) {
+      if (!record || typeof record.path !== "string" || record.path.length === 0) continue;
+      const rst = checkoutState(record.path, repoRoot);
+      const rid = rst.real !== null ? rst.real : rst.absolute;
+      if (rid === null) continue;
+      if (typeof record.branch === "string" && record.branch.length > 0 && !map.has(rid)) {
+        map.set(rid, record.branch);
+      }
+    }
+  } catch {
+    // No live map: every caller falls back to its registry field.
+  }
+  return map;
+}
+
+// How many registry rows claim each checkout identity. The CURRENT branch
+// replaces a row's stored branch only when that row is the checkout's sole
+// claimant: several rows may deliberately reach one checkout (a symlink
+// spelling kept under its own name), and there the stored names stay so the
+// ambiguity keeps resolving.
+function registryClaimCounts(rows, repoRoot) {
+  const counts = new Map();
+  try {
+    for (const row of rows || []) {
+      if (!row || typeof row.path !== "string" || !path.isAbsolute(row.path)) continue;
+      const rst = checkoutState(row.path, repoRoot);
+      const rid = rst.real !== null ? rst.real : rst.absolute;
+      if (rid === null) continue;
+      counts.set(rid, (counts.get(rid) || 0) + 1);
+    }
+  } catch {
+    // No counts: callers keep their registry fields.
+  }
+  return counts;
+}
+
+function resolveCheckoutByName(name, git, read, principal, live, repoRoot, opts) {
+  // S14: the warp allows a single unregistered match (`{allowUnregistered:
+  // true}`); close-by-name and session-open keep the default refusal so
+  // their semantics do not change.
   const rows = read && Array.isArray(read.worktrees) ? read.worktrees : [];
   const extras = liveUnregisteredEntries(rows, live, repoRoot, principal);
   const knownNames = [];
@@ -1455,9 +1992,22 @@ function resolveCheckoutByName(name, git, read, principal, live, repoRoot) {
       candidates: knownNames,
     };
   }
+  // S39: a row matches by its stored slug OR by its CURRENT live-branch
+  // slug, so the refreshed name the listing and the selector show stays
+  // warpable. One row matching twice still counts once.
+  const liveById = liveBranchMap(live, repoRoot);
   const matches = [];
   for (const row of rows) {
-    if (slugOf(git, row && row.branch) === name) matches.push(row);
+    if (slugOf(git, row && row.branch) === name) {
+      matches.push(row);
+      continue;
+    }
+    if (row && typeof row.path === "string" && path.isAbsolute(row.path)) {
+      const rst = checkoutState(row.path, repoRoot);
+      const rid = rst.real !== null ? rst.real : rst.absolute;
+      const current = rid !== null ? liveById.get(rid) : undefined;
+      if (typeof current === "string" && slugOf(git, current) === name) matches.push(row);
+    }
   }
   const extraMatches = extras.filter((extra) => slugOf(git, extra.branch) === name);
   if (matches.length + extraMatches.length > 1) {
@@ -1480,6 +2030,14 @@ function resolveCheckoutByName(name, git, read, principal, live, repoRoot) {
   }
   if (extraMatches.length === 1) {
     const only = extraMatches[0];
+    // S14: the warp moves to a lone unregistered checkout; every other
+    // caller keeps the refusal (close never acts on one).
+    if (opts && opts.allowUnregistered === true) {
+      return {
+        ok: true, kind: "unregistered", name,
+        path: only.path, branch: only.branch, entry: null,
+      };
+    }
     return {
       ok: false,
       error: `no registered worktree for ${JSON.stringify(name)}: '${only.branch}' at ${only.path} is unregistered, and neither close nor warp acts on an unregistered checkout`,
@@ -1531,6 +2089,154 @@ function principalForName(git, repoRoot, repo, live) {
   }
 }
 
+// Best-effort session-manager string accessor for the close sequence:
+// the current session id or session file, or null when the context
+// carries no such accessor. Never throws.
+function closeSessionString(ctx, method) {
+  try {
+    const sm = ctx && ctx.sessionManager;
+    if (!sm || typeof sm[method] !== "function") return null;
+    const value = sm[method]();
+    return typeof value === "string" && value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+// S33/S34 pre-removal sequence for `worktree_close`, running after
+// approval and before the checkout removal:
+//  1. A foreign live session (a Pi session that is not ours, evidenced
+//     by `herdr agent list` agents cwd'd in the target checkout) refuses
+//     the close with an actionable message and changes nothing. A
+//     failing or unparseable agent list is NO evidence: Herdr being
+//     unavailable never blocks the removal.
+//  2. Our own session (the tool context's cwd inside the target) warps
+//     to the principal FIRST through the existing warp machinery, and
+//     the close continues only when that warp actually succeeded.
+//  3. Only after such a warp, the Herdr workspace that pointed at the
+//     removed checkout is closed and a normal workspace is opened at the
+//     principal, resuming the warped session (lib/worktree-close-herdr.js;
+//     Herdr offers no workspace path move). Without a warped session the
+//     removal below already retires the workspace with the checkout, so
+//     there is nothing to re-home and the step stays silent.
+// Returns {ok: true, warp, herdrWorkspace, notices} or {ok: false, text,
+// details}. Never throws: every failure mode is a value.
+async function closePreRemovalSequence({ git, repo, target, branch, force, ctx, opts, resolvedTarget }) {
+  const closeHerdr = libRequire("worktree-close-herdr.js");
+  // Subprocess cwd, re-anchored onto the principal after a warp (below)
+  // so no Herdr call ever runs inside the checkout being removed.
+  let runRoot = repo.root;
+  const runHerdr = (argv, timeoutMs) => git.runArgv(herdrBinary(), argv, { cwd: runRoot, timeoutMs });
+  const ourSessionId = closeSessionString(ctx, "getSessionId");
+  let agents = [];
+  try {
+    const listed = runHerdr(["agent", "list"], 60000);
+    if (listed && listed.status === 0) {
+      agents = closeHerdr.agentsInCheckout(listed.stdout, resolvedTarget, repo.root, ourSessionId);
+    }
+  } catch {
+    agents = [];
+  }
+  if (agents.length > 0) {
+    const named = agents.map((agent) => agent.cwd).join(", ");
+    return {
+      ok: false,
+      text: `cannot close the worktree at ${target}: another live Pi session is active in that checkout (${named}); warp it to the principal with /herdr-gentle:worktree warp principal from that session and retry; the checkout and the registry were left untouched`,
+      details: { branch, path: target, force, agents },
+    };
+  }
+  let warp = null;
+  try {
+    const sessionState = checkoutState(toolCwd(ctx), repo.root);
+    const sessionId = sessionState.real !== null ? sessionState.real : sessionState.absolute;
+    if (sessionId !== null && (sessionId === resolvedTarget || sessionId.startsWith(resolvedTarget + path.sep))) {
+      const warpOpts = opts && typeof opts === "object" ? opts : undefined;
+      const moved = await executeWorktreeWarp("principal", ctx, warpOpts);
+      if (!moved || moved.isError) {
+        return {
+          ok: false,
+          text: `cannot close the worktree at ${target}: the session warp to the principal failed (${moved && moved.text ? moved.text : "the warp reported no result"}); the checkout and the registry were left untouched`,
+          details: { branch, path: target, force, warp: moved && moved.details ? moved.details : null },
+        };
+      }
+      warp = {
+        name: moved.details.name,
+        path: moved.details.path,
+        branch: moved.details.branch,
+        sessionFile: closeSessionString(ctx, "getSessionFile"),
+      };
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      text: `cannot close the worktree at ${target}: the session warp to the principal failed (${(err && err.message) || err}); the checkout and the registry were left untouched`,
+      details: { branch, path: target, force, warp: null },
+    };
+  }
+  let herdrWorkspace = null;
+  const notices = [];
+  // Subprocess anchor: the pre-warp repo.root names the caller's
+  // checkout, which after a warp is the doomed target itself. Re-anchor
+  // on the principal the warp just moved to (best-effort; the common
+  // dir — and therefore the registry — is shared either way), so the
+  // workspace reconcile and the removal below never run with a cwd
+  // inside the checkout being removed.
+  let anchorRoot = repo.root;
+  if (warp !== null) {
+    try {
+      anchorRoot = git.repoIdentity(warp.path).root;
+    } catch {
+      anchorRoot = repo.root;
+    }
+    runRoot = anchorRoot;
+    const reconciled = closeHerdr.reconcileHerdrWorkspace({
+      run: (argv, timeoutMs) => runHerdr(argv, timeoutMs),
+      repoRoot: anchorRoot,
+      resolvedTarget,
+      principalPath: warp.path,
+      session: { file: warp.sessionFile, id: ourSessionId },
+      force,
+    });
+    if (reconciled.status === "reconciled") {
+      herdrWorkspace = {
+        status: "reconciled",
+        closedWorkspace: reconciled.closedWorkspace,
+        openedWorkspace: reconciled.openedWorkspace,
+        session: reconciled.session,
+      };
+      // S35: the group reconcile closes every member of the checkout's
+      // group (linked first, root last); carry the full list when present.
+      if (Array.isArray(reconciled.closedWorkspaces)) {
+        herdrWorkspace.closedWorkspaces = reconciled.closedWorkspaces;
+      }
+    } else if (reconciled.status !== "absent") {
+      // 'skipped' and 'reconciled-partial': a short visible notice
+      // travels with the success, and the removal below still proceeds.
+      herdrWorkspace = {
+        status: reconciled.status,
+        notice: reconciled.notice,
+      };
+      if (reconciled.closedWorkspace !== undefined && reconciled.closedWorkspace !== null) {
+        herdrWorkspace.closedWorkspace = reconciled.closedWorkspace;
+      }
+      if (Array.isArray(reconciled.closedWorkspaces)) {
+        herdrWorkspace.closedWorkspaces = reconciled.closedWorkspaces;
+      }
+      // S35: a failed member leaves the group half-closed: name it so no
+      // partial success is mistaken for a clean reconcile.
+      if (typeof reconciled.failedWorkspace === "string" && reconciled.failedWorkspace.length > 0) {
+        herdrWorkspace.failedWorkspace = reconciled.failedWorkspace;
+      }
+      if (reconciled.openedWorkspace !== undefined) {
+        herdrWorkspace.openedWorkspace = reconciled.openedWorkspace;
+      }
+      if (reconciled.session !== undefined) herdrWorkspace.session = reconciled.session;
+      notices.push(reconciled.notice);
+    }
+  }
+  return { ok: true, warp, herdrWorkspace, notices, repoRoot: anchorRoot };
+}
+
 // Core of `worktree_close` (S7, D6): remove the checkout and its Herdr
 // workspace, keep the branch, drop the registry entry. Exported for unit
 // tests; the registered tool calls it with the live Pi context.
@@ -1543,7 +2249,7 @@ function principalForName(git, repoRoot, repo, live) {
 // `force` fails with the backend's own reason and nothing is mutated. The
 // registry entry is dropped only after `listWorktrees` confirms the path
 // is gone.
-async function executeWorktreeClose(params, ctx) {
+async function executeWorktreeClose(params, ctx, opts) {
   const git = libRequire("worktree-git.js");
   const registry = libRequire("worktree-registry.js");
   const mode = libRequire("worktree-mode.js");
@@ -1620,15 +2326,43 @@ async function executeWorktreeClose(params, ctx) {
     }
     const resolved = resolveCheckoutByName(rawName, git, read, principalForName(git, repo.root, repo, liveForName), liveForName, repo.root);
     if (!resolved.ok) {
-      return errorResult(resolved.error, { query: rawName, candidates: resolved.candidates, force });
-    }
-    if (resolved.kind === "principal") {
+      // S29: the same field accepts a name OR a path — the name first,
+      // then the path. A path resolves only when it exists and belongs
+      // to this project's worktrees (checked against the registry and
+      // the live listing); anything else fails closed with the name
+      // resolution error and no side effect.
+      const pathEntry = resolveClosePathEntry(rawName, git, read, liveForName, repo.root);
+      if (pathEntry) {
+        entry = pathEntry;
+      } else {
+        return errorResult(resolved.error, { query: rawName, candidates: resolved.candidates, force });
+      }
+    } else if (resolved.kind === "principal") {
       return errorResult(
         `cannot close the principal checkout at ${resolved.path}: worktree_close only closes registered agent worktrees; the checkout and the registry were left untouched`,
         { name: rawName, path: resolved.path, branch: resolved.branch, force },
       );
+    } else {
+      entry = resolved.entry;
     }
-    entry = resolved.entry;
+    // S32: a path that resolves to the principal checkout (or to
+    // anything that is not a registered agent worktree) is refused here,
+    // before any approval, removal or registry write.
+    if (entry) {
+      const entryState = checkoutState(entry.path, repo.root);
+      const entryId = entryState.real !== null ? entryState.real : entryState.absolute;
+      const principalRef = principalForName(git, repo.root, repo, liveForName);
+      if (principalRef && typeof principalRef.path === "string") {
+        const pst = checkoutState(principalRef.path, repo.root);
+        const pid = pst.real !== null ? pst.real : pst.absolute;
+        if (entryId !== null && pid !== null && entryId === pid) {
+          return errorResult(
+            `cannot close the principal checkout at ${principalRef.path}: worktree_close only closes registered agent worktrees; the checkout and the registry were left untouched`,
+            { name: rawName, path: principalRef.path, branch: principalRef.branch, force },
+          );
+        }
+      }
+    }
   }
   if (!entry) {
     // Never remove an unknown checkout: refuse and name the closest
@@ -1697,17 +2431,33 @@ async function executeWorktreeClose(params, ctx) {
 
   // Approval when the host offers dialog UI; non-interactive modes
   // proceed without it. A refusal mutates nothing and keeps the entry.
+  // S61: the confirmation names the checkout's pending changes when it
+  // has any (N files +N/-N read through lib/worktree-changes.js); a
+  // clean checkout omits the dirty warning. A summary failure degrades
+  // to the plain confirmation (never a silent force: force still comes
+  // only from the caller's params).
   if (ctx && ctx.hasUI) {
     const canAsk = ctx.ui && typeof ctx.ui.confirm === "function";
     let approved = false;
     if (canAsk) {
+      let dirtyLine = '';
+      try {
+        const changesLib = libRequire('worktree-changes.js');
+        const summary = await changesLib.summarizeChanges(target, { git });
+        if (summary && summary.ok === true && summary.files > 0) {
+          dirtyLine = ` Pending changes: ${summary.files} file${summary.files === 1 ? '' : 's'}, +${summary.added}/-${summary.deleted}.`;
+        }
+      } catch {
+        dirtyLine = '';
+      }
       try {
         approved = await ctx.ui.confirm(
           `Close worktree '${branch}'?`,
           `Remove the worktree checkout at ${target} for branch '${branch}'? The branch '${branch}' will be kept.`
             + (owner
               ? ` This checkout is owned by thread '${owner}'.`
-              : " This checkout has no recorded owning thread."),
+              : " This checkout has no recorded owning thread.")
+            + dirtyLine,
         );
       } catch {
         approved = false;
@@ -1721,6 +2471,21 @@ async function executeWorktreeClose(params, ctx) {
     }
   }
 
+  // S33/S34: warp a live session out and reconcile the Herdr workspace
+  // BEFORE the checkout removal below. A refusal here changes nothing:
+  // the checkout, the branch and the registry entry are left untouched.
+  const preRemoval = await closePreRemovalSequence({
+    git, repo, target, branch, force, ctx, opts, resolvedTarget,
+  });
+  if (!preRemoval.ok) {
+    return errorResult(preRemoval.text, preRemoval.details);
+  }
+  // S33/S34: after a warp the caller's checkout is the doomed target
+  // itself, so the removal and its verification run anchored on the
+  // principal the warp moved to. Without a warp this is repo.root and
+  // the removal below is exactly as before.
+  const effectiveRoot = preRemoval.repoRoot || repo.root;
+
   // Remove herdr-first: resolve the workspace id from `herdr worktree
   // list`, then `herdr worktree remove`. Fixed argv only, values as
   // separate elements (herdr rejects --flag=value). Never
@@ -1729,18 +2494,18 @@ async function executeWorktreeClose(params, ctx) {
   let removedBy = null;
   let removeError = null;
   let workspace = null;
-  const listed = git.runArgv(herdrBinary(), git.herdrArgv("list", { cwd: repo.root }), {
-    cwd: repo.root,
+  const listed = git.runArgv(herdrBinary(), git.herdrArgv("list", { cwd: effectiveRoot }), {
+    cwd: effectiveRoot,
     timeoutMs: 60000,
   });
   if (listed.status === 0) {
-    workspace = herdrWorkspaceId(listed.stdout, resolvedTarget, repo.root);
+    workspace = herdrWorkspaceId(listed.stdout, resolvedTarget, effectiveRoot);
   }
   if (workspace) {
     const removeParams = { workspace };
     if (force) removeParams.force = true;
     const removed = git.runArgv(herdrBinary(), git.herdrArgv("remove", removeParams), {
-      cwd: repo.root,
+      cwd: effectiveRoot,
       timeoutMs: 120000,
     });
     if (removed.status === 0) {
@@ -1758,7 +2523,7 @@ async function executeWorktreeClose(params, ctx) {
     const argv = ["worktree", "remove"];
     if (force) argv.push("--force");
     argv.push(resolvedTarget);
-    const fallen = git.runArgv("git", argv, { cwd: repo.root, timeoutMs: 120000 });
+    const fallen = git.runArgv("git", argv, { cwd: effectiveRoot, timeoutMs: 120000 });
     if (fallen.status === 0) {
       removedBy = "git";
     } else {
@@ -1771,7 +2536,7 @@ async function executeWorktreeClose(params, ctx) {
     // deleted a checkout other than the target on its way out, so the
     // vanished comparison runs BEFORE this early return, never after it.
     // Either way the registry entry is kept; only the message differs.
-    const vanishedOnFailure = vanishedCheckouts(git, repo.root, live, resolvedTarget);
+    const vanishedOnFailure = vanishedCheckouts(git, effectiveRoot, live, resolvedTarget);
     if (vanishedOnFailure.length > 0) {
       return errorResult(
         `worktree removal failed (${removeError || "failed to remove worktree"}) and removed an unexpected checkout at ${vanishedOnFailure[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
@@ -1792,9 +2557,9 @@ async function executeWorktreeClose(params, ctx) {
   // unverifiable-removal message. Covers both the herdr and git paths.
   let after;
   try {
-    after = git.listWorktrees(repo.root);
+    after = git.listWorktrees(effectiveRoot);
   } catch (err) {
-    const vanishedWithoutList = vanishedCheckouts(git, repo.root, live, resolvedTarget, null);
+    const vanishedWithoutList = vanishedCheckouts(git, effectiveRoot, live, resolvedTarget, null);
     if (vanishedWithoutList.length > 0) {
       return errorResult(
         `worktree removal removed an unexpected checkout at ${vanishedWithoutList[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
@@ -1812,7 +2577,7 @@ async function executeWorktreeClose(params, ctx) {
   // successful, and the registry entry is left in place. Covers both the
   // herdr and the git removal paths; a legitimate single-checkout removal
   // (only the target gone) never trips it.
-  const vanished = vanishedCheckouts(git, repo.root, live, resolvedTarget, after);
+  const vanished = vanishedCheckouts(git, effectiveRoot, live, resolvedTarget, after);
   if (vanished.length > 0) {
     return errorResult(
       `worktree removal removed an unexpected checkout at ${vanished[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
@@ -1830,7 +2595,7 @@ async function executeWorktreeClose(params, ctx) {
   }
   let dropped;
   try {
-    dropped = registry.removeWorktreeByPath(repo.root, resolvedTarget);
+    dropped = registry.removeWorktreeByPath(effectiveRoot, resolvedTarget);
   } catch (err) {
     dropped = { ok: false, error: (err && err.message) || String(err) };
   }
@@ -1840,14 +2605,24 @@ async function executeWorktreeClose(params, ctx) {
       { branch, path: target, force, removed: true, branchKept: true },
     );
   }
+  // S33/S34: the pre-removal sequence appends its own visible lines —
+  // the warp that moved this session out, and any skipped Herdr
+  // workspace step — while the removed/branch-kept contract stays
+  // byte-identical on every path that never warped.
+  const successLines = [closeSuccessText(branch, true)];
+  if (preRemoval.warp !== null) successLines.push("session warped to principal");
+  for (const notice of preRemoval.notices) successLines.push(notice);
+  const successDetails = { path: target, branch, removed: true, branchKept: true, thread: owner };
+  if (preRemoval.warp !== null) successDetails.warp = preRemoval.warp;
+  if (preRemoval.herdrWorkspace !== null) successDetails.herdrWorkspace = preRemoval.herdrWorkspace;
   return textResult(
-    `worktree close: ${target}`,
-    { path: target, branch, removed: true, branchKept: true, thread: owner },
+    successLines.join("\n"),
+    successDetails,
     false,
   );
 }
 
-const worktreeListTool = defineTool({
+const worktreeListTool = withWorktreeCardRenderer(defineTool({
   name: "worktree_list",
   label: "Worktree List",
   description: "List the principal checkout plus the agent worktrees registered for this repository, cross-checked against live checkouts with their owning thread. The session's own checkout is listed first. Pass all:true to also show live checkouts the registry does not know about. Rows whose paths no longer exist are excluded and pruned from the registry.",
@@ -1857,9 +2632,9 @@ const worktreeListTool = defineTool({
   async execute(toolCallId, params, signal, onUpdate, ctx) {
     return executeWorktreeList(params, ctx);
   },
-});
+}));
 
-const worktreeCloseTool = defineTool({
+const worktreeCloseTool = withWorktreeCardRenderer(defineTool({
   name: "worktree_close",
   label: "Worktree Close",
   description: "Remove a registered agent worktree checkout and its Herdr workspace while keeping the branch. Pass the worktree name, path, or branch (only one), plus force:true to close a dirty checkout.",
@@ -1872,7 +2647,7 @@ const worktreeCloseTool = defineTool({
   async execute(toolCallId, params, signal, onUpdate, ctx) {
     return executeWorktreeClose(params, ctx);
   },
-});
+}));
 
 // ---------------------------------------------------------------------------
 // `worktree_session_open` (S25, T34): open a Pi session in a Herdr
@@ -2241,8 +3016,10 @@ function clearSessionWatchers() {
   SESSION_WATCHERS.clear();
 }
 
-function sessionSuccessText(worktree, sessionId) {
-  return `worktree session open: ${worktree} ${sessionId}`;
+function sessionSuccessText(worktree, sessionId, targetPath, resumed) {
+  const head = `opened: ${warpClean(worktree, 'worktree')} · ${warpClean(sessionId, '(unknown session)')}`;
+  if (resumed === true) return `${head}\nresumed`;
+  return `${head}\npath: ${warpClean(targetPath, '(unknown path)')}`;
 }
 
 // A value that is unambiguously a filesystem path rather than a worktree
@@ -2498,16 +3275,16 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
     : undefined;
   // T35 wires the behaviour; this tool only accepts and reports it.
   const notify = !(params && params.notify === false);
+  // S29: the same field accepts a name OR a path — the name first,
+  // then the path. An explicit path is NOT refused up front: it falls
+  // through to the path leg below, which resolves only when the path
+  // exists and belongs to this project's worktrees. Anything else keeps
+  // the historical refusals byte-identical.
   if (typeof rawWorktree !== "string" || rawWorktree.length === 0) {
     return errorResult(
       "worktree_session_open requires a worktree name: pass the NAME 'worktree list' prints (or a branch name), not a path",
       { worktree: rawWorktree },
     );
-  }
-  // An explicit path is refused before any backend runs, so no command
-  // can ever run outside a worktree of this repository.
-  if (isExplicitPath(rawWorktree)) {
-    return errorResult(pathRefusal(rawWorktree), { worktree: rawWorktree });
   }
 
   let repo;
@@ -2545,6 +3322,28 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
       const viaSlug = resolveCheckoutByName(slug, git, read, principal, live, repo.root);
       if (viaSlug.ok) resolved = viaSlug;
     }
+  }
+  if (!resolved.ok && looksLikePath(rawWorktree)) {
+    // S29 path leg: a path that exists and belongs to this project's
+    // worktrees resolves to its registered row; any other path keeps
+    // the historical refusal, byte-identical, before any backend runs.
+    const pathEntry = resolveClosePathEntry(rawWorktree, git, read, live, repo.root);
+    if (pathEntry) {
+      let entryName = null;
+      try {
+        entryName = git.slugifyBranch(pathEntry.branch);
+      } catch {
+        entryName = null;
+      }
+      resolved = {
+        ok: true, kind: "agent",
+        name: entryName || pathEntry.branch,
+        path: pathEntry.path, branch: pathEntry.branch, entry: pathEntry,
+      };
+    }
+  }
+  if (!resolved.ok && isExplicitPath(rawWorktree)) {
+    return errorResult(pathRefusal(rawWorktree), { worktree: rawWorktree });
   }
   if (!resolved.ok && looksLikePath(rawWorktree)) {
     return errorResult(pathRefusal(rawWorktree), { worktree: rawWorktree });
@@ -2768,7 +3567,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
     );
   }
   const opened = textResult(
-    sessionSuccessText(resolved.name, sessionId),
+    sessionSuccessText(resolved.name, sessionId, targetCwd, resumed),
     {
       worktree: resolved.name, branch, path: targetCwd,
       paneId, workspaceId, sessionId, resumed, agentName, notify,
@@ -2792,7 +3591,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
   return opened;
 }
 
-const worktreeSessionOpenTool = defineTool({
+const worktreeSessionOpenTool = withWorktreeCardRenderer(defineTool({
   name: "worktree_session_open",
   label: "Worktree Session Open",
   description: "Open a Pi session inside a registered agent worktree via Herdr (workspace only, never a path): pass the worktree NAME 'worktree list' prints (or a branch name) and optionally a session id to resume. A new session id is minted when resuming is not asked. Unless notify:false is passed, the creator is notified when that session really finishes.",
@@ -2805,34 +3604,8 @@ const worktreeSessionOpenTool = defineTool({
   async execute(toolCallId, params, signal, onUpdate, ctx) {
     return executeWorktreeSessionOpen(params, ctx);
   },
-});
+}));
 
-// ---------------------------------------------------------------------------
-// Automatic odd/ capture (S5, D7).
-//
-// The extension observes the Pi tool pipeline for the `read`, `edit` and
-// `write` tools. For each call it decides whether the touched path is a
-// `.md` document inside the principal checkout's `odd/` directory and, when
-// it is, associates that document with the worktree of the AGENT'S CONTEXT
-// (resolved from the invoking context's working directory and matched
-// against the registry entries) — never from the file path identity,
-// because `odd/` is a symlink into the principal checkout so one real path
-// is shared by every worktree. A call running in the principal checkout
-// itself associates nothing.
-//
-// `bash` commands touching `odd/` are NOT reliably parseable (arbitrary
-// shell text, redirections, and quoting cannot be reduced to a file list),
-// so the per-call capture is complemented by a bounded re-scan of the
-// worktree's own `odd/` directory (`.md` only) on EVERY pipeline event on
-// this hook — including `bash` calls, which carry no parseable path at
-// all. Anything the registry does not know about yet is recorded there.
-//
-// The hook never throws and never blocks the pipeline: any failure
-// (unreadable registry, lock timeout, unknown context) is swallowed after
-// a best-effort attempt, and the handler returns nothing.
-// ---------------------------------------------------------------------------
-
-// Only these three tools carry a single document path worth capturing.
 const ODD_CAPTURE_TOOLS = new Set(["read", "edit", "write"]);
 
 // Bounds for the complementary re-scan: at most this many `.md` documents
@@ -3103,14 +3876,9 @@ function handleWorktreeOddEvent(event, ctx) {
 // `new_cwd = "follow"` inherit it); the interactive bash shell in that
 // pane does NOT change directory, because a child process cannot change
 // its parent shell's cwd.
-// ---------------------------------------------------------------------------
 
-// Emit OSC-7 announcing the session's new cwd to the terminal — written
-// ONLY when the stream is a TTY, so a stream the TUI owns when it is not a
-// TTY is never written to. The payload is a file URL, so a path holding a
-// space or a non-ASCII character is percent-encoded instead of splitting
-// the OSC-7 argument. The stream is injectable so tests can assert the
-// exact bytes.
+// Shared helpers restored for this layer (old warp + startup).
+
 function emitOsc7(stream, cwd) {
   try {
     if (!stream || stream.isTTY !== true || typeof stream.write !== "function") return false;
@@ -3129,6 +3897,7 @@ function emitOsc7(stream, cwd) {
 // imports from the same package), else the session instance's own
 // constructor — the class that produced it, whose statics (`forkFrom`,
 // `create`, `open`) are the mechanism. Null when neither is available.
+
 async function sessionManagerClassFor(ctx) {
   try {
     const mod = await import("@earendil-works/pi-coding-agent");
@@ -3148,30 +3917,57 @@ async function sessionManagerClassFor(ctx) {
   return null;
 }
 
+
 function warpFail(text, details) {
   return { text, details: details || {}, isError: true };
 }
 
-// Core of the `warp` verb. Exported for unit tests, which inject a fake
-// SessionManager class plus a fake OSC stream through `opts` and drive a
-// fake command context (`waitForIdle`, `sessionManager` with
-// `getSessionFile`/`getLeafId`/`getEntries`/`getSessionDir`,
-// `switchSession`, `ui.setStatus`, `cwd`); the registered command calls
-// it with the live Pi context and notifies the returned text.
-//
-// Mechanism (S23): `await ctx.waitForIdle()`; capture
-// `{file: getSessionFile(), leaf: getLeafId(), cwd: ctx.cwd, sessionDir}`
-// and refuse when there is no persisted session; `SessionManager.forkFrom`
-// (or, for a session Pi has not written to disk yet — brand-new, living
-// only in memory — clone the in-memory entries into a session allocated
-// for the target cwd via `SessionManager.create` + `open`); `branch(leaf)`
-// (or `resetLeaf()` when there is no leaf) plus one `appendCustomEntry`
-// transition record naming both cwds; then
-// `ctx.switchSession(targetFile, { withSession: r => r.ui.setStatus(...)
-// + r.sendMessage(..., {triggerTurn: false}) })`, whose message tells the
-// session to revalidate every path and cwd-dependent assumption.
-// `cancelled` is a real outcome: it removes the target session file,
-// reports it, and changes nothing else.
+// S18/S19 warp text hygiene. Branch names and checkout paths reach the
+// transcript through the two-line moved/to compact and the one-line
+// transition notice, so control characters and ANSI escapes are stripped
+// at this layer — the card renderer never sees a command notification.
+
+function warpClean(value, fallback) {
+  try {
+    const line = String(value ?? '')
+      .replace(/\x1b\[[0-9;]*m|\x1b\]8;;.*?\x07/g, '')
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+      .split('\n')[0].trim().replace(/\s+/g, ' ');
+    return line.length > 0 ? line : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// The S19 compact: exactly two ordered lines — the checkout left, then
+// the checkout entered as `name · branch`. Never a paragraph dump; the
+// longer explanation lives in the transition notice and the docs.
+
+function scanLiveCheckouts(cwd) {
+  try {
+    const git = libRequire("worktree-git.js");
+    const from = typeof cwd === "string" && cwd.length > 0 ? cwd : process.cwd();
+    const repo = git.repoIdentity(from);
+    const live = git.listWorktrees(repo.root);
+    return { repo, live };
+  } catch {
+    return null;
+  }
+}
+
+// S20 warp confirmation card: the visible transition notice renders like
+// the reference cards (glyph, capitalised label, ordered short lines)
+// instead of Pi's default `[worktree-warp]` block. Commands have no render
+// hook, so the styling lives here as a message renderer over the pure card
+// factory in lib/worktree-card.js, with helpers through the same
+// injectable seam as the tool cards. Guarded so older hosts and unit-test
+// doubles without registerMessageRenderer still load: then the notice
+// shows through the default block, while the warp itself is unaffected.
+
+
+// Restored base worktree command + warp verb (this layer, before removals).
+// ---------------------------------------------------------------------------
+
 async function executeWorktreeWarp(rawName, ctx, opts) {
   const options = opts || {};
   const git = libRequire("worktree-git.js");
@@ -3486,8 +4282,7 @@ export default function (pi) {
   // Load-time gate (D9): missing means enabled, malformed never enables.
   // The toggle command below always stays registered so the mode can be
   // flipped back; the current registration state is reported through its
-  // `status` verb in the same style the `/herdr-gentle:sidebar` command
-  // uses (mode state, what is active, whether `/reload` is needed).
+  // `status` verb.
   let toolsRegistered = false;
   try {
     toolsRegistered = libRequire("worktree-mode.js").readMode().enabled === true;
@@ -3507,7 +4302,61 @@ export default function (pi) {
   if (typeof pi?.on === "function") {
     pi.on("tool_call", handleWorktreeOddEvent);
     pi.on("tool_result", handleWorktreeOddEvent);
+    // S28: enumerate EVERY repository worktree through git at startup
+    // and register the missing ones — all registered worktrees, not
+    // only those under the creation path (that path is only where new
+    // ones are born). Best-effort: never writes user config, never
+    // throws, never blocks the session; the principal checkout is never
+    // registered here (S31: its record is created on demand by an
+    // explicit edit).
+    pi.on("session_start", (event, ctx) => {
+      try {
+        const cwd = ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd
+          : event && typeof event.cwd === "string" && event.cwd.length > 0 ? event.cwd
+          : process.cwd();
+        const scanned = scanLiveCheckouts(cwd);
+        if (scanned !== null) {
+          try {
+            const registry = libRequire("worktree-registry.js");
+            let principalId = null;
+            try {
+              if (typeof scanned.repo.commonDir === "string" && path.basename(scanned.repo.commonDir) === ".git") {
+                const rawPrincipal = path.resolve(path.dirname(scanned.repo.commonDir));
+                const pst = checkoutState(rawPrincipal, scanned.repo.root);
+                principalId = pst.real !== null ? pst.real : pst.absolute;
+              }
+            } catch {
+              principalId = null;
+            }
+            if (typeof registry.registerMissingWorktrees === "function") {
+              registry.registerMissingWorktrees(scanned.repo.root, scanned.live, principalId);
+            }
+          } catch {
+            // Discovery registration is best-effort.
+          }
+        }
+      } catch {
+        // Discovery must never break startup.
+      }
+    });
+    // S22: compare the installed `herdr-gentle-shell` Herdr plugin
+    // against the version this package ships, once per session.
+    // Best-effort and read-only: an absent Herdr CLI or unreadable
+    // metadata fails silent inside the check itself — never throws,
+    // never blocks the session, never writes config, never repeats
+    // the alert, and never mentions /reload.
+    pi.on("session_start", (event, ctx) => {
+      try {
+        const check = libRequire("herdr-plugin-check.js");
+        const notify = ctx && ctx.ui && typeof ctx.ui.notify === "function"
+          ? (text) => ctx.ui.notify(text, "info")
+          : null;
+        check.checkAndNotifyHerdrPlugin({ env: process.env, notify });
+      } catch {
+        // The plugin check must never break startup.
+      }
+    });
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setWorktreeCardHelpers };

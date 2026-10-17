@@ -92,6 +92,31 @@ describe('worktree-git: runArgv', () => {
   });
 });
 
+describe('worktree-git: runArgvAsync', () => {
+  test('resolves the same shape as the sync runner, never a shell string', async () => {
+    const result = await gitLib.runArgvAsync('git', ['--version'], {});
+    assert.deepEqual(Object.keys(result).sort(), ['error', 'status', 'stderr', 'stdout']);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /^git version \d/);
+    assert.equal(result.error, null);
+  });
+
+  test('reports a missing binary instead of throwing', async () => {
+    const result = await gitLib.runArgvAsync('definitely-not-a-real-binary-xyz', ['--version'], {});
+    assert.equal(result.status, null);
+    assert.equal(typeof result.error, 'string');
+    assert.ok(result.error.length > 0);
+  });
+
+  test('a hanging child aborts on its bound instead of blocking', async () => {
+    const started = Date.now();
+    const result = await gitLib.runArgvAsync('sleep', ['30'], { timeoutMs: 100 });
+    assert.equal(result.status, null);
+    assert.match(result.error, /timed out/);
+    assert.ok(Date.now() - started < 10000, 'bounded well under the child lifetime');
+  });
+});
+
 describe('worktree-git: repoIdentity', () => {
   test('returns the exact identity shape', () => {
     const root = makeRepo('identity');
@@ -198,6 +223,39 @@ describe('worktree-git: worktreePath', () => {
     // A fresh branch target is not inside any checkout.
     assert.equal(gitLib.isPathInAnyCheckout(root, gitLib.worktreePath(root, 'feat/fresh')), false);
   });
+
+  test('is preserved for the tool path: called from the principal it is the canonical layout', () => {
+    const root = makeRepo('principal-pin');
+    assert.equal(
+      gitLib.worktreePath(root, 'feat/x'),
+      gitLib.canonicalWorktreePath(root, 'feat/x'),
+      'from the principal checkout both spellings agree — the tool default never moves',
+    );
+  });
+});
+
+describe('worktree-git: principalRoot + canonicalWorktreePath', () => {
+  test('recovers the principal from a linked worktree without branch-name assumptions', () => {
+    const root = makeRepo('canonical');
+    const linked = path.join(path.dirname(root), `${path.basename(root)}-linked`);
+    track(linked);
+    git(root, ['worktree', 'add', linked, '-b', 'feature/linked']);
+    // No main/master assumption: whatever the default branch is named,
+    // the principal is where the shared common dir lives.
+    assert.equal(gitLib.principalRoot(linked), root);
+    assert.equal(gitLib.principalRoot(root), root);
+  });
+
+  test('canonical layout stays sibling to the principal even from a linked checkout', () => {
+    const root = makeRepo('canonical-layout');
+    const linked = path.join(path.dirname(root), `${path.basename(root)}-linked`);
+    track(linked);
+    git(root, ['worktree', 'add', linked, '-b', 'feature/linked']);
+    const expected = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, 'feat-picked');
+    assert.equal(gitLib.canonicalWorktreePath(linked, 'feat/picked'), expected);
+    assert.ok(!expected.startsWith(linked), 'never nested inside the calling worktree');
+    assert.equal(gitLib.isPathInAnyCheckout(linked, expected), false);
+  });
 });
 
 describe('worktree-git: herdrArgv', () => {
@@ -247,6 +305,35 @@ describe('worktree-git: herdrArgv', () => {
     );
     assert.throws(() => gitLib.herdrArgv('create', { branch: 'x', noFocus: true }));
     assert.throws(() => gitLib.herdrArgv('remove', { workspace: 'abc', trustRepository: true }));
+  });
+});
+
+describe('worktree-git: resolveHerdrBinary (test isolation)', () => {
+  test('an explicit HERDR_BIN_PATH always wins, even under the test harness', () => {
+    assert.equal(
+      gitLib.resolveHerdrBinary({ HERDR_BIN_PATH: '/tmp/fake-herdr', GENTLE_WORKTREE_LIB_DIR: '/x/lib' }),
+      '/tmp/fake-herdr',
+    );
+  });
+
+  test('a test-harness process without an injected binary fails closed instead of reaching live herdr', () => {
+    // GENTLE_WORKTREE_LIB_DIR is set only by the test loaders that import
+    // the extension copy; with it present and HERDR_BIN_PATH empty, resolving
+    // must throw so no test can spawn the real `herdr` on PATH.
+    assert.throws(
+      () => gitLib.resolveHerdrBinary({ GENTLE_WORKTREE_LIB_DIR: '/x/lib' }),
+      /HERDR_BIN_PATH/,
+    );
+    assert.throws(
+      () => gitLib.resolveHerdrBinary({ HERDR_BIN_PATH: '', GENTLE_WORKTREE_LIB_DIR: '/x/lib' }),
+      /HERDR_BIN_PATH/,
+    );
+  });
+
+  test('the production default still resolves to herdr on PATH when nothing is injected', () => {
+    assert.equal(gitLib.resolveHerdrBinary({}), 'herdr');
+    assert.equal(gitLib.resolveHerdrBinary({ HERDR_BIN_PATH: '' }), 'herdr');
+    assert.equal(gitLib.resolveHerdrBinary(undefined), 'herdr');
   });
 });
 
@@ -491,5 +578,100 @@ describe('worktree-mode', () => {
     const env = scratchEnv();
     fs.writeFileSync(modeLib.modePath(env), '{ nope {{{');
     assert.deepEqual(modeLib.readMode(env), { state: 'malformed', enabled: false });
+  });
+});
+
+describe('worktree-mode stored-dir fallback (S15)', () => {
+  // A sandbox XDG state home plus an injected (new-id) dir. A stored flag
+  // means <sandbox>/herdr/plugins/herdr-gentle-agents holds the mode file.
+  function injectedFixture(tag, storedDoc) {
+    const sandbox = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-s15-xdg-${tag}-`)));
+    const injected = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-s15-injected-${tag}-`)));
+    let stored = null;
+    if (storedDoc !== undefined) {
+      stored = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+      fs.mkdirSync(stored, { recursive: true });
+      fs.writeFileSync(path.join(stored, 'gentle-worktree-mode.json'), `${JSON.stringify(storedDoc)}\n`);
+    }
+    return { env: { HERDR_PLUGIN_STATE_DIR: injected, XDG_STATE_HOME: sandbox }, injected, stored, sandbox };
+  }
+
+  test('readMode finds a stored disabled flag under an injected empty dir', () => {
+    const { env } = injectedFixture('disabled', { version: 1, enabled: false });
+    assert.deepEqual(modeLib.readMode(env), { state: 'disabled', enabled: false });
+  });
+
+  test('readMode finds a stored enabled flag under an injected empty dir', () => {
+    const { env } = injectedFixture('enabled', { version: 1, enabled: true });
+    assert.deepEqual(modeLib.readMode(env), { state: 'enabled', enabled: true });
+  });
+
+  test('explicit user dir wins over injected and stored dirs', () => {
+    const { env, injected, sandbox } = injectedFixture('explicit', { version: 1, enabled: true });
+    const explicit = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-s15-explicit-')));
+    fs.writeFileSync(path.join(explicit, 'gentle-worktree-mode.json'), '{"version":1,"enabled":false}\n');
+    const full = { ...env, GENTLE_STATUS_STATE_DIR: explicit };
+    assert.deepEqual(modeLib.readMode(full), { state: 'disabled', enabled: false });
+    assert.equal(modeLib.stateDir(full), explicit);
+    assert.ok(injected.length > 0 && sandbox.length > 0, 'fixture dirs exist');
+  });
+
+  test('explicit empty/invalid values keep historical semantics (overrides ignored)', () => {
+    const sandbox = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-s15-empty-')));
+    const stored = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+    assert.equal(
+      modeLib.stateDir({ GENTLE_STATUS_STATE_DIR: '', HERDR_PLUGIN_STATE_DIR: '/x-unreal', XDG_STATE_HOME: sandbox }),
+      stored,
+      'an explicit empty string ignores every override, as before',
+    );
+    assert.equal(
+      modeLib.stateDir({ GENTLE_STATUS_STATE_DIR: 5, XDG_STATE_HOME: sandbox }),
+      stored,
+      'a non-string override is ignored, as before',
+    );
+  });
+
+  test('fresh installs converge on the injected dir', () => {
+    const { env, injected } = injectedFixture('fresh');
+    assert.equal(modeLib.stateDir(env), injected);
+    assert.deepEqual(modeLib.readMode(env), { state: 'missing', enabled: true });
+  });
+
+  test('flags in both dirs resolve deterministically to the injected dir', () => {
+    const { env, injected } = injectedFixture('both', { version: 1, enabled: false });
+    fs.writeFileSync(path.join(injected, 'gentle-worktree-mode.json'), '{"version":1,"enabled":true}\n');
+    assert.equal(modeLib.stateDir(env), injected);
+    assert.deepEqual(modeLib.readMode(env), { state: 'enabled', enabled: true });
+  });
+
+  test('writes land where reads look (no split-brain)', () => {
+    const { env } = injectedFixture('write', { version: 1, enabled: false });
+    modeLib.writeMode(true, env);
+    assert.deepEqual(modeLib.readMode(env), { state: 'enabled', enabled: true });
+    const stored = path.join(env.XDG_STATE_HOME, 'herdr', 'plugins', 'herdr-gentle-agents', 'gentle-worktree-mode.json');
+    assert.equal(fs.readFileSync(stored, 'utf8'), '{"version":1,"enabled":true}\n');
+  });
+});
+
+describe('S14 registry accepts issues:[] (T7 RED)', { concurrency: false }, () => {
+  test('upsert/read round-trips an entry with no issues', () => {
+    const root = makeRepo('regempty');
+    const target = path.join(path.dirname(root), 'empty-wt');
+    const written = registryLib.upsertWorktree(root, {
+      branch: 'feat/empty', path: target, thread: 'thread-1', issues: [], odd: [],
+    });
+    assert.equal(written.ok, true, `expected acceptance, got: ${written.error}`);
+    assert.deepEqual(written.entry.issues, []);
+    assert.deepEqual(registryLib.findByBranch(root, 'feat/empty').issues, []);
+  });
+
+  test('a non-array issues value is still refused', () => {
+    const root = makeRepo('regnonarray');
+    const target = path.join(path.dirname(root), 'nonarray-wt');
+    const refused = registryLib.upsertWorktree(root, {
+      branch: 'feat/nonarray', path: target, thread: 'thread-1', issues: '35', odd: [],
+    });
+    assert.equal(refused.ok, false);
+    assert.match(refused.error, /issues/);
   });
 });
