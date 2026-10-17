@@ -221,7 +221,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
       const { tools } = await loadExtension();
       assert.deepEqual(
         [...tools.keys()].sort(),
-        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open'],
+        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'],
       );
       const params = tools.get('worktree_session_open').parameters;
       assert.deepEqual(Object.keys(params.properties).sort(), ['name', 'notify', 'session', 'worktree']);
@@ -939,7 +939,7 @@ describe('worktree_session_open preserves the existing tools (S25)', { concurren
       const { tools, commands } = await loadExtension();
       assert.deepEqual(
         [...tools.keys()].sort(),
-        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open'],
+        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'],
       );
       assert.deepEqual(
         Object.keys(tools.get('worktree_create').parameters.properties).sort(),

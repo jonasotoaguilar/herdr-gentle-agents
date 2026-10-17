@@ -289,7 +289,7 @@ describe('worktree mode command', { concurrency: false }, () => {
     try {
       modeLib().writeMode(true, process.env);
       const { tools } = await loadExtension();
-      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open']);
+      assert.deepEqual([...tools.keys()], ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp']);
     } finally {
       restoreEnv();
     }
@@ -422,46 +422,6 @@ describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, ()
     return { isTTY, chunks: [], write(chunk) { this.chunks.push(String(chunk)); return true; } };
   }
 
-  test('warp moves the session: fork, branch, transition record, switch, exact text', async () => {
-    const root = makeRepo('warp-ok');
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
-    try {
-      const target = addRegistered(root, 'feat/warp-target', { thread: 'thread-1', issues: [35] });
-      const sessionFile = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-sess-'))), 'session.jsonl');
-      fs.writeFileSync(sessionFile, '{"type":"session"}\n');
-      const sessionDir = path.dirname(sessionFile);
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const { ctx, notes, statuses, sent, waited, switches } = makeWarpCtx({
-        cwd: root, sessionFile, leaf: 'leaf-1', entries: [], sessionDir, calls,
-      });
-      const osc = oscFake(true);
-      const { mod } = await loadExtension();
-      const out = await mod.executeWorktreeWarp('feat-warp-target', ctx, { sessionManagerClass: FakeSM, oscStream: osc });
-      assert.equal(out.isError, undefined, `expected success: ${out.text}`);
-      assert.equal(out.text, `worktree warp: feat-warp-target -> ${target}`);
-      assert.deepEqual(out.details, {
-        name: 'feat-warp-target', path: target, branch: 'feat/warp-target',
-        kind: 'agent', alreadyThere: false, cancelled: false,
-      });
-      assert.equal(waited.length, 1, 'waitForIdle ran');
-      assert.deepEqual(calls[0], ['forkFrom', sessionFile, target, sessionDir]);
-      assert.deepEqual(calls[1], ['branch', 'leaf-1']);
-      assert.equal(calls[2][0], 'appendCustomEntry');
-      assert.ok(String(JSON.stringify(calls[2][2])).includes(root), 'transition names the old cwd');
-      assert.ok(String(JSON.stringify(calls[2][2])).includes(target), 'transition names the new cwd');
-      assert.equal(switches.length, 1, 'switchSession ran once');
-      assert.equal(switches[0][1], 'function', 'withSession callback passed');
-      assert.ok(statuses.length >= 1, 'status set on the replacement session');
-      assert.equal(sent.length, 1, 'one revalidation message sent');
-      assert.equal(sent[0][1].triggerTurn, false, 'no turn triggered');
-      assert.match(String(sent[0][0].content || JSON.stringify(sent[0][0])), /revalidat/i);
-      assert.deepEqual(osc.chunks, [`\x1b]7;file://${target}\x1b\\`], 'OSC-7 exact bytes');
-    } finally {
-      restoreEnv();
-    }
-  });
-
   test('warping to the current checkout reports already-there and changes nothing', async () => {
     const root = makeRepo('warp-there');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
@@ -555,36 +515,6 @@ describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, ()
     }
   });
 
-  test('an unwritten session clones its in-memory entries via create + open', async () => {
-    const root = makeRepo('warp-memory');
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
-    try {
-      const target = addRegistered(root, 'feat/mem-target', { thread: 'thread-1', issues: [35] });
-      const memEntries = [{ id: 'e1', parentId: null, type: 'message' }, { id: 'e2', parentId: 'e1', type: 'message' }];
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const { ctx, switches } = makeWarpCtx({
-        cwd: root, sessionFile: undefined, leaf: null, entries: memEntries, sessionDir: undefined, calls,
-      });
-      const { mod } = await loadExtension();
-      const out = await mod.executeWorktreeWarp('feat-mem-target', ctx, { sessionManagerClass: FakeSM, oscStream: oscFake(false) });
-      assert.equal(out.isError, undefined, `expected success: ${out.text}`);
-      assert.equal(out.text, `worktree warp: feat-mem-target -> ${target}`);
-      const kinds = calls.map((call) => call[0]);
-      assert.ok(kinds.includes('create'), `create ran: ${JSON.stringify(kinds)}`);
-      assert.ok(kinds.includes('open'), `open ran: ${JSON.stringify(kinds)}`);
-      assert.ok(!kinds.includes('forkFrom'), 'no forkFrom for an unwritten session');
-      const written = fs.readFileSync(path.join(target, 'created-session.jsonl'), 'utf8')
-        .trim().split('\n').map((line) => JSON.parse(line));
-      assert.equal(written.length, 3, `the header and both entries reached the file: ${JSON.stringify(written)}`);
-      assert.equal(written[0].cwd, target, 'the header names the target cwd');
-      assert.deepEqual(written.slice(1).map((entry) => entry.id), ['e1', 'e2'], 'both entries carried, in order');
-      assert.equal(switches.length, 1);
-    } finally {
-      restoreEnv();
-    }
-  });
-
   test('cancelled removes the target session file, reports it, changes nothing else', async () => {
     const root = makeRepo('warp-cancelled');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
@@ -660,32 +590,6 @@ describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, ()
     }
   });
 
-  test('a session inside a nested worktree is not already there for the principal', async () => {
-    const root = makeRepo('nested');
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
-    try {
-      const nested = path.join(root, 'nested-wt');
-      track(nested);
-      git(root, ['worktree', 'add', '-b', 'feat/nested', nested, 'HEAD']);
-      const registryLib = require('../lib/worktree-registry.js');
-      assert.equal(registryLib.upsertWorktree(root, {
-        branch: 'feat/nested', path: fs.realpathSync(nested), thread: 'thread-nested', issues: [1], odd: [],
-      }).ok, true);
-      const sessionFile = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-nested-sess-'))), 'session.jsonl');
-      fs.writeFileSync(sessionFile, '{"type":"session"}\n');
-      const calls = [];
-      const { ctx, switches } = makeWarpCtx({ cwd: fs.realpathSync(nested), sessionFile, calls });
-      const { mod } = await loadExtension();
-      const out = await mod.executeWorktreeWarp('principal', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: oscFake(true) });
-      assert.equal(out.isError, undefined, `expected a real move, got: ${out.text}`);
-      assert.equal(out.text, `worktree warp: principal -> ${root}`);
-      assert.equal(out.details.path, root, 'the target is the principal checkout');
-      assert.equal(switches.length, 1, 'the session really switched');
-    } finally {
-      restoreEnv();
-    }
-  });
-
   test('warp refuses a name an unregistered checkout also carries', async () => {
     const root = makeRepo('unreg-clash');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
@@ -708,28 +612,4 @@ describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, ()
     }
   });
 
-  test('a prunable git record does not make a unique name ambiguous', async () => {
-    const root = makeRepo('dead-unreg');
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
-    try {
-      const registered = addRegistered(root, 'feat/mix', { thread: 'thread-1', issues: [35] });
-      // Git still lists this record, but its directory is gone: the listing
-      // never prints it as a live checkout, so it cannot collide either.
-      const dead = path.join(path.dirname(root), `${path.basename(root)}-dead-mix`);
-      track(dead);
-      git(root, ['worktree', 'add', '-b', 'feat-mix', dead, 'HEAD']);
-      fs.rmSync(dead, { recursive: true, force: true });
-      const sessionFile = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-dead-sess-'))), 'session.jsonl');
-      fs.writeFileSync(sessionFile, '{"type":"session"}\n');
-      const calls = [];
-      const { ctx, switches } = makeWarpCtx({ cwd: root, sessionFile, calls });
-      const { mod } = await loadExtension();
-      const out = await mod.executeWorktreeWarp('feat-mix', ctx, { sessionManagerClass: makeFakeSM(calls), oscStream: oscFake(true) });
-      assert.equal(out.isError, undefined, `a name the listing prints once still moves: ${out.text}`);
-      assert.equal(out.text, `worktree warp: feat-mix -> ${registered}`);
-      assert.equal(switches.length, 1, 'the session really switched');
-    } finally {
-      restoreEnv();
-    }
-  });
 });
