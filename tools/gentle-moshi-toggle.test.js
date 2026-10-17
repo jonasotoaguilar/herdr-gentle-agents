@@ -1,6 +1,15 @@
 'use strict';
-// The Pi-side switch for the optional Moshi notification mirror (DESIGN §7):
-// `/herdr-gentle:moshi enable|disable|status` (no argument opens a selector).
+// The Pi-side switch for the optional Moshi notification mirror (DESIGN §7),
+// now reached through the `/herdr-gentle:customize` panel (customize-command
+// T2/S7: the `/herdr-gentle:moshi` command is removed outright). These tests
+// keep every state-level assertion of the old command suite — flag file
+// bytes, settings exclusion entries, untouched-settings cases, fail-closed
+// behaviour — repointed at the provider slot the state extension registers
+// (`globalThis[Symbol.for("herdr-gentle.customize.v1")].moshi`), whose
+// `apply` reuses the same `writeMoshiFlag` / `setMoshiExclusion` /
+// `moshiFlagEnabled` paths unchanged. Only the command-handler UX tests
+// (selector, unknown verb, `status` text) are gone with the command; the
+// read-only reporting they offered lives on as `customize status`.
 //
 // Enabling writes the flag file the consumer daemon reads
 // (`$GENTLE_STATUS_STATE_DIR/gentle-moshi.json`) AND excludes the
@@ -34,7 +43,7 @@ const copy = path.join(root, 'gentle-herdr-state.mjs');
 fs.writeFileSync(copy, stubbed);
 const copyUrl = pathToFileURL(copy).href;
 
-const COMMAND = 'herdr-gentle:moshi';
+const SLOT_KEY = 'herdr-gentle.customize.v1';
 const EXCLUSION_ENTRY = '-extensions/moshi-hooks.ts';
 const OTHER_ENTRY = '-extensions/herdr-agent-state.ts';
 
@@ -87,13 +96,13 @@ function settingsRaw() {
   }
 }
 
-// Minimal fake Pi: only the surfaces this feature touches (plus the event
-// registries the rest of the factory uses). `registerCommand` is optional on
-// purpose — installed harnesses without it must keep loading the extension.
-function harness({ withCommand = true, select = undefined } = {}) {
+// Minimal fake Pi: only the surfaces the provider path touches (plus the
+// event registries the rest of the factory uses). `registerCommand` is
+// optional on purpose — installed harnesses without it must keep loading
+// the extension.
+function harness({ withCommand = true } = {}) {
   const commands = new Map();
   const notices = [];
-  const selects = [];
   const pi = {
     on: () => {},
     events: { on: () => {}, emit: () => {} },
@@ -106,169 +115,200 @@ function harness({ withCommand = true, select = undefined } = {}) {
   const ctx = {
     ui: {
       notify: (message, kind) => notices.push([message, kind]),
-      select: async (title, items) => {
-        selects.push([title, items]);
-        if (typeof select === 'function') return select(title, items);
-        return select;
-      },
     },
   };
-  return { pi, commands, notices, selects, ctx };
+  return { pi, commands, notices, ctx };
 }
 
-async function run(h, args) {
-  await h.commands.get(COMMAND).handler(args, h.ctx);
+function slotOf() {
+  const slot = globalThis[Symbol.for(SLOT_KEY)];
+  assert.ok(slot && typeof slot === 'object', 'expected the provider slot to be registered at load');
+  assert.equal(typeof slot.moshi.read, 'function', 'moshi.read');
+  assert.equal(typeof slot.moshi.apply, 'function', 'moshi.apply');
+  return slot;
 }
 
-test('registers /herdr-gentle:moshi and leaves the mirror off by default', async () => {
+// S38 prerequisite gate: the enable path requires the `moshi-hook` CLI
+// plus `status --json` reporting paired:true. Tests always stub both
+// seams (never spawn a real `moshi-hook`); every test starts from the
+// happy gate and the refusal tests override it afterwards.
+async function happyGate() {
+  const loaded = await factoryPromise;
+  loaded.setMoshiHookResolver(() => '/test-only/moshi-hook');
+  loaded.setMoshiStatusRunner(() => ({ ok: true }));
+  return loaded;
+}
+
+async function refusalGate({ cli = true, status = { ok: false, reason: 'not-paired' } } = {}) {
+  const loaded = await factoryPromise;
+  const calls = { resolve: 0, run: 0 };
+  loaded.setMoshiHookResolver(() => {
+    calls.resolve += 1;
+    return cli ? '/test-only/moshi-hook' : null;
+  });
+  loaded.setMoshiStatusRunner(() => {
+    calls.run += 1;
+    return status;
+  });
+  return { loaded, calls };
+}
+
+test('no /herdr-gentle:moshi command; the mirror stays off by default', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir();
   const h = harness();
   factory(h.pi);
-  assert.ok(h.commands.has(COMMAND), `expected the /${COMMAND} command`);
-  await run(h, 'status');
-  assert.equal(readFlag(), null, 'no flag file means off');
-  assert.match(h.notices.at(-1)[0], /off/i);
+  assert.ok(!h.commands.has('herdr-gentle:moshi'), 'the command is removed outright (S7)');
+  assert.equal(slotOf().moshi.read(), 'off', 'no flag file means off');
+  assert.equal(readFlag(), null, 'read writes nothing');
 });
 
-test('enable/disable write the flag file', async () => {
+test('on/off apply writes the flag file and reports the exclusion verdict', async () => {
   const { default: factory } = await factoryPromise;
+  await happyGate();
   resetState();
   resetAgentDir();
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
+  const turnedOn = await slot.moshi.apply('on', h.ctx);
   assert.equal(readFlag().enabled, true);
-  assert.match(h.notices.at(-1)[0], /enabled/i);
-  assert.match(h.notices.at(-1)[0], /\/reload/, 'enable warns that running sessions need /reload');
+  assert.deepEqual(
+    { changed: turnedOn.changed, needsReload: turnedOn.needsReload },
+    { changed: true, needsReload: true },
+    'the exclusion entry actually changed, so a reload is needed (S6)',
+  );
+  assert.ok(!turnedOn.text.includes('/reload'), 'the panel never asks the user to run /reload');
 
-  await run(h, 'disable');
+  const turnedOff = await slot.moshi.apply('off', h.ctx);
   assert.equal(readFlag().enabled, false);
-  assert.match(h.notices.at(-1)[0], /disabled/i);
+  assert.deepEqual(
+    { changed: turnedOff.changed, needsReload: turnedOff.needsReload },
+    { changed: true, needsReload: true },
+    'removing the entry is a change too',
+  );
 });
 
-test('enable adds the moshi-hooks exclusion and preserves other entries', async () => {
+test('on adds the moshi-hooks exclusion and preserves other entries', async () => {
   const { default: factory } = await factoryPromise;
+  await happyGate();
   resetState();
   resetAgentDir({ settings: { theme: 'x', extensions: [OTHER_ENTRY] } });
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
+  await slot.moshi.apply('on', h.ctx);
   const settings = readSettings();
   assert.deepEqual(settings.extensions, [OTHER_ENTRY, EXCLUSION_ENTRY]);
   assert.equal(settings.theme, 'x', 'unrelated keys are preserved');
 
-  await run(h, 'enable');
+  await slot.moshi.apply('on', h.ctx);
   assert.deepEqual(readSettings().extensions, [OTHER_ENTRY, EXCLUSION_ENTRY], 'idempotent');
 });
 
-test('enable leaves settings.json untouched when moshi-hooks.ts is absent', async () => {
+test('on leaves settings.json untouched when moshi-hooks.ts is absent', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ hooksInstalled: false, settings: { extensions: [OTHER_ENTRY] } });
   const before = settingsRaw();
   const h = harness();
+  await happyGate();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
+  const result = await slot.moshi.apply('on', h.ctx);
   assert.equal(readFlag().enabled, true, 'the mirror still turns on');
   assert.equal(settingsRaw(), before, 'settings bytes are unchanged');
+  assert.equal(result.needsReload, false, 'no exclusion change means no reload (S6)');
 });
 
-test('disable removes the exclusion and preserves the rest', async () => {
+test('off removes the exclusion and preserves the rest', async () => {
   const { default: factory } = await factoryPromise;
+  await happyGate();
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY, EXCLUSION_ENTRY], model: 'm' } });
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'disable');
+  // Reach the removal through the converged flow: on stages the owned
+  // entry, off removes it again (apply is a no-op when already there).
+  await slot.moshi.apply('on', h.ctx);
+  await slot.moshi.apply('off', h.ctx);
   const settings = readSettings();
   assert.deepEqual(settings.extensions, [OTHER_ENTRY]);
   assert.equal(settings.model, 'm');
   assert.equal(readFlag().enabled, false);
 });
 
-test('disable leaves settings.json untouched when moshi-hooks.ts is absent', async () => {
+test('off leaves settings.json untouched when moshi-hooks.ts is absent', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ hooksInstalled: false, settings: { extensions: [OTHER_ENTRY, EXCLUSION_ENTRY] } });
   const before = settingsRaw();
   const h = harness();
+  await happyGate();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'disable');
+  await slot.moshi.apply('on', h.ctx);
+  assert.equal(readFlag().enabled, true, 'the mirror turns on first');
+  await slot.moshi.apply('off', h.ctx);
   assert.equal(settingsRaw(), before, 'a stale exclusion is left alone by design');
   assert.equal(readFlag().enabled, false);
 });
 
-test('invalid settings.json fails closed: no write, mirror still toggles', async () => {
+test('invalid settings.json fails closed: no settings write, mirror still toggles', async () => {
   const { default: factory } = await factoryPromise;
+  await happyGate();
   resetState();
   resetAgentDir({ settings: '{ not json' });
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
+  const result = await slot.moshi.apply('on', h.ctx);
   assert.equal(readFlag().enabled, true);
   assert.equal(settingsRaw(), '{ not json', 'the unparseable file is never rewritten');
-  assert.equal(h.notices.at(-1)[1], 'error', 'the failure is reported');
+  assert.equal(result.changed, true, 'the flag still flipped');
+  assert.equal(result.needsReload, false, 'the exclusion did not change');
+  assert.match(result.text, /could not update/, 'the failure is reported');
 });
 
-test('an unknown option changes nothing and says so', async () => {
+test('an unknown value changes nothing', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir();
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'banana');
-  assert.equal(readFlag(), null);
-  assert.equal(h.notices.at(-1)[1], 'error');
-  assert.match(h.notices.at(-1)[0], /enable\|disable\|status/);
+  const result = await slot.moshi.apply('banana', h.ctx);
+  assert.deepEqual(
+    { changed: result.changed, needsReload: result.needsReload },
+    { changed: false, needsReload: false },
+  );
+  assert.equal(readFlag(), null, 'no flag file is created');
+  assert.equal(settingsRaw(), null, 'no settings file is created');
 });
 
-test('no argument opens the selector and applies the chosen option', async () => {
+test('read follows the writes', async () => {
   const { default: factory } = await factoryPromise;
+  await happyGate();
   resetState();
   resetAgentDir();
-  const h = harness({ select: () => 'Enable' });
-  factory(h.pi);
-
-  await run(h, '');
-  assert.equal(h.selects.length, 1, 'a selector is offered');
-  assert.equal(h.selects[0][1].length, 3);
-  assert.equal(readFlag().enabled, true, 'the chosen option is applied');
-});
-
-test('no argument with no selector falls back to status', async () => {
-  const { default: factory } = await factoryPromise;
-  resetState();
-  resetAgentDir();
-  const h = harness({ select: undefined });
-  delete h.ctx.ui.select;
-  factory(h.pi);
-
-  await run(h, '');
-  assert.equal(readFlag(), null);
-  assert.match(h.notices.at(-1)[0], /off/i);
-});
-
-test('status reports the hook and exclusion state', async () => {
-  const { default: factory } = await factoryPromise;
-  resetState();
-  resetAgentDir({ settings: { extensions: [EXCLUSION_ENTRY] } });
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'status');
-  const message = h.notices.at(-1)[0];
-  assert.match(message, /off/i);
-  assert.match(message, /moshi-hooks\.ts/);
-  assert.match(message, /excluded/i);
+  assert.equal(slot.moshi.read(), 'off');
+  await slot.moshi.apply('on', h.ctx);
+  assert.equal(slot.moshi.read(), 'on');
+  await slot.moshi.apply('off', h.ctx);
+  assert.equal(slot.moshi.read(), 'off');
 });
 
 test('loads without registerCommand (older/limited hosts)', async () => {
@@ -277,4 +317,136 @@ test('loads without registerCommand (older/limited hosts)', async () => {
   resetAgentDir();
   const h = harness({ withCommand: false });
   assert.doesNotThrow(() => factory(h.pi));
+  assert.ok(slotOf().moshi, 'the provider slot registers without commands');
+});
+
+test('S38: on refuses when the CLI is missing — nothing written, message names the CLI', async () => {
+  const { default: factory } = await factoryPromise;
+  await happyGate();
+  await refusalGate({ cli: false });
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  const before = settingsRaw();
+  const h = harness();
+  factory(h.pi);
+  const slot = slotOf();
+
+  const result = await slot.moshi.apply('on', h.ctx);
+  assert.deepEqual(
+    { changed: result.changed, needsReload: result.needsReload },
+    { changed: false, needsReload: false },
+    'a refusal changes nothing and never reloads',
+  );
+  assert.equal(readFlag(), null, 'no flag file is created');
+  assert.equal(settingsRaw(), before, 'settings bytes are unchanged');
+  assert.match(result.text, /moshi-hook/, 'the message names the missing CLI');
+  assert.match(result.text, /install/i, 'the message names the fix');
+  assert.equal(slot.moshi.read(), 'off', 'the switch stays Off');
+  await happyGate();
+});
+
+test('S38: on refuses when unpaired — nothing written, message names pairing and the pair command', async () => {
+  const { default: factory } = await factoryPromise;
+  await happyGate();
+  await refusalGate({ status: { ok: false, reason: 'not-paired' } });
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  const before = settingsRaw();
+  const h = harness();
+  factory(h.pi);
+  const slot = slotOf();
+
+  const result = await slot.moshi.apply('on', h.ctx);
+  assert.deepEqual(
+    { changed: result.changed, needsReload: result.needsReload },
+    { changed: false, needsReload: false },
+    'a refusal changes nothing and never reloads',
+  );
+  assert.equal(readFlag(), null, 'no flag file is created');
+  assert.equal(settingsRaw(), before, 'settings bytes are unchanged');
+  assert.match(result.text, /paired/, 'the message names what is missing');
+  assert.ok(
+    result.text.includes('moshi-hook pair --token <pairing-token>'),
+    'the message names the fix command literally (never a real token)',
+  );
+  assert.equal(slot.moshi.read(), 'off', 'the switch stays Off');
+  await happyGate();
+});
+
+test('S38: an erroring or unparseable status refuses fail-closed', async () => {
+  for (const status of [
+    { ok: false, reason: 'non-zero-exit', status: 1 },
+    { ok: false, reason: 'unparseable' },
+    { ok: false, reason: 'missing-field' },
+    { ok: false, reason: 'spawn-failed' },
+  ]) {
+    const { default: factory } = await factoryPromise;
+    await happyGate();
+    await refusalGate({ status });
+    resetState();
+    resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+    const before = settingsRaw();
+    const h = harness();
+    factory(h.pi);
+    const slot = slotOf();
+
+    const result = await slot.moshi.apply('on', h.ctx);
+    assert.deepEqual(
+      { changed: result.changed, needsReload: result.needsReload },
+      { changed: false, needsReload: false },
+      `a ${status.reason} refusal changes nothing`,
+    );
+    assert.equal(readFlag(), null, 'no flag file is created');
+    assert.equal(settingsRaw(), before, 'settings bytes are unchanged');
+    assert.match(result.text, /status --json/, 'the message names the failed check');
+    assert.equal(slot.moshi.read(), 'off', 'the switch stays Off');
+  }
+  await happyGate();
+});
+
+test('S38: paired:true enables and writes exactly the same settings as before', async () => {
+  const { default: factory } = await factoryPromise;
+  await happyGate();
+  resetState();
+  resetAgentDir({ settings: { theme: 'x', extensions: [OTHER_ENTRY] } });
+  const h = harness();
+  factory(h.pi);
+  const slot = slotOf();
+
+  const result = await slot.moshi.apply('on', h.ctx);
+  assert.equal(readFlag().enabled, true);
+  assert.deepEqual(readSettings().extensions, [OTHER_ENTRY, EXCLUSION_ENTRY]);
+  assert.equal(readSettings().theme, 'x', 'unrelated keys are preserved');
+  assert.equal(result.changed, true);
+  assert.equal(result.needsReload, true, 'the exclusion entry actually changed');
+});
+
+test('S38: disabling never runs the prerequisite check', async () => {
+  const { default: factory } = await factoryPromise;
+  await happyGate();
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY, EXCLUSION_ENTRY] } });
+  const h = harness();
+  factory(h.pi);
+  const slot = slotOf();
+  await slot.moshi.apply('on', h.ctx);
+  assert.equal(slot.moshi.read(), 'on');
+
+  // The gate is now hostile: any call would throw. Disabling must not
+  // consult it at all.
+  const { calls } = await refusalGate({
+    status: { ok: false, reason: 'not-paired' },
+  });
+  const loaded = await factoryPromise;
+  loaded.setMoshiHookResolver(() => { calls.resolve += 1; throw new Error('must not resolve on disable'); });
+  loaded.setMoshiStatusRunner(() => { calls.run += 1; throw new Error('must not run on disable'); });
+  const before = calls.resolve + calls.run;
+
+  const result = await slot.moshi.apply('off', h.ctx);
+  assert.equal(calls.resolve + calls.run, before, 'disable consults neither seam');
+  assert.equal(result.changed, true);
+  assert.deepEqual(readSettings().extensions, [OTHER_ENTRY]);
+  assert.equal(readFlag().enabled, false);
+  assert.equal(slot.moshi.read(), 'off');
+  await happyGate();
 });

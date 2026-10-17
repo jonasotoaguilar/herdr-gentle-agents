@@ -281,14 +281,14 @@ describe('customize command registration', { concurrency: false }, () => {
     }
   });
 
-  test('the three old commands are still registered (T2 owns their removal)', async () => {
+  test('the three old commands are gone and the two new ones are registered (S7)', async () => {
     const modeEnv = scratchStateEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
     const hadSlot = setSlot(undefined);
     try {
       modeLib().writeMode(true, process.env);
       const { commands } = await loadExtension();
-      assert.ok(commands.has('herdr-gentle:worktree'), 'worktree toggle must not disappear in this commit');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the worktree toggle is removed outright (S7)');
       assert.ok(commands.has('herdr-gentle:warp'), 'warp stays registered');
       assert.ok(commands.has('herdr-gentle:customize'), 'customize stays registered');
     } finally {
@@ -1262,7 +1262,7 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
   // every disabled-path refusal keeps its exact bytes.
   const FOUR = ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'];
   const REFUSAL =
-    'worktree tools are disabled; run /herdr-gentle:worktree enabled to enable them';
+    'worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them';
   const ENABLED_DETAIL = 'agents can create, list, close, warp between and open sessions in agent worktrees';
 
   function textOf(result) {

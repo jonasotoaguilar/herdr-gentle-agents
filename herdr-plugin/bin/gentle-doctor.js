@@ -62,7 +62,7 @@ function main() {
   const stateDir = diag.resolveStateDir();
   const mode = diag.sidebarModeStatus(stateDir);
   if (mode.malformed) {
-    process.stdout.write('fail: sidebar mode invalid (Gentle publishing disabled)\nremedy: inspect gentle-sidebar-mode.json and /herdr-gentle:sidebar status before changing modes\n');
+    process.stdout.write('fail: sidebar mode invalid (Gentle publishing disabled)\nremedy: inspect gentle-sidebar-mode.json and /herdr-gentle:customize status before changing modes\n');
     process.stderr.write('gentle-doctor: one or more checks failed\n');
     return 1;
   }

@@ -1530,75 +1530,11 @@ function setMoshiExclusion(want) {
   return { ok: true, note: want ? `added ${MOSHI_EXCLUSION_ENTRY}.` : `removed ${MOSHI_EXCLUSION_ENTRY}.` };
 }
 
-function moshiStatusMessage() {
-  const installed = fs.existsSync(moshiHooksPath());
-  const excluded = installed ? moshiExclusionPresent() : null;
-  const hook = installed
-    ? `${MOSHI_HOOKS_REL}: installed, excluded ${excluded === null ? "unknown (settings.json unreadable)" : excluded ? "yes" : "no"}`
-    : `${MOSHI_HOOKS_REL}: not installed`;
-  return `Moshi notifications are ${moshiFlagEnabled(moshiFlagPath()) ? "on" : "off"} (${hook}). Use /herdr-gentle:moshi enable|disable|status.`;
-}
-
-// Registered before the `enabled()` guard on purpose: the switch belongs to
-// the Pi session, not to a Herdr pane, so it must exist even where this
-// extension publishes nothing. Hosts whose Pi build has no commands simply
-// skip it.
-function registerMoshiToggle(pi) {
-  if (typeof pi?.registerCommand !== "function") return;
-  pi.registerCommand("herdr-gentle:moshi", {
-    description: "Turn Moshi notifications for Gentle (ask + real finish) on or off",
-    handler: async (args, ctx) => {
-      const raw = String(args ?? "").trim().toLowerCase();
-      let verb = raw;
-      // No argument opens the selector when the host can render one; a
-      // cancelled or unavailable selector falls back to status.
-      if (verb === "") {
-        let choice;
-        try {
-          choice = await ctx?.ui?.select?.("Moshi notifications", ["Enable", "Disable", "Status"]);
-        } catch {
-          choice = undefined;
-        }
-        verb = typeof choice === "string" && choice.length > 0 ? choice.toLowerCase() : "status";
-      }
-      if (verb === "on") verb = "enable";
-      if (verb === "off") verb = "disable";
-      if (verb !== "enable" && verb !== "disable" && verb !== "status") {
-        ctx?.ui?.notify?.(`Unknown option "${raw}". Use /herdr-gentle:moshi enable|disable|status.`, "error");
-        return;
-      }
-      if (verb === "status") {
-        ctx?.ui?.notify?.(moshiStatusMessage(), "info");
-        return;
-      }
-      const enabled = verb === "enable";
-      const path = moshiFlagPath();
-      try {
-        writeMoshiFlag(path, enabled);
-      } catch (error) {
-        ctx?.ui?.notify?.(`Could not write ${path}: ${error?.message ?? error}`, "error");
-        return;
-      }
-      const exclusion = setMoshiExclusion(enabled);
-      // A running session keeps the previously loaded hook until /reload:
-      // enabling here activates our sender immediately while the original
-      // hook stays live in that session, so both would notify. Warn once.
-      const reloadNote =
-        enabled && exclusion.ok
-          ? " Sessions already running need /reload to unload the original hook."
-          : "";
-      ctx?.ui?.notify?.(
-        `Moshi notifications ${enabled ? "enabled" : "disabled"}. ${exclusion.note}${reloadNote}`,
-        exclusion.ok ? "info" : "error",
-      );
-    },
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Sidebar integration switch (S7): OUR sidebar versus the native Herdr
-// sidebar. `/herdr-gentle:sidebar toggle|enable|disable|status` (no
-// argument opens a selector, following the Moshi convention above).
+// sidebar. Reached through the `/herdr-gentle:customize` panel's sidebar
+// rows (the old `toggle|enable|disable|status` command is removed); the
+// provider slot below drives `sidebarEnable`/`sidebarDisable`.
 // Enable means OURS (owned native exclusion + managed `configure` rows);
 // disable means NATIVE (only the owned exclusion removed + managed rows
 // unconfigured, so the native sidebar renders again). This block is
@@ -1960,53 +1896,14 @@ function sidebarRowsManaged(text) {
   return typeof text === "string" && text.includes(SIDEBAR_MANAGED_BEGIN) && text.includes(SIDEBAR_MANAGED_END);
 }
 
-// Read-only managed-rows probe for status (never writes the config).
-function sidebarRowsState() {
-  const file = sidebarConfigPath();
-  let body;
-  try {
-    body = fs.readFileSync(file, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") return "rows absent (no Herdr config yet)";
-    return "rows unknown (config unreadable)";
-  }
-  if (body.includes(SIDEBAR_MANAGED_BEGIN) && body.includes(SIDEBAR_MANAGED_END)) {
-    return "managed rows present";
-  }
-  return "managed rows absent";
-}
-
-function sidebarStatusMessage() {
-  const mode = readSidebarMode();
-  const state = mode.state === "missing"
-    ? "enabled (default; no mode file)"
-    : mode.state === "malformed"
-      ? "unknown (mode file malformed)"
-      : mode.state;
-  const which = mode.publish ? "ours" : mode.state === "disabled" ? "native" : "unknown";
-  const installed = fs.existsSync(sidebarNativePath());
-  let excluded;
-  if (!installed) excluded = "not installed";
-  else {
-    const loaded = readSettingsDoc(piSettingsPath());
-    if (loaded === null) excluded = "unknown (settings.json unreadable)";
-    else {
-      const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
-      excluded = list.includes(SIDEBAR_NATIVE_ENTRY) ? "excluded yes" : "excluded no";
-    }
-  }
-  const hook = `${SIDEBAR_NATIVE_REL}: ${excluded}`;
-  return `Gentle sidebar is ${state} (${which}; ${hook}; ${sidebarRowsState()}). Use /herdr-gentle:sidebar toggle|enable|disable|status.`;
-}
-
 async function sidebarEnable(ctx) {
   const notify = ctx?.ui?.notify;
-  const reRun = "Re-run /herdr-gentle:sidebar enable to converge.";
+  const reRun = "Retry via /herdr-gentle:customize to converge.";
   // Preflight before any mutation: unreadable settings or a
   // foreign/misbound record fails closed with nothing touched.
   if (fs.existsSync(sidebarNativePath())) {
     if (readSettingsDoc(piSettingsPath()) === null) {
-      notify?.(`Could not enable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then re-run /herdr-gentle:sidebar enable.`, "error");
+      notify?.(`Could not enable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then retry via /herdr-gentle:customize.`, "error");
       return;
     }
     const binding = checkSidebarMarker(piSettingsPath());
@@ -2071,10 +1968,10 @@ async function sidebarEnable(ctx) {
 
 async function sidebarDisable(ctx) {
   const notify = ctx?.ui?.notify;
-  const reRun = "Re-run /herdr-gentle:sidebar disable to converge.";
+  const reRun = "Retry via /herdr-gentle:customize to converge.";
   if (fs.existsSync(sidebarNativePath())) {
     if (readSettingsDoc(piSettingsPath()) === null) {
-      notify?.(`Could not disable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then re-run /herdr-gentle:sidebar disable.`, "error");
+      notify?.(`Could not disable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then retry via /herdr-gentle:customize.`, "error");
       return;
     }
     const binding = checkSidebarMarker(piSettingsPath());
@@ -2130,52 +2027,6 @@ async function sidebarDisable(ctx) {
     `Gentle sidebar disabled (native renders again). ${exclusion.note} Managed rows removed and verified (configure exit 0). Sessions already running need /reload to pick up the extension-list change.`,
     "info",
   );
-}
-
-// Registered before the `enabled()` guard on purpose: the switch belongs
-// to the Pi session, not to a Herdr pane, so it must exist even where
-// this extension publishes nothing. Hosts whose Pi build has no commands
-// simply skip it.
-function registerSidebarToggle(pi) {
-  if (typeof pi?.registerCommand !== "function") return;
-  pi.registerCommand("herdr-gentle:sidebar", {
-    description: "Switch OUR Herdr sidebar integration versus the native sidebar",
-    handler: async (args, ctx) => {
-      const raw = String(args ?? "").trim().toLowerCase();
-      let verb = raw;
-      // No argument opens the selector when the host can render one; a
-      // cancelled or unavailable selector falls back to status.
-      if (verb === "") {
-        let choice;
-        try {
-          choice = await ctx?.ui?.select?.("Gentle sidebar", ["Enable", "Disable", "Status"]);
-        } catch {
-          choice = undefined;
-        }
-        verb = typeof choice === "string" && choice.length > 0 ? choice.toLowerCase() : "status";
-      }
-      if (verb === "on") verb = "enable";
-      if (verb === "off") verb = "disable";
-      if (verb !== "enable" && verb !== "disable" && verb !== "status" && verb !== "toggle") {
-        ctx?.ui?.notify?.(`Unknown option "${raw}". Use /herdr-gentle:sidebar toggle|enable|disable|status.`, "error");
-        return;
-      }
-      if (verb === "status") {
-        ctx?.ui?.notify?.(sidebarStatusMessage(), "info");
-        return;
-      }
-      if (verb === "toggle") {
-        const mode = readSidebarMode();
-        if (mode.state === "malformed") {
-          ctx?.ui?.notify?.(`Could not toggle: ${sidebarModePath()} is malformed (expected {"version":1,"enabled":boolean}); fix or remove it, then re-run. Nothing was changed.`, "error");
-          return;
-        }
-        verb = mode.publish ? "disable" : "enable";
-      }
-      if (verb === "enable") await sidebarEnable(ctx);
-      else await sidebarDisable(ctx);
-    },
-  });
 }
 
 /* ------------------------------------------------------------ moshi */
@@ -2712,8 +2563,6 @@ function registerCustomizeProviders() {
 
 export default function (pi) {
   registerCustomizeProviders();
-  registerMoshiToggle(pi);
-  registerSidebarToggle(pi);
   if (!enabled()) return;
 
   let rootSession = false;
