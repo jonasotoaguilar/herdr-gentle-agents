@@ -1402,14 +1402,72 @@ export async function liveSummarizeRoots(roots) {
 const MOSHI_HOOKS_REL = "extensions/moshi-hooks.ts";
 const MOSHI_EXCLUSION_ENTRY = "-extensions/moshi-hooks.ts";
 
-function moshiFlagPath() {
+// S15 identity rename: the active plugin lookup id is herdr-gentle-shell,
+// but every stored state path keeps the herdr-gentle-agents segment (no
+// migration step, no orphaned flags). GENTLE_STATUS_STATE_DIR (explicit
+// user override) is used as-is; HERDR_PLUGIN_STATE_DIR is Herdr-injected
+// and changes with the plugin id, so when it holds none of our files
+// while the stored dir does, the stored dir wins. Fresh installs with no
+// stored files converge on the injected dir.
+const SIDEBAR_STATE_SEGMENT = "herdr-gentle-agents";
+const SIDEBAR_STATE_KNOWN_FILES = [
+  "gentle-sidebar-mode.json",
+  "gentle-moshi.json",
+  "pi-extension-exclusion-owned",
+  "gentle-status.pid",
+  "gentle-interruptions.json",
+  "installer-state",
+  "gentle-worktree-mode.json",
+];
+
+function sidebarStoredDir() {
   const env = process.env;
-  const override = env.GENTLE_STATUS_STATE_DIR ?? env.HERDR_PLUGIN_STATE_DIR;
-  if (typeof override === "string" && override.length > 0) return join(override, "gentle-moshi.json");
   const base = env.XDG_STATE_HOME
     ? join(env.XDG_STATE_HOME, "herdr")
     : join(homedir(), ".local", "state", "herdr");
-  return join(base, "plugins", "herdr-gentle-agents", "gentle-moshi.json");
+  return join(base, "plugins", SIDEBAR_STATE_SEGMENT);
+}
+
+function sidebarEffectiveDir() {
+  const env = process.env;
+  const explicit = env.GENTLE_STATUS_STATE_DIR;
+  if (typeof explicit === "string" && explicit.length > 0) return explicit;
+  const stored = sidebarStoredDir();
+  // HEAD parity: an explicit-but-empty (or otherwise invalid non-nullish)
+  // value ignores every override and uses the stored default. Only an
+  // omitted (null/undefined) explicit falls through to the injected dir.
+  if (explicit !== undefined && explicit !== null) return stored;
+  const injected = env.HERDR_PLUGIN_STATE_DIR;
+  if (typeof injected !== "string" || injected.length === 0) return stored;
+  if (injected === stored) return injected;
+  try {
+    let injectedHas = false;
+    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
+      try {
+        if (fs.existsSync(join(injected, name))) {
+          injectedHas = true;
+          break;
+        }
+      } catch {
+        // A single unreadable entry never decides; keep scanning.
+      }
+    }
+    if (injectedHas) return injected;
+    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
+      try {
+        if (fs.existsSync(join(stored, name))) return stored;
+      } catch {
+        // A single unreadable entry never decides; keep scanning.
+      }
+    }
+  } catch {
+    // Fall through to the injected dir on unexpected failure.
+  }
+  return injected;
+}
+
+function moshiFlagPath() {
+  return join(sidebarEffectiveDir(), "gentle-moshi.json");
 }
 
 function moshiFlagEnabled(path) {
@@ -1551,7 +1609,8 @@ const SIDEBAR_NATIVE_REL = "extensions/herdr-agent-state.ts";
 const SIDEBAR_NATIVE_ENTRY = "-extensions/herdr-agent-state.ts";
 const SIDEBAR_MODE_VERSION = 1;
 const SIDEBAR_MARKER_VERSION = 1;
-const SIDEBAR_PLUGIN_ID = "herdr-gentle-agents";
+const SIDEBAR_PLUGIN_ID = "herdr-gentle-shell";
+const SIDEBAR_LEGACY_PLUGIN_ID = "herdr-gentle-agents";
 const SIDEBAR_MARKER_NAME = "pi-extension-exclusion-owned";
 const SIDEBAR_MANAGED_BEGIN = "# BEGIN herdr-gentle-agents (managed; do not edit)";
 const SIDEBAR_MANAGED_END = "# END herdr-gentle-agents";
@@ -1560,13 +1619,7 @@ const SIDEBAR_MANAGED_END = "# END herdr-gentle-agents";
 // resolution as the Moshi flag above): {version:1,enabled:boolean}.
 // Missing defaults to enabled for current-install compatibility.
 function sidebarModePath() {
-  const env = process.env;
-  const override = env.GENTLE_STATUS_STATE_DIR ?? env.HERDR_PLUGIN_STATE_DIR;
-  if (typeof override === "string" && override.length > 0) return join(override, "gentle-sidebar-mode.json");
-  const base = env.XDG_STATE_HOME
-    ? join(env.XDG_STATE_HOME, "herdr")
-    : join(homedir(), ".local", "state", "herdr");
-  return join(base, "plugins", "herdr-gentle-agents", "gentle-sidebar-mode.json");
+  return join(sidebarEffectiveDir(), "gentle-sidebar-mode.json");
 }
 
 function sidebarMarkerPath() {
@@ -1827,13 +1880,17 @@ function removeSidebarExclusion() {
 // never commits state and never claims success.
 // Resolve the installed plugin root via read-only `herdr plugin list
 // --json` (verified shape: result.plugins[] with plugin_id/plugin_root).
-// Fail-closed: zero, ambiguous, non-absolute, or script-less roots refuse.
-function resolveSidebarPluginRoot() {
+// The active (renamed) id is queried first; a zero match falls through to
+// one explicit lookup by the retired id so pre-rename installs keep
+// working. Ambiguous roots fail closed on either id — the legacy lookup
+// is never a silent weak fallback. Other failures (spawn, exit, parse)
+// fail closed on the id that produced them.
+function querySidebarPluginRoots(id) {
   let result;
   try {
     result = spawnSync(
       sidebarHerdrBin(),
-      ["plugin", "list", "--plugin", SIDEBAR_PLUGIN_ID, "--json"],
+      ["plugin", "list", "--plugin", id, "--json"],
       { encoding: "utf8", timeout: 15000, windowsHide: true },
     );
   } catch (error) {
@@ -1845,23 +1902,42 @@ function resolveSidebarPluginRoot() {
   if (result.status !== 0) {
     return { ok: false, note: `could not resolve the installed plugin root (plugin list exited ${result.status}).` };
   }
-  let roots;
   try {
     const doc = JSON.parse(result.stdout || "");
     const arr = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
     if (!Array.isArray(arr)) throw new Error("no plugins array");
-    const hits = arr.filter((p) => p && (p.plugin_id === SIDEBAR_PLUGIN_ID || p.id === SIDEBAR_PLUGIN_ID));
-    roots = [...new Set(hits.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0))];
+    const hits = arr.filter((p) => p && (p.plugin_id === id || p.id === id));
+    const roots = [...new Set(hits.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0))];
+    return { ok: true, roots };
   } catch (error) {
     return { ok: false, note: `could not resolve the installed plugin root: malformed plugin list (${error?.message ?? error}).` };
   }
-  if (roots.length !== 1 || !roots[0].startsWith("/")) {
-    return { ok: false, note: `could not resolve the installed plugin root (${roots.length === 0 ? "no match" : "ambiguous or non-absolute"}).` };
+}
+
+function checkSidebarPluginRoot(root) {
+  if (!root.startsWith("/")) {
+    return { ok: false, note: `could not resolve the installed plugin root (ambiguous or non-absolute).` };
   }
-  if (!fs.existsSync(join(roots[0], "bin", "configure.js"))) {
-    return { ok: false, note: `could not resolve the installed plugin root (${roots[0]} has no bin/configure.js).` };
+  if (!fs.existsSync(join(root, "bin", "configure.js"))) {
+    return { ok: false, note: `could not resolve the installed plugin root (${root} has no bin/configure.js).` };
   }
-  return { ok: true, root: roots[0] };
+  return { ok: true, root };
+}
+
+function resolveSidebarPluginRoot() {
+  const active = querySidebarPluginRoots(SIDEBAR_PLUGIN_ID);
+  if (!active.ok) return active;
+  if (active.roots.length === 1) return checkSidebarPluginRoot(active.roots[0]);
+  if (active.roots.length > 1) {
+    return { ok: false, note: `could not resolve the installed plugin root (ambiguous for ${SIDEBAR_PLUGIN_ID}).` };
+  }
+  const legacy = querySidebarPluginRoots(SIDEBAR_LEGACY_PLUGIN_ID);
+  if (!legacy.ok) return legacy;
+  if (legacy.roots.length === 1) return checkSidebarPluginRoot(legacy.roots[0]);
+  if (legacy.roots.length > 1) {
+    return { ok: false, note: `could not resolve the installed plugin root (ambiguous for retired id ${SIDEBAR_LEGACY_PLUGIN_ID}).` };
+  }
+  return { ok: false, note: `could not resolve the installed plugin root (no match for ${SIDEBAR_PLUGIN_ID} or ${SIDEBAR_LEGACY_PLUGIN_ID}).` };
 }
 
 // Run the installed configure script synchronously (fixed argv, no

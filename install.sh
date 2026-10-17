@@ -1,5 +1,7 @@
 #!/bin/sh
-# herdr-gentle-agents two-package installer (Linux only, POSIX sh).
+# herdr-gentle-shell two-package installer (Linux only, POSIX sh).
+# Repository (unchanged until a remote rename is authorized):
+# jonasotoaguilar/herdr-gentle-agents.
 #
 # Stable public entrypoint (example):
 #   curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh
@@ -13,10 +15,15 @@
 #   1. The Herdr plugin from the repository subdirectory, pinned at a
 #      herdr-vX.Y.Z release ref:
 #        herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin --ref REF
-#      then `herdr plugin enable herdr-gentle-agents`.
+#      then `herdr plugin enable herdr-gentle-shell`.
 #   2. The Pi package (the repository root, npm name
-#      @jonasotoaguilar/herdr-gentle-agents) with `pi install`, either from
+#      @jonasotoaguilar/herdr-gentle-shell) with `pi install`, either from
 #      the npm registry or from git when the registry is unreachable.
+#      A pre-rename install (plugin herdr-gentle-agents, npm
+#      @jonasotoaguilar/herdr-gentle-agents) is detected by an explicit
+#      second lookup and its remote plugin removed after the new one
+#      succeeds; a locally linked legacy checkout is left in place with a
+#      warning.
 #
 # What it does (install/update):
 #   1. Validates Linux, Node >= 18, herdr/pi availability, and a safe ref
@@ -59,7 +66,7 @@
 #
 # Updates (each package on its own story):
 #   pi update --extensions
-#   herdr plugin update herdr-gentle-agents
+#   herdr plugin update herdr-gentle-shell
 #
 # Environment overrides (for isolated tests / local use):
 #   HERDR_BIN_PATH            herdr binary (default: herdr from PATH)
@@ -84,10 +91,16 @@ REPO="jonasotoaguilar/herdr-gentle-agents"
 PLUGIN_SUBDIR="herdr-plugin"
 LATEST_URL_DEFAULT="https://api.github.com/repos/jonasotoaguilar/herdr-gentle-agents/releases"
 LS_REMOTE_URL="https://github.com/jonasotoaguilar/herdr-gentle-agents"
-PLUGIN_ID="herdr-gentle-agents"
-PI_PKG="@jonasotoaguilar/herdr-gentle-agents"
-PI_NPM_SPEC="npm:@jonasotoaguilar/herdr-gentle-agents"
+PLUGIN_ID="herdr-gentle-shell"
+LEGACY_PLUGIN_ID="herdr-gentle-agents"
+# Stored state location. Deliberately NOT $PLUGIN_ID: the rename keeps the
+# existing directory so upgrades keep their flags, markers and installer
+# state with no migration step.
+STATE_PLUGIN_ID="herdr-gentle-agents"
+PI_PKG="@jonasotoaguilar/herdr-gentle-shell"
+PI_NPM_SPEC="npm:@jonasotoaguilar/herdr-gentle-shell"
 PI_GIT_SPEC="git:github.com/jonasotoaguilar/herdr-gentle-agents"
+PI_LEGACY_NPM_SPEC="npm:@jonasotoaguilar/herdr-gentle-agents"
 LEGACY_REL="extensions/gentle-herdr-state.ts"
 CONFIGURE_REL="bin/configure.js"
 STATUS_REL="bin/gentle-status.js"
@@ -130,11 +143,11 @@ usage: install.sh [--ref REF] [--pi-source auto|npm|git] [--allow-downgrade] [--
 
 two packages (one command installs both):
   herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin --ref REF
-  pi install npm:@jonasotoaguilar/herdr-gentle-agents (or git:github.com/jonasotoaguilar/herdr-gentle-agents)
+  pi install npm:@jonasotoaguilar/herdr-gentle-shell (or git:github.com/jonasotoaguilar/herdr-gentle-agents)
 
 updates (each package on its own story):
   pi update --extensions
-  herdr plugin update herdr-gentle-agents
+  herdr plugin update herdr-gentle-shell
 
 retired managed copy:
   install.sh no longer copies extensions/gentle-herdr-state.ts into the Pi
@@ -233,7 +246,7 @@ else
   [ -n "$_HOME2" ] || die "HOME is unset and XDG_STATE_HOME is unset" 2
   STATE_BASE="$_HOME2/.local/state"
 fi
-STATE_DIR="$STATE_BASE/herdr/plugins/$PLUGIN_ID"
+STATE_DIR="$STATE_BASE/herdr/plugins/$STATE_PLUGIN_ID"
 STATE_FILE="$STATE_DIR/installer-state"
 LEGACY_DEST="$PI_DIR/$LEGACY_REL"
 EXCLUSION_REL="extensions/herdr-agent-state.ts"
@@ -302,23 +315,26 @@ sha_of() {
   sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1
 }
 
-# Emit the plugin list JSON (stdout) or fail. Never aborts the caller.
+# Emit the plugin list JSON for one plugin id (stdout) or fail. Never
+# aborts the caller. Defaults to the active (renamed) id.
 plugin_list_json() {
-  "$HERDR_BIN" plugin list --plugin "$PLUGIN_ID" --json 2>/dev/null
+  "$HERDR_BIN" plugin list --plugin "${1:-$PLUGIN_ID}" --json 2>/dev/null
 }
 
-# Parse plugin-list JSON from stdin; prints matches/distinct/root/kind/version
-# lines (best-effort: prints parse_error=1 on any failure). Never fails.
+# Parse plugin-list JSON from stdin for one plugin id ($1, default active);
+# prints matches/distinct/root/kind/version lines (best-effort: prints
+# parse_error=1 on any failure). Never fails.
 plugin_info() {
-  node -e '
+  HERDR_GENTLE_WANT_PLUGIN="${1:-$PLUGIN_ID}" node -e '
 let raw = "";
 process.stdin.on("data", (d) => { raw += d; });
 process.stdin.on("end", () => {
   try {
+    const want = process.env.HERDR_GENTLE_WANT_PLUGIN || "herdr-gentle-shell";
     const doc = JSON.parse(raw);
     const arr = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
     if (!Array.isArray(arr)) throw new Error("no plugins array");
-    const hits = arr.filter((p) => p && (p.plugin_id === "herdr-gentle-agents" || p.id === "herdr-gentle-agents"));
+    const hits = arr.filter((p) => p && (p.plugin_id === want || p.id === want));
     const roots = hits.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0);
     const uniq = [...new Set(roots)];
     const first = hits[0] || {};
@@ -445,9 +461,10 @@ semver_cmp() {
   return 0
 }
 
-# Resolve the exact plugin_root: explicit test override bypasses lookup,
-# otherwise parse `herdr plugin list --json` and fail closed on
-# zero / multiple / non-absolute / malformed roots. Echoes the root.
+# Resolve the exact plugin_root for one plugin id ($1, default active):
+# explicit test override bypasses lookup, otherwise parse
+# `herdr plugin list --json` and fail closed on zero / multiple /
+# non-absolute / malformed roots. Echoes the root.
 resolve_plugin_root() {
   if [ -n "$OVERRIDE_ROOT" ]; then
     case "$OVERRIDE_ROOT" in
@@ -458,10 +475,11 @@ resolve_plugin_root() {
     printf '%s' "$OVERRIDE_ROOT"
     return 0
   fi
+  _rr_id="${1:-$PLUGIN_ID}"
   _list=""
-  _list="$(plugin_list_json)" || die "failed to list Herdr plugins (herdr plugin list --json)"
+  _list="$(plugin_list_json "$_rr_id")" || die "failed to list Herdr plugins (herdr plugin list --json)"
   [ -n "$_list" ] || die "failed to list Herdr plugins (empty output)"
-  _root="$(printf '%s' "$_list" | node -e '
+  _root="$(printf '%s' "$_list" | HERDR_GENTLE_WANT_PLUGIN="$_rr_id" node -e '
 let raw = "";
 process.stdin.on("data", (d) => { raw += d; });
 process.stdin.on("end", () => {
@@ -472,14 +490,15 @@ process.stdin.on("end", () => {
       console.error("install.sh: plugin list JSON has no result.plugins array");
       process.exit(1);
     }
-    const hits = container.filter((p) => p && (p.plugin_id === "herdr-gentle-agents" || p.id === "herdr-gentle-agents"));
+    const want = process.env.HERDR_GENTLE_WANT_PLUGIN || "herdr-gentle-shell";
+    const hits = container.filter((p) => p && (p.plugin_id === want || p.id === want));
     const roots = hits.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0);
     if (roots.length === 0) {
-      console.error("install.sh: no plugin_root found for herdr-gentle-agents (zero matches)");
+      console.error("install.sh: no plugin_root found for " + want + " (zero matches)");
       process.exit(1);
     }
     if (roots.length !== 1 || new Set(roots).size !== 1) {
-      console.error("install.sh: ambiguous plugin_root for herdr-gentle-agents (multiple distinct roots)");
+      console.error("install.sh: ambiguous plugin_root for " + want + " (multiple distinct roots)");
       process.exit(1);
     }
     const root = roots[0];
@@ -493,8 +512,8 @@ process.stdin.on("end", () => {
     process.exit(1);
   }
 });
-')" || die "could not resolve plugin_root for $PLUGIN_ID from plugin list JSON"
-  [ -n "$_root" ] || die "could not resolve plugin_root for $PLUGIN_ID (empty)"
+')" || die "could not resolve plugin_root for $_rr_id from plugin list JSON"
+  [ -n "$_root" ] || die "could not resolve plugin_root for $_rr_id (empty)"
   printf '%s' "$_root"
 }
 
@@ -541,7 +560,9 @@ pi_source_installed() {
 
 # Echo the installed Pi package root parsed from `pi list` output: the
 # absolute path line following the two-space-indented package source line.
-# Returns 1 when unresolvable.
+# Preference order is the active npm spec, the shared git spec (same
+# repository for both identities), then the retired npm spec for
+# pre-rename installs. Returns 1 when unresolvable.
 resolve_pi_root() {
   _rpr_out=""
   _rpr_out="$("$PI_BIN" list 2>/dev/null)" || return 1
@@ -552,7 +573,7 @@ process.stdin.on("data", (d) => { raw += d; });
 process.stdin.on("end", () => {
   try {
     const lines = raw.split("\n");
-    const wants = ["npm:@jonasotoaguilar/herdr-gentle-agents", "git:github.com/jonasotoaguilar/herdr-gentle-agents"];
+    const wants = ["npm:@jonasotoaguilar/herdr-gentle-shell", "git:github.com/jonasotoaguilar/herdr-gentle-agents", "npm:@jonasotoaguilar/herdr-gentle-agents"];
     const want = process.env.HERDR_GENTLE_WANT_SOURCE || "";
     const ordered = (want && wants.indexOf(want) !== -1) ? [want].concat(wants.filter((w) => w !== want)) : wants;
     for (const spec of ordered) {
@@ -678,6 +699,8 @@ do_install() {
   fi
 
   # Pre-install plugin state (best-effort: unknown means not current).
+  # The active (renamed) id is queried first; the retired id gets an
+  # explicit second lookup below, never a silent fallback.
   _pre=""
   _have_pre=0
   if _pre="$(plugin_list_json)"; then
@@ -688,8 +711,9 @@ do_install() {
   _iroot=""
   _ikind=""
   _iver=""
+  _active_parse_error=0
   if [ "$_have_pre" = "1" ]; then
-    _info="$(printf '%s' "$_pre" | plugin_info)" || _info=""
+    _info="$(printf '%s' "$_pre" | plugin_info "$PLUGIN_ID")" || _info=""
     if [ -n "$_info" ]; then
       while IFS= read -r _line; do
         case "$_line" in
@@ -698,11 +722,69 @@ do_install() {
           root=*) _iroot="${_line#root=}" ;;
           kind=*) _ikind="${_line#kind=}" ;;
           version=*) _iver="${_line#version=}" ;;
-          parse_error=*) _matches=0; _distinct=0; _iroot=""; _ikind=""; _iver="" ;;
+          parse_error=*) _matches=0; _distinct=0; _iroot=""; _ikind=""; _iver=""; _active_parse_error=1 ;;
         esac
       done <<EOF
 $_info
 EOF
+    fi
+  fi
+
+  # Retired-id assessment (S15 rename compat): one explicit lookup by the
+  # pre-rename id. A distinct legacy root counts as residue to clean; the
+  # same root answering both ids means the backend ignores the filter and
+  # is not residue; a locally linked legacy checkout is never auto-touched.
+  # Ambiguous or unreadable legacy state fails closed before any mutation.
+  _legacy_present=0
+  _legacy_local=0
+  _legacy_root=""
+  if [ -z "$OVERRIDE_ROOT" ] && [ "$_active_parse_error" = "0" ]; then
+    _leg_json=""
+    _leg_have=0
+    if _leg_json="$(plugin_list_json "$LEGACY_PLUGIN_ID")"; then
+      if [ -n "$_leg_json" ]; then _leg_have=1; fi
+    fi
+    if [ "$_leg_have" = "1" ]; then
+      _leg_info=""
+      _leg_info="$(printf '%s' "$_leg_json" | plugin_info "$LEGACY_PLUGIN_ID")" || _leg_info=""
+      _leg_matches=0
+      _leg_distinct=0
+      _leg_root=""
+      _leg_kind=""
+      _leg_parse_error=0
+      if [ -n "$_leg_info" ]; then
+        while IFS= read -r _leg_line; do
+          case "$_leg_line" in
+            matches=*) _leg_matches="${_leg_line#matches=}" ;;
+            distinct=*) _leg_distinct="${_leg_line#distinct=}" ;;
+            root=*) _leg_root="${_leg_line#root=}" ;;
+            kind=*) _leg_kind="${_leg_line#kind=}" ;;
+            parse_error=*) _leg_matches=0; _leg_distinct=0; _leg_root=""; _leg_kind=""; _leg_parse_error=1 ;;
+          esac
+        done <<EOF
+$_leg_info
+EOF
+      fi
+      if [ "$_leg_parse_error" = "1" ]; then
+        die "could not assess the legacy plugin $LEGACY_PLUGIN_ID (malformed plugin list JSON); refusing to proceed" 1
+      fi
+      if [ "$_leg_distinct" -gt "1" ]; then
+        die "ambiguous legacy plugin_root for $LEGACY_PLUGIN_ID (multiple distinct roots); remove the unwanted install and re-run" 1
+      fi
+      if [ "$_leg_distinct" = "1" ]; then
+        case "$_leg_root" in
+          /*) ;;
+          *) die "legacy plugin_root for $LEGACY_PLUGIN_ID is not absolute: $_leg_root" 1 ;;
+        esac
+        if [ -n "$_iroot" ] && [ "$_leg_root" = "$_iroot" ]; then
+          :
+        elif [ "$_leg_kind" = "local" ]; then
+          _legacy_local=1
+        else
+          _legacy_present=1
+          _legacy_root="$_leg_root"
+        fi
+      fi
     fi
   fi
 
@@ -721,8 +803,9 @@ EOF
 
     # Already current: one resolvable root, not locally linked, installed
     # version equals the target, the Pi package is already installed from
-    # the same source, and no legacy managed copy exists. Exit 0 before any
-    # mutation with exactly one info line.
+    # the same source, no legacy managed copy exists, and no remote legacy
+    # plugin residue remains. Exit 0 before any mutation with exactly one
+    # info line.
     if [ "$_cmp_ok" = "1" ] && [ "$_cmp" = "0" ] && [ "$_ikind" != "local" ]; then
       _exact_one=0
       if [ -n "$OVERRIDE_ROOT" ]; then
@@ -730,7 +813,7 @@ EOF
       elif [ "$_distinct" = "1" ]; then
         _exact_one=1
       fi
-      if [ "$_exact_one" = "1" ] && [ ! -e "$LEGACY_DEST" ] && [ ! -L "$LEGACY_DEST" ]; then
+      if [ "$_exact_one" = "1" ] && [ ! -e "$LEGACY_DEST" ] && [ ! -L "$LEGACY_DEST" ] && [ "$_legacy_present" = "0" ]; then
         if pi_source_installed "$PI_SOURCE"; then
           info "already up to date ($REF)"
           exit 0
@@ -741,6 +824,13 @@ EOF
 
   # 4. Legacy migration, before installing anything.
   migrate_legacy
+
+  # 4b. A locally linked legacy checkout is never auto-replaced: warn
+  # loudly and leave it for its owner. (Remote legacy residue is removed
+  # after the new install succeeds, step 10b.)
+  if [ "$_legacy_local" = "1" ]; then
+    warn "legacy locally linked plugin $LEGACY_PLUGIN_ID left in place (source.kind=local); remove it manually when the checkout is retired"
+  fi
 
   # 5. A locally linked plugin is replaced automatically (warn loudly).
   if [ "$_have_pre" = "1" ] && [ "$_ikind" = "local" ]; then
@@ -840,6 +930,23 @@ EOF
     warn "daemon script unavailable ($STATUS_BIN); continuing (packages are installed)"
   fi
 
+  # 10b. Remote legacy cleanup: the pre-rename plugin must not linger
+  # beside the new one. Runs only after the new install succeeded, so a
+  # failed install never leaves the user with nothing. Best-effort with a
+  # loud manual command on failure; a locally linked legacy checkout was
+  # already warned about in step 4b and is never touched here.
+  if [ "$_legacy_present" = "1" ]; then
+    _leg_out=""
+    _leg_rc=0
+    _leg_out="$("$HERDR_BIN" plugin uninstall "$LEGACY_PLUGIN_ID" 2>&1)" || _leg_rc=$?
+    if [ "$_leg_rc" = "0" ]; then
+      info "uninstalled legacy Herdr plugin $LEGACY_PLUGIN_ID"
+    else
+      [ -n "$_leg_out" ] && printf '%s\n' "$_leg_out" >&2
+      warn "could not remove legacy plugin $LEGACY_PLUGIN_ID (exit $_leg_rc); remove it manually: herdr plugin uninstall $LEGACY_PLUGIN_ID"
+    fi
+  fi
+
   # 11. Versioned installer state.
   _post_ver="$(current_plugin_version)"
   [ -n "$_post_ver" ] || _post_ver=""
@@ -858,8 +965,9 @@ EOF
 }
 
 # Echo the Pi source to remove on uninstall: explicit --pi-source/env wins,
-# then the source `pi list` actually shows, then the state-file record, then
-# the npm default. Never fails; never touches the network.
+# then the source `pi list` actually shows (active npm, shared git, retired
+# npm), then the state-file record, then the npm default. Never fails;
+# never touches the network.
 uninstall_pi_source() {
   if [ -n "$PI_SOURCE_REQ" ]; then
     validate_pi_source "$PI_SOURCE_REQ"
@@ -883,6 +991,9 @@ uninstall_pi_source() {
     case "$_uus_out" in
       *"$PI_GIT_SPEC"*) printf '%s' "$PI_GIT_SPEC"; return 0 ;;
     esac
+    case "$_uus_out" in
+      *"$PI_LEGACY_NPM_SPEC"*) printf '%s' "$PI_LEGACY_NPM_SPEC"; return 0 ;;
+    esac
   fi
   if [ -f "$STATE_FILE" ]; then
     if grep -Fq "$PI_NPM_SPEC" "$STATE_FILE" 2>/dev/null; then
@@ -891,8 +1002,26 @@ uninstall_pi_source() {
     if grep -Fq "$PI_GIT_SPEC" "$STATE_FILE" 2>/dev/null; then
       printf '%s' "$PI_GIT_SPEC"; return 0
     fi
+    if grep -Fq "$PI_LEGACY_NPM_SPEC" "$STATE_FILE" 2>/dev/null; then
+      printf '%s' "$PI_LEGACY_NPM_SPEC"; return 0
+    fi
   fi
   printf '%s' "$PI_NPM_SPEC"
+  return 0
+}
+
+# Echo the retired npm source when `pi list` still shows it installed (and
+# it differs from the primary removal source). Prints nothing otherwise.
+# Never fails; never touches the network.
+uninstall_legacy_pi_source() {
+  _lps_primary="$1"
+  [ "$PI_LEGACY_NPM_SPEC" = "$_lps_primary" ] && return 0
+  _lps_out=""
+  if _lps_out="$("$PI_BIN" list 2>/dev/null)"; then
+    case "$_lps_out" in
+      *"$PI_LEGACY_NPM_SPEC"*) printf '%s' "$PI_LEGACY_NPM_SPEC"; return 0 ;;
+    esac
+  fi
   return 0
 }
 
@@ -902,12 +1031,17 @@ do_uninstall() {
     warn "--force is deprecated and has no effect"
   fi
 
-  # Pi source for removal (no network probe on uninstall).
+  # Pi sources for removal (no network probe on uninstall): the primary
+  # source plus the retired npm source when `pi list` still shows it.
   _rm_source="$(uninstall_pi_source)"
+  _rm_legacy="$(uninstall_legacy_pi_source "$_rm_source")"
 
-  # Resolve the installed root first; missing root skips daemon cleanup only.
+  # Resolve the installed root first (active id, then the retired id for
+  # pre-rename installs); missing root skips daemon cleanup only.
   PLUGIN_ROOT=""
-  if _r="$(resolve_plugin_root 2>/dev/null)"; then
+  if _r="$(resolve_plugin_root "$PLUGIN_ID" 2>/dev/null)"; then
+    PLUGIN_ROOT="$_r"
+  elif _r="$(resolve_plugin_root "$LEGACY_PLUGIN_ID" 2>/dev/null)"; then
     PLUGIN_ROOT="$_r"
   else
     warn "could not resolve installed plugin root; skipping daemon cleanup"
@@ -952,16 +1086,20 @@ do_uninstall() {
     warn "preserving $PI_SETTINGS as-is (installed Pi package root unknown)"
   fi
 
-  # Pi package removal: a refusal is reported without failing the rest.
-  _pu_out=""
-  _pu_rc=0
-  _pu_out="$("$PI_BIN" remove "$_rm_source" 2>&1)" || _pu_rc=$?
-  if [ "$_pu_rc" = "0" ]; then
-    info "removed Pi package $_rm_source"
-  else
-    [ -n "$_pu_out" ] && printf '%s\n' "$_pu_out" >&2
-    warn "pi remove $_rm_source refused or failed (exit $_pu_rc); continuing with the Herdr uninstall"
-  fi
+  # Pi package removal, primary then retired: a refusal is reported
+  # without failing the rest.
+  for _rm_each in "$_rm_source" "$_rm_legacy"; do
+    [ -n "$_rm_each" ] || continue
+    _pu_out=""
+    _pu_rc=0
+    _pu_out="$("$PI_BIN" remove "$_rm_each" 2>&1)" || _pu_rc=$?
+    if [ "$_pu_rc" = "0" ]; then
+      info "removed Pi package $_rm_each"
+    else
+      [ -n "$_pu_out" ] && printf '%s\n' "$_pu_out" >&2
+      warn "pi remove $_rm_each refused or failed (exit $_pu_rc); continuing with the Herdr uninstall"
+    fi
+  done
 
   # Legacy managed-copy removal only when still owned (sha match). Never
   # deletes unowned content; never touches user settings.
@@ -992,24 +1130,48 @@ do_uninstall() {
   rmdir "$STATE_BASE/herdr/plugins" 2>/dev/null || true
   rmdir "$STATE_BASE/herdr" 2>/dev/null || true
 
-  # Plugin uninstall: tolerate already-absent only when classifiable.
-  _uout=""
-  _urc=0
-  _uout="$("$HERDR_BIN" plugin uninstall "$PLUGIN_ID" 2>&1)" || _urc=$?
-  if [ "$_urc" = "0" ]; then
-    info "uninstalled Herdr plugin $PLUGIN_ID"
-  else
-    _ulower="$(printf '%s' "$_uout" | tr '[:upper:]' '[:lower:]')"
-    case "$_ulower" in
-      *'not installed'*|*'not found'*|*'no such'*|*'unknown plugin'*|*'absent'*|*'does not exist'*)
-        warn "plugin $PLUGIN_ID already absent; continuing"
-        ;;
-      *)
-        printf '%s\n' "$_uout" >&2
-        die "herdr plugin uninstall failed (exit $_urc)"
-        ;;
-    esac
-  fi
+  # Plugin uninstall, active id then retired id: tolerate already-absent
+  # only when classifiable. The retired id is uninstalled only when the
+  # list still shows it, so unrelated installs are never touched.
+  for _u_id in "$PLUGIN_ID" "$LEGACY_PLUGIN_ID"; do
+    if [ "$_u_id" = "$LEGACY_PLUGIN_ID" ]; then
+      _u_leg_json=""
+      _u_leg_matches=0
+      if _u_leg_json="$(plugin_list_json "$LEGACY_PLUGIN_ID" 2>/dev/null)"; then
+        _u_leg_info=""
+        _u_leg_info="$(printf '%s' "$_u_leg_json" | plugin_info "$LEGACY_PLUGIN_ID" 2>/dev/null)" || _u_leg_info=""
+        if [ -n "$_u_leg_info" ]; then
+          while IFS= read -r _u_leg_line; do
+            case "$_u_leg_line" in
+              matches=*) _u_leg_matches="${_u_leg_line#matches=}" ;;
+            esac
+          done <<EOF
+$_u_leg_info
+EOF
+        fi
+      fi
+      if [ "$_u_leg_matches" = "0" ]; then
+        continue
+      fi
+    fi
+    _uout=""
+    _urc=0
+    _uout="$("$HERDR_BIN" plugin uninstall "$_u_id" 2>&1)" || _urc=$?
+    if [ "$_urc" = "0" ]; then
+      info "uninstalled Herdr plugin $_u_id"
+    else
+      _ulower="$(printf '%s' "$_uout" | tr '[:upper:]' '[:lower:]')"
+      case "$_ulower" in
+        *'not installed'*|*'not found'*|*'no such'*|*'unknown plugin'*|*'absent'*|*'does not exist'*)
+          warn "plugin $_u_id already absent; continuing"
+          ;;
+        *)
+          printf '%s\n' "$_uout" >&2
+          die "herdr plugin uninstall failed (exit $_urc)"
+          ;;
+      esac
+    fi
+  done
 
   info "done. Running Pi sessions need /reload or a restart."
 }

@@ -34,7 +34,7 @@ var MIN_MAJOR = 18;
 var major = Number(String(process.versions.node).split('.')[0]);
 if (major < MIN_MAJOR) {
   process.stderr.write(
-    'herdr-gentle-agents: Node ' + MIN_MAJOR + ' or newer is required (running ' + process.versions.node + ').\n',
+    'herdr-gentle-shell: Node ' + MIN_MAJOR + ' or newer is required (running ' + process.versions.node + ').\n',
   );
   process.exit(1);
 }
@@ -52,7 +52,13 @@ const interruptions = require('../lib/gentle-interruptions');
 // `gentle:v1`; the daemon writes under the plugin convention
 // `plugin:<id>` (same as herdr-pi-tree's herdr.source()), so a clear
 // touches only this writer's tokens even where names collide.
-const PLUGIN_ID = 'herdr-gentle-agents';
+// Active plugin lookup identity (S15 rename): the manifest id is now
+// herdr-gentle-shell, so Herdr injects HERDR_PLUGIN_ID/HERDR_PLUGIN_STATE_DIR
+// for the new id. The SOURCE fallback follows the install; the stored
+// state dir below deliberately keeps the pre-rename segment so upgrades
+// keep their flags, pidfile and ledger with no migration step.
+const PLUGIN_ID = 'herdr-gentle-shell';
+const STATE_PLUGIN_ID = 'herdr-gentle-agents';
 const SOURCE = `plugin:${process.env.HERDR_PLUGIN_ID ?? PLUGIN_ID}`;
 
 // DESIGN §10 U2 is unresolved (no normative cadence); the provisional poll
@@ -200,11 +206,69 @@ function herdrStateDir() {
   return path.join(os.homedir(), '.local', 'state', 'herdr');
 }
 
+// Family of files proving a state dir is ours: when the Herdr-injected
+// dir (which changes with the plugin id) holds none of these while the
+// stored dir does, the stored dir wins so pre-rename flags stay readable.
+// Fresh installs with no stored files converge on the injected dir.
+// GENTLE_STATUS_STATE_DIR (explicit user override) is always used as-is.
+const STATE_KNOWN_FILES = [
+  'gentle-sidebar-mode.json',
+  'gentle-moshi.json',
+  'pi-extension-exclusion-owned',
+  'gentle-status.pid',
+  'gentle-interruptions.json',
+  'installer-state',
+  'gentle-worktree-mode.json',
+];
+
+function dirHasKnownFiles(dir) {
+  for (const name of STATE_KNOWN_FILES) {
+    try {
+      if (fs.existsSync(path.join(dir, name))) return true;
+    } catch {
+      // A single unreadable entry never decides; keep scanning.
+    }
+  }
+  return false;
+}
+
+function storedStateRoot() {
+  return path.join(herdrStateDir(), 'plugins', STATE_PLUGIN_ID);
+}
+
 function stateRoot() {
-  const dir =
-    process.env.GENTLE_STATUS_STATE_DIR ??
-    process.env.HERDR_PLUGIN_STATE_DIR ??
-    path.join(herdrStateDir(), 'plugins', PLUGIN_ID);
+  const explicit = process.env.GENTLE_STATUS_STATE_DIR;
+  if (typeof explicit === 'string' && explicit.length > 0) {
+    try {
+      fs.mkdirSync(explicit, { recursive: true });
+    } catch {
+      // Callers degrade rather than crash; pid writes are best-effort.
+    }
+    return explicit;
+  }
+  const stored = storedStateRoot();
+  // HEAD parity: an explicit-but-empty (or otherwise invalid non-nullish)
+  // value ignores every override and uses the stored default. Only an
+  // omitted (null/undefined) explicit falls through to the injected dir.
+  if (explicit !== undefined && explicit !== null) {
+    try {
+      fs.mkdirSync(stored, { recursive: true });
+    } catch {
+      // Callers degrade rather than crash; pid writes are best-effort.
+    }
+    return stored;
+  }
+  const injected = process.env.HERDR_PLUGIN_STATE_DIR;
+  let dir = stored;
+  if (typeof injected === 'string' && injected.length > 0 && injected !== stored) {
+    try {
+      if (dirHasKnownFiles(injected)) dir = injected;
+      else if (dirHasKnownFiles(stored)) dir = stored;
+      else dir = injected;
+    } catch {
+      dir = injected;
+    }
+  }
   try {
     fs.mkdirSync(dir, { recursive: true });
   } catch {

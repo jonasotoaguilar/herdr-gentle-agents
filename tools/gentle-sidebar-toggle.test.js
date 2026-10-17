@@ -71,7 +71,27 @@ fs.writeFileSync(
     'if [ "$1" = "plugin" ] && [ "$2" = "list" ]; then',
     '  code="${HERDR_SHIM_LIST_EXIT:-${HERDR_SHIM_EXIT:-0}}"',
     '  [ "$code" = "0" ] || exit "$code"',
-    '  printf \'{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-gentle-agents","plugin_root":"%s"}]}}\\n\' "$HERDR_SHIM_PLUGIN_ROOT"',
+    '  want=""',
+    '  prev=""',
+    '  for a in "$@"; do',
+    '    if [ "$prev" = "--plugin" ]; then want="$a"; fi',
+    '    prev="$a"',
+    '  done',
+    '  [ -n "$want" ] || want="herdr-gentle-agents"',
+    '  ids="${HERDR_SHIM_LIST_IDS:-herdr-gentle-agents herdr-gentle-shell}"',
+    '  hit=0',
+    '  for id in $ids; do',
+    '    if [ "$id" = "$want" ]; then hit=1; fi',
+    '  done',
+    '  if [ "${HERDR_SHIM_LIST_MODE:-single}" = "multiple" ] && [ "$hit" = "1" ]; then',
+    '    printf \'{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"%s","plugin_root":"%s-a"},{"plugin_id":"%s","plugin_root":"%s-b"}]}}\\n\' "$want" "$HERDR_SHIM_PLUGIN_ROOT" "$want" "$HERDR_SHIM_PLUGIN_ROOT"',
+    '    exit 0',
+    '  fi',
+    '  if [ "$hit" = "1" ]; then',
+    '    printf \'{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"%s","plugin_root":"%s"}]}}\\n\' "$want" "$HERDR_SHIM_PLUGIN_ROOT"',
+    '  else',
+    '    printf \'{"id":"cli:plugin","result":{"plugins":[]}}\n\'',
+    '  fi',
     '  exit 0',
     'fi',
     '# plugin action invoke: queued acceptance only, never an effect.',
@@ -778,4 +798,276 @@ test('package CLI rejects unknown verbs: exit 2, stores unchanged', async () => 
   assert.match(result.stderr, /usage/);
   assert.equal(readMode(), null, 'mode untouched');
   assert.equal(settingsRaw(), before, 'settings untouched');
+});
+
+// S15 identity rename: the active plugin lookup uses herdr-gentle-shell
+// while pre-rename installs (herdr-gentle-agents) keep resolving, and the
+// stored state dir stays on the legacy segment even when Herdr injects a
+// new-id state dir. HERDR_SHIM_LIST_IDS bounds which ids the fake list
+// answers with; GENTLE_STATUS_STATE_DIR is the explicit user override and
+// always wins (its semantics are preserved, no fallback).
+test('provider resolves the active new plugin id', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
+  process.env.HERDR_SHIM_LIST_IDS = 'herdr-gentle-shell';
+  try {
+    const h = harness();
+    factory(h.pi);
+    const result = await slotOf().sidebar.apply('gentle', h.ctx);
+    assert.equal(result.changed, true, `new-id lookup must converge: ${result.text}`);
+    assert.deepEqual(readMode(), { version: 1, enabled: true });
+  } finally {
+    delete process.env.HERDR_SHIM_LIST_IDS;
+  }
+});
+
+test('provider falls back to the retired plugin id', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
+  process.env.HERDR_SHIM_LIST_IDS = 'herdr-gentle-agents';
+  try {
+    const h = harness();
+    factory(h.pi);
+    const result = await slotOf().sidebar.apply('gentle', h.ctx);
+    assert.equal(result.changed, true, `legacy-id lookup must keep converging: ${result.text}`);
+    assert.deepEqual(readMode(), { version: 1, enabled: true });
+  } finally {
+    delete process.env.HERDR_SHIM_LIST_IDS;
+  }
+});
+
+test('provider refuses on ambiguous plugin roots without touching state', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
+  const beforeSettings = settingsRaw();
+  process.env.HERDR_SHIM_LIST_IDS = 'herdr-gentle-shell';
+  process.env.HERDR_SHIM_LIST_MODE = 'multiple';
+  try {
+    const h = harness();
+    factory(h.pi);
+    const result = await slotOf().sidebar.apply('gentle', h.ctx);
+    assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: false, needsReload: false });
+    assert.match(result.text, /ambiguous|resolve/i);
+    assert.deepEqual(readMode(), { version: 1, enabled: false }, 'mode untouched on ambiguity');
+    assert.equal(settingsRaw(), beforeSettings, 'settings untouched on ambiguity');
+  } finally {
+    delete process.env.HERDR_SHIM_LIST_IDS;
+    delete process.env.HERDR_SHIM_LIST_MODE;
+  }
+});
+
+test('injected new-id state dir keeps pre-rename flags readable', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir();
+  const savedGentleDir = process.env.GENTLE_STATUS_STATE_DIR;
+  const savedHerdrDir = process.env.HERDR_PLUGIN_STATE_DIR;
+  const savedXdg = process.env.XDG_STATE_HOME;
+  const sandbox = fs.mkdtempSync(path.join(root, 'xdg-'));
+  const legacyDir = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+  fs.mkdirSync(legacyDir, { recursive: true });
+  fs.writeFileSync(path.join(legacyDir, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":false}\n');
+  delete process.env.GENTLE_STATUS_STATE_DIR;
+  process.env.HERDR_PLUGIN_STATE_DIR = path.join(sandbox, 'injected-shell');
+  process.env.XDG_STATE_HOME = sandbox;
+  try {
+    const h = harness();
+    factory(h.pi);
+    assert.equal(slotOf().sidebar.read(), 'native', 'the stored disabled flag must win over the empty injected dir');
+    assert.equal(slotOf().moshi.read(), 'off', 'moshi flag resolution shares the stored dir');
+  } finally {
+    if (savedGentleDir === undefined) delete process.env.GENTLE_STATUS_STATE_DIR;
+    else process.env.GENTLE_STATUS_STATE_DIR = savedGentleDir;
+    if (savedHerdrDir === undefined) delete process.env.HERDR_PLUGIN_STATE_DIR;
+    else process.env.HERDR_PLUGIN_STATE_DIR = savedHerdrDir;
+    if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = savedXdg;
+  }
+});
+
+test('explicit user state dir wins over injected and stored dirs', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir();
+  const savedGentleDir = process.env.GENTLE_STATUS_STATE_DIR;
+  const savedHerdrDir = process.env.HERDR_PLUGIN_STATE_DIR;
+  const savedXdg = process.env.XDG_STATE_HOME;
+  const sandbox = fs.mkdtempSync(path.join(root, 'xdg-explicit-'));
+  const legacyDir = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+  fs.mkdirSync(legacyDir, { recursive: true });
+  fs.writeFileSync(path.join(legacyDir, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":false}\n');
+  const explicitDir = path.join(sandbox, 'explicit');
+  fs.mkdirSync(explicitDir, { recursive: true });
+  fs.writeFileSync(path.join(explicitDir, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":true}\n');
+  process.env.GENTLE_STATUS_STATE_DIR = explicitDir;
+  process.env.HERDR_PLUGIN_STATE_DIR = path.join(sandbox, 'injected-shell');
+  process.env.XDG_STATE_HOME = sandbox;
+  try {
+    const h = harness();
+    factory(h.pi);
+    assert.equal(slotOf().sidebar.read(), 'gentle', 'the explicit override keeps its semantics');
+  } finally {
+    if (savedGentleDir === undefined) delete process.env.GENTLE_STATUS_STATE_DIR;
+    else process.env.GENTLE_STATUS_STATE_DIR = savedGentleDir;
+    if (savedHerdrDir === undefined) delete process.env.HERDR_PLUGIN_STATE_DIR;
+    else process.env.HERDR_PLUGIN_STATE_DIR = savedHerdrDir;
+    if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = savedXdg;
+  }
+});
+
+test('lib enable resolves the active new plugin id', async () => {
+  const sidebar = require('../lib/gentle-sidebar.js');
+  const libRoot = fs.mkdtempSync(path.join(root, 'libid-'));
+  const env = {
+    GENTLE_STATUS_STATE_DIR: path.join(libRoot, 'state'),
+    PI_CODING_AGENT_DIR: path.join(libRoot, 'agent'),
+    HERDR_CONFIG_PATH: path.join(libRoot, 'config.toml'),
+  };
+  fs.mkdirSync(path.join(env.PI_CODING_AGENT_DIR, 'extensions'), { recursive: true });
+  fs.writeFileSync(path.join(env.PI_CODING_AGENT_DIR, 'extensions', 'herdr-agent-state.ts'), '// native\n');
+  const savedConfig = process.env.HERDR_CONFIG_PATH;
+  process.env.HERDR_CONFIG_PATH = env.HERDR_CONFIG_PATH;
+  process.env.HERDR_SHIM_LIST_IDS = 'herdr-gentle-shell';
+  try {
+    const result = sidebar.enable(env);
+    assert.equal(result.code, 0, `new-id lookup must converge: ${result.message}`);
+    assert.deepEqual(sidebar.readMode(env), { state: 'enabled', publish: true });
+  } finally {
+    delete process.env.HERDR_SHIM_LIST_IDS;
+    if (savedConfig === undefined) delete process.env.HERDR_CONFIG_PATH;
+    else process.env.HERDR_CONFIG_PATH = savedConfig;
+  }
+});
+
+test('lib stateDir keeps the stored legacy segment and honors explicit override', async () => {
+  const sidebar = require('../lib/gentle-sidebar.js');
+  const sandbox = fs.mkdtempSync(path.join(root, 'libstate-'));
+  const legacyDir = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+  fs.mkdirSync(legacyDir, { recursive: true });
+  fs.writeFileSync(path.join(legacyDir, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":false}\n');
+  assert.equal(
+    sidebar.stateDir({ XDG_STATE_HOME: sandbox }),
+    legacyDir,
+    'the stored dir is the default despite the rename',
+  );
+  assert.equal(sidebar.stateDir({ GENTLE_STATUS_STATE_DIR: '/explicit/dir' }), '/explicit/dir');
+  assert.equal(
+    sidebar.stateDir({ HERDR_PLUGIN_STATE_DIR: path.join(sandbox, 'injected-shell'), XDG_STATE_HOME: sandbox }),
+    legacyDir,
+    'an empty injected dir never orphans stored flags',
+  );
+});
+
+test('provider sidebar write stays stored when stored holds only the worktree flag (S15)', async () => {
+  const { default: factory } = await factoryPromise;
+  const modeLib = require('../lib/worktree-mode.js');
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  const savedGentleDir = process.env.GENTLE_STATUS_STATE_DIR;
+  const savedHerdrDir = process.env.HERDR_PLUGIN_STATE_DIR;
+  const savedXdg = process.env.XDG_STATE_HOME;
+  const sandbox = fs.mkdtempSync(path.join(root, 'xdg-wtonly-'));
+  const stored = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+  fs.mkdirSync(stored, { recursive: true });
+  fs.writeFileSync(path.join(stored, 'gentle-worktree-mode.json'), '{"version":1,"enabled":false}\n');
+  const injected = path.join(sandbox, 'injected-shell');
+  fs.mkdirSync(injected, { recursive: true });
+  delete process.env.GENTLE_STATUS_STATE_DIR;
+  process.env.HERDR_PLUGIN_STATE_DIR = injected;
+  process.env.XDG_STATE_HOME = sandbox;
+  try {
+    const h = harness();
+    factory(h.pi);
+    // Missing sidebar mode reads as gentle, so native is a real change.
+    const result = await slotOf().sidebar.apply('native', h.ctx);
+    assert.equal(result.changed, true, `apply must converge: ${result.text}`);
+    assert.ok(fs.existsSync(path.join(stored, 'gentle-sidebar-mode.json')), 'sidebar flag lands stored');
+    assert.ok(!fs.existsSync(path.join(injected, 'gentle-sidebar-mode.json')), 'nothing lands injected');
+    const wtEnv = { HERDR_PLUGIN_STATE_DIR: injected, XDG_STATE_HOME: sandbox };
+    assert.deepEqual(modeLib.readMode(wtEnv), { state: 'disabled', enabled: false }, 'worktree stays disabled');
+  } finally {
+    if (savedGentleDir === undefined) delete process.env.GENTLE_STATUS_STATE_DIR;
+    else process.env.GENTLE_STATUS_STATE_DIR = savedGentleDir;
+    if (savedHerdrDir === undefined) delete process.env.HERDR_PLUGIN_STATE_DIR;
+    else process.env.HERDR_PLUGIN_STATE_DIR = savedHerdrDir;
+    if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = savedXdg;
+  }
+});
+
+test('explicit empty GENTLE keeps provider writes stored (S15)', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  const savedGentleDir = process.env.GENTLE_STATUS_STATE_DIR;
+  const savedHerdrDir = process.env.HERDR_PLUGIN_STATE_DIR;
+  const savedXdg = process.env.XDG_STATE_HOME;
+  const sandbox = fs.mkdtempSync(path.join(root, 'xdg-empty-'));
+  const stored = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+  fs.mkdirSync(stored, { recursive: true });
+  fs.writeFileSync(path.join(stored, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":true}\n');
+  fs.writeFileSync(path.join(stored, 'gentle-worktree-mode.json'), '{"version":1,"enabled":false}\n');
+  const injected = path.join(sandbox, 'injected-shell');
+  fs.mkdirSync(injected, { recursive: true });
+  fs.writeFileSync(path.join(injected, 'gentle-status.pid'), '123456\n');
+  process.env.GENTLE_STATUS_STATE_DIR = '';
+  process.env.HERDR_PLUGIN_STATE_DIR = injected;
+  process.env.XDG_STATE_HOME = sandbox;
+  try {
+    const h = harness();
+    factory(h.pi);
+    const result = await slotOf().sidebar.apply('native', h.ctx);
+    assert.equal(result.changed, true, `apply must converge: ${result.text}`);
+    assert.equal(
+      fs.readFileSync(path.join(stored, 'gentle-sidebar-mode.json'), 'utf8'),
+      '{"version":1,"enabled":false}\n',
+      'stored flag updated',
+    );
+    assert.ok(!fs.existsSync(path.join(injected, 'gentle-sidebar-mode.json')), 'nothing lands injected');
+  } finally {
+    if (savedGentleDir === undefined) delete process.env.GENTLE_STATUS_STATE_DIR;
+    else process.env.GENTLE_STATUS_STATE_DIR = savedGentleDir;
+    if (savedHerdrDir === undefined) delete process.env.HERDR_PLUGIN_STATE_DIR;
+    else process.env.HERDR_PLUGIN_STATE_DIR = savedHerdrDir;
+    if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = savedXdg;
+  }
+});
+
+test('omitted GENTLE still reads an injected flag (S15)', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir();
+  const savedGentleDir = process.env.GENTLE_STATUS_STATE_DIR;
+  const savedHerdrDir = process.env.HERDR_PLUGIN_STATE_DIR;
+  const savedXdg = process.env.XDG_STATE_HOME;
+  const sandbox = fs.mkdtempSync(path.join(root, 'xdg-omit-'));
+  const injected = path.join(sandbox, 'injected-shell');
+  fs.mkdirSync(injected, { recursive: true });
+  fs.writeFileSync(path.join(injected, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":true}\n');
+  delete process.env.GENTLE_STATUS_STATE_DIR;
+  process.env.HERDR_PLUGIN_STATE_DIR = injected;
+  process.env.XDG_STATE_HOME = sandbox;
+  try {
+    const h = harness();
+    factory(h.pi);
+    assert.equal(slotOf().sidebar.read(), 'gentle', 'the injected enabled flag is honored');
+  } finally {
+    if (savedGentleDir === undefined) delete process.env.GENTLE_STATUS_STATE_DIR;
+    else process.env.GENTLE_STATUS_STATE_DIR = savedGentleDir;
+    if (savedHerdrDir === undefined) delete process.env.HERDR_PLUGIN_STATE_DIR;
+    else process.env.HERDR_PLUGIN_STATE_DIR = savedHerdrDir;
+    if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = savedXdg;
+  }
 });

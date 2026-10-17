@@ -1,7 +1,7 @@
 {
-  "name": "@jonasotoaguilar/herdr-gentle-agents",
+  "name": "@jonasotoaguilar/herdr-gentle-shell",
   "version": "0.5.0",
-  "description": "Pi package for Herdr sidebar states: the Pi extension sidecar that publishes session facts as Herdr pane-metadata tokens, plus the Pi-side helpers the Herdr Gentle Agents plugin drives.",
+  "description": "Pi package for Herdr sidebar states: the Pi extension sidecar that publishes session facts as Herdr pane-metadata tokens, plus the Pi-side helpers the Herdr Gentle Shell plugin drives.",
   "keywords": [
     "pi-package",
     "pi",
@@ -20,7 +20,8 @@
     "node": ">=18"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "files": [
     "extensions",

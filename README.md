@@ -1,6 +1,6 @@
-# Herdr Gentle Agents
+# Herdr Gentle Shell
 
-![Herdr Gentle Agents banner](docs/images/banner.png)
+![Herdr Gentle Shell banner](docs/images/banner.png)
 
 Local Herdr plugin so the sidebar recognises Pi + Gentle Shell agents.
 
@@ -47,12 +47,17 @@ panes).
 One script installs two packages: the Herdr plugin (`herdr-plugin/`,
 installed with `herdr plugin install
 jonasotoaguilar/herdr-gentle-agents/herdr-plugin`) and the Pi package (the
-repository root, published to npm as `@jonasotoaguilar/herdr-gentle-agents`
+repository root, published to npm as `@jonasotoaguilar/herdr-gentle-shell`
 with the `pi-package` keyword, installed with `pi install`). The two
 packages version independently and release from two tag series —
 `pi-vX.Y.Z` (npm publish) and `herdr-vX.Y.Z` (GitHub Release with the
 `install.sh` and `install.sh.sha256` assets) — so either side may lag the
 other; the Herdr side is not bumped when it carries no change.
+
+Source repository: only the published names above were renamed. The code
+still lives at `github.com/jonasotoaguilar/herdr-gentle-agents`, so every
+GitHub URL below keeps that repository; no `herdr-gentle-shell` repository
+was created.
 
 Installer usage:
 `install.sh [--ref REF] [--pi-source auto|npm|git] [--allow-downgrade] [--uninstall] [--help]`
@@ -88,7 +93,7 @@ What the installer does:
   subdirectory at the resolved `--ref` (the newest `herdr-vX.Y.Z` release
   when `--ref` is omitted).
 - Installs the Pi package with `pi install`. `--pi-source` selects the
-  source: `npm` installs `npm:@jonasotoaguilar/herdr-gentle-agents`, `git`
+  source: `npm` installs `npm:@jonasotoaguilar/herdr-gentle-shell`, `git`
   installs `git:github.com/jonasotoaguilar/herdr-gentle-agents`, and `auto`
   (the default) uses npm when the package resolves on the registry and
   otherwise falls back to git with a warning — so an install before the
@@ -147,10 +152,10 @@ Point Herdr at this checkout's plugin subdirectory (from this directory).
 
 ```sh
 herdr plugin link --enabled ./herdr-plugin
-herdr plugin action invoke configure --plugin herdr-gentle-agents
+herdr plugin action invoke configure --plugin herdr-gentle-shell
 ```
 
-The repository root is the Pi package (`@jonasotoaguilar/herdr-gentle-agents`)
+The repository root is the Pi package (`@jonasotoaguilar/herdr-gentle-shell`)
 and `herdr-plugin/` is the Herdr plugin. Then run `/reload` in Pi to pick up
 the local package.
 
@@ -169,7 +174,7 @@ pi update --extensions
 and the Herdr plugin updates with:
 
 ```sh
-herdr plugin update herdr-gentle-agents
+herdr plugin update herdr-gentle-shell
 ```
 
 To move the Herdr side to an explicitly older `herdr-vX.Y.Z` release, pass
@@ -328,7 +333,7 @@ node --check herdr-plugin/bin/gentle-status.js
 HERDR_CONFIG_PATH=/tmp/herdr-fixture.toml node herdr-plugin/bin/configure.js --apply
 HERDR_CONFIG_PATH=/tmp/herdr-fixture.toml node herdr-plugin/bin/configure.js --check
 HERDR_CONFIG_PATH=/tmp/herdr-fixture.toml node herdr-plugin/bin/configure.js --uninstall
-herdr plugin action invoke configure --plugin herdr-gentle-agents
+herdr plugin action invoke configure --plugin herdr-gentle-shell
 herdr server reload-config
 ```
 

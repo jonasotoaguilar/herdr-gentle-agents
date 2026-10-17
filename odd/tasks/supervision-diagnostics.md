@@ -1,6 +1,8 @@
 # Supervision and diagnostics
 Implement the five approved improvements and `/herdr-gentle:sidebar` in the registered `feat/supervision-diagnostics` worktree; preserve sidebar state contracts.
 Delivery: feature-branch-chain, local work-unit commits explicitly authorized; no push/PR/merge. Runner: `node --test tools/*.test.js`. Forecast: ~1,000 authored diff lines, split by behavior.
+
+> SUPERSEDED (customize-command, `feat/customize-command`, see `odd/tasks/customize-command.md`): `/herdr-gentle:sidebar` and `/herdr-gentle:moshi` are removed outright — use `/herdr-gentle:customize` (plus `customize status`). The quoted specs, task rows and log below are the historical record and are unchanged.
 Chain build path: manual (this chain already existed without `gh-stack`; `gh-stack` is now the default for new chains). Known deviations: layer branches use `chain/NN-<slice>` instead of `feat/<feature>-NN-<slice>`, and the Chain Context bodies use an ad-hoc table without the prescribed field list or the Autonomy checklist.
 
 ## Specs
