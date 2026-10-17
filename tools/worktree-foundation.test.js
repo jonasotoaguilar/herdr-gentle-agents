@@ -653,6 +653,72 @@ describe('worktree-mode stored-dir fallback (S15)', () => {
   });
 });
 
+describe('cross-resolver stored-dir agreement (S15)', () => {
+  const sidebarLib = require('../lib/gentle-sidebar.js');
+  const diagLib = require('../herdr-plugin/lib/gentle-diagnostics.js');
+
+  // Stored dir holds ONLY the worktree disabled flag; the injected
+  // (new-id) dir is empty. Every resolver must agree on the stored dir,
+  // and a sidebar write must stay there without flipping the worktree.
+  function worktreeOnlyFixture(tag) {
+    const sandbox = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-s15-xonly-${tag}-`)));
+    const injected = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-s15-xinjected-${tag}-`)));
+    const stored = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+    fs.mkdirSync(stored, { recursive: true });
+    fs.writeFileSync(path.join(stored, 'gentle-worktree-mode.json'), '{"version":1,"enabled":false}\n');
+    return { env: { HERDR_PLUGIN_STATE_DIR: injected, XDG_STATE_HOME: sandbox }, injected, stored, sandbox };
+  }
+
+  test('sidebar, worktree and diagnostics resolvers agree on the stored dir', () => {
+    const { env, stored, injected } = worktreeOnlyFixture('agree');
+    assert.equal(modeLib.stateDir(env), stored, 'worktree resolver stays stored');
+    assert.equal(sidebarLib.stateDir(env), stored, 'sidebar resolver stays stored');
+    assert.equal(diagLib.resolveStateDir(env), stored, 'diagnostics resolver stays stored');
+    assert.deepEqual(modeLib.readMode(env), { state: 'disabled', enabled: false });
+    assert.ok(injected.length > 0, 'fixture injected dir exists');
+  });
+
+  test('a sidebar write stays stored and cannot flip the worktree flag', () => {
+    const { env, stored, injected } = worktreeOnlyFixture('write');
+    sidebarLib.writeMode(false, env);
+    assert.equal(sidebarLib.modePath(env), path.join(stored, 'gentle-sidebar-mode.json'));
+    assert.ok(fs.existsSync(path.join(stored, 'gentle-sidebar-mode.json')), 'sidebar flag lands stored');
+    assert.ok(!fs.existsSync(path.join(injected, 'gentle-sidebar-mode.json')), 'nothing lands injected');
+    assert.equal(modeLib.stateDir(env), stored, 'worktree resolution does not flip after the sidebar write');
+    assert.deepEqual(modeLib.readMode(env), { state: 'disabled', enabled: false });
+    assert.deepEqual(sidebarLib.readMode(env), { state: 'disabled', publish: false });
+  });
+
+  test('explicit empty GENTLE ignores the injected dir on every resolver', () => {
+    const sandbox = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-s15-xempty-')));
+    const injected = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-s15-xempty-injected-')));
+    fs.writeFileSync(path.join(injected, 'gentle-status.pid'), '123456\n');
+    fs.writeFileSync(path.join(injected, 'gentle-moshi.json'), '{"enabled":true}\n');
+    const stored = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+    const env = { GENTLE_STATUS_STATE_DIR: '', HERDR_PLUGIN_STATE_DIR: injected, XDG_STATE_HOME: sandbox };
+    assert.equal(modeLib.stateDir(env), stored, 'worktree resolver ignores every override, as HEAD did');
+    assert.equal(sidebarLib.stateDir(env), stored, 'sidebar resolver ignores every override, as HEAD did');
+    assert.equal(diagLib.resolveStateDir(env), stored, 'diagnostics resolver ignores every override, as HEAD did');
+    assert.deepEqual(modeLib.readMode(env), { state: 'missing', enabled: true });
+    sidebarLib.writeMode(true, env);
+    assert.ok(fs.existsSync(path.join(stored, 'gentle-sidebar-mode.json')), 'writes land stored');
+    assert.ok(!fs.existsSync(path.join(injected, 'gentle-sidebar-mode.json')), 'writes never leak injected');
+  });
+
+  test('omitted GENTLE still allows an injected dir holding flags', () => {
+    const sandbox = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-s15-xomit-')));
+    const injected = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-s15-xomit-injected-')));
+    fs.writeFileSync(path.join(injected, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":true}\n');
+    const stored = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+    const env = { HERDR_PLUGIN_STATE_DIR: injected, XDG_STATE_HOME: sandbox };
+    assert.equal(modeLib.stateDir(env), injected);
+    assert.equal(sidebarLib.stateDir(env), injected);
+    assert.equal(diagLib.resolveStateDir(env), injected);
+    assert.deepEqual(sidebarLib.readMode(env), { state: 'enabled', publish: true });
+    assert.ok(!fs.existsSync(stored), 'nothing is created stored');
+  });
+});
+
 describe('S14 registry accepts issues:[] (T7 RED)', { concurrency: false }, () => {
   test('upsert/read round-trips an entry with no issues', () => {
     const root = makeRepo('regempty');

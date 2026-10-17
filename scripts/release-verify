@@ -6,7 +6,7 @@
 #   pi-vX.Y.Z     verifies the GitHub Release plus the installer asset (same
 #                 as the herdr series) and additionally verifies the published
 #                 npm version resolves: npm view
-#                 @jonasotoaguilar/herdr-gentle-agents@<version> version
+#                 @jonasotoaguilar/herdr-gentle-shell@<version> version
 #                 equals <version>. Fail-closed when the registry has no such
 #                 version.
 #   herdr-vX.Y.Z  verifies the GitHub Release plus the installer asset only;
@@ -117,12 +117,12 @@ case "$TAG" in
   pi-v*)
     command -v npm >/dev/null 2>&1 || fail "npm is required"
     NPM_VERSION="$(printf '%s' "$TAG" | sed 's/^pi-v//')"
-    PUBLISHED="$(npm view "@jonasotoaguilar/herdr-gentle-agents@$NPM_VERSION" version)" \
-      || fail "npm view @jonasotoaguilar/herdr-gentle-agents@$NPM_VERSION version failed"
+    PUBLISHED="$(npm view "@jonasotoaguilar/herdr-gentle-shell@$NPM_VERSION" version)" \
+      || fail "npm view @jonasotoaguilar/herdr-gentle-shell@$NPM_VERSION version failed"
     PUBLISHED_TRIMMED="$(printf '%s' "$PUBLISHED" | tr -d '[:space:]')"
     [ "$PUBLISHED_TRIMMED" = "$NPM_VERSION" ] \
       || fail "npm version mismatch for $TAG: registry has '$PUBLISHED_TRIMMED', expected '$NPM_VERSION'"
-    pass "npm version OK: @jonasotoaguilar/herdr-gentle-agents@$PUBLISHED_TRIMMED"
+    pass "npm version OK: @jonasotoaguilar/herdr-gentle-shell@$PUBLISHED_TRIMMED"
     ;;
 esac
 

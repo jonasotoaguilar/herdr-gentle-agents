@@ -559,7 +559,7 @@ describe('release-verify verdicts', () => {
     assert.match(r.stdout, /verified GitHub Release pi-v0\.2\.0/);
     const npmLog = npmLogLines(fx).join('\n');
     assert.ok(npmLog.includes('view'), `npm view must run, log:\n${npmLog}`);
-    assert.ok(npmLog.includes('@jonasotoaguilar/herdr-gentle-agents@0.2.0'), `npm view must target the pinned version, log:\n${npmLog}`);
+    assert.ok(npmLog.includes('@jonasotoaguilar/herdr-gentle-shell@0.2.0'), `npm view must target the pinned version, log:\n${npmLog}`);
   });
 
   it('pi series fails when the npm version mismatches', (t) => {

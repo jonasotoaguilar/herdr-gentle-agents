@@ -1,4 +1,4 @@
-# herdr-gentle-agents — DESIGN.md (Task 4, as implemented)
+# herdr-gentle-shell — DESIGN.md (Task 4, as implemented)
 
 Status protocol for the Herdr sidebar: producer (Pi sidecar extension) →
 pane-metadata tokens → consumer (plugin daemon) → sidebar state + badges.
@@ -722,11 +722,11 @@ provider renders its category unavailable and `Enter` writes nothing.
   versioning (not sidebar-config versioning) is the compatibility mechanism.
 - Packaging (two-package split): the repository ships two independently
   versioned packages — the Pi package at the repository root (published to
-  npm as `@jonasotoaguilar/herdr-gentle-agents`, installed with
+  npm as `@jonasotoaguilar/herdr-gentle-shell`, installed with
   `pi install`, updated with `pi update --extensions`) and the Herdr plugin
   in `herdr-plugin/` (installed with `herdr plugin install
   jonasotoaguilar/herdr-gentle-agents/herdr-plugin`, updated with
-  `herdr plugin update herdr-gentle-agents`). Releases run on two tag
+  `herdr plugin update herdr-gentle-shell`). Releases run on two tag
   series, `pi-vX.Y.Z` and `herdr-vX.Y.Z`; the Herdr side is not bumped when
   it carries no change. The old managed-copy install (the installer copying
   `extensions/gentle-herdr-state.ts` into the Pi agent dir) is retired: the

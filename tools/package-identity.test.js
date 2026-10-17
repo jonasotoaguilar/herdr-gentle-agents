@@ -29,7 +29,7 @@ function manifestVersion() {
 
 describe('Pi package identity', () => {
   it('is published under the scoped npm name with the pi-package keyword', () => {
-    assert.equal(PKG.name, '@jonasotoaguilar/herdr-gentle-agents');
+    assert.equal(PKG.name, '@jonasotoaguilar/herdr-gentle-shell');
     assert.ok(PKG.keywords.includes('pi-package'), `keywords: ${PKG.keywords.join(', ')}`);
   });
 
@@ -89,7 +89,7 @@ describe('Pi package identity', () => {
 describe('Herdr plugin identity', () => {
   it('keeps its own manifest, id and independent semver version', () => {
     assert.ok(fs.existsSync(MANIFEST_PATH), 'herdr-plugin/herdr-plugin.toml must exist');
-    assert.match(fs.readFileSync(MANIFEST_PATH, 'utf8'), /^id = "herdr-gentle-agents"$/m);
+    assert.match(fs.readFileSync(MANIFEST_PATH, 'utf8'), /^id = "herdr-gentle-shell"$/m);
     assert.match(manifestVersion(), /^\d+\.\d+\.\d+$/);
   });
 
