@@ -178,7 +178,7 @@ describe('customize provider slot', { concurrency: false }, () => {
     }
   });
 
-  test('the old sidebar and moshi commands are still registered (T2 owns their removal)', async () => {
+  test('the old sidebar and moshi commands are gone (S7)', async () => {
     const fix = fixture();
     setEnv({
       GENTLE_STATUS_STATE_DIR: fix.stateDir,
@@ -190,8 +190,8 @@ describe('customize provider slot', { concurrency: false }, () => {
     takeSlot();
     try {
       const { commands } = await loadExtension();
-      assert.ok(commands.has('herdr-gentle:sidebar'), 'sidebar must not disappear in this commit');
-      assert.ok(commands.has('herdr-gentle:moshi'), 'moshi must not disappear in this commit');
+      assert.ok(!commands.has('herdr-gentle:sidebar'), 'the sidebar toggle is removed outright (S7)');
+      assert.ok(!commands.has('herdr-gentle:moshi'), 'the moshi toggle is removed outright (S7)');
     } finally {
       restoreEnv();
     }

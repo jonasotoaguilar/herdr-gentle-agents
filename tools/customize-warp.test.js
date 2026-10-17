@@ -345,7 +345,7 @@ describe('herdr-gentle:warp command (S11)', { concurrency: false }, () => {
       modeLib().writeMode(false, process.env);
       const { tools, commands } = await loadExtension();
       assert.ok(commands.has('herdr-gentle:warp'), `exact name, got ${JSON.stringify([...commands.keys()])}`);
-      assert.ok(commands.has('herdr-gentle:worktree'), 'the toggle itself stays registered');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
       assert.deepEqual([...tools.keys()], [], 'the worktree tools stay gated while disabled');
     } finally {
       restoreEnv();

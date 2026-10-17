@@ -238,7 +238,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
       require('../lib/worktree-mode.js').writeMode(false, process.env);
       const { tools, commands } = await loadExtension();
       assert.deepEqual([...tools.keys()], [], 'no worktree tool is registered while disabled');
-      assert.ok(commands.has('herdr-gentle:worktree'), 'the toggle itself stays registered');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
     } finally {
       restoreEnv();
     }
@@ -260,7 +260,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
       require('../lib/worktree-mode.js').writeMode(false, process.env);
       const result = await callSessionOpen(tools, { worktree: 'feat-gated' }, makeCtx(root));
       assert.equal(result.isError, true);
-      assert.ok(resultText(result).includes('/herdr-gentle:worktree enabled'), `names the toggle: ${resultText(result)}`);
+      assert.ok(resultText(result).includes('/herdr-gentle:customize'), `names the new command: ${resultText(result)}`);
       assert.deepEqual(shimArgv(herdr.log), [], 'herdr is never invoked');
     } finally {
       restoreEnv();
@@ -950,7 +950,7 @@ describe('worktree_session_open preserves the existing tools (S25)', { concurren
         ['branch', 'force', 'name', 'path'],
       );
       assert.ok(tools.get('worktree_list'), 'worktree_list stays registered');
-      assert.ok(commands.has('herdr-gentle:worktree'), 'the mode command stays registered');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
       // List still answers the principal line when nothing else is registered.
       const listResult = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       assert.equal(listResult.isError, undefined);

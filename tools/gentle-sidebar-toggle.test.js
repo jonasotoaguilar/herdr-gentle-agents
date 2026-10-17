@@ -1,7 +1,16 @@
 'use strict';
 // Pi-side switch for OUR sidebar integration versus the native Herdr
-// sidebar (S7): `/herdr-gentle:sidebar toggle|enable|disable|status`
-// (no argument opens a selector, following the Moshi convention).
+// sidebar (S7), now reached through the `/herdr-gentle:customize` panel
+// (customize-command T2/S7: the `/herdr-gentle:sidebar` command is removed
+// outright). These tests keep every state-level assertion of the old
+// command suite — mode file bytes, owned exclusion entries, verified
+// configure rows, rollback, fail-closed behaviour — repointed at the
+// provider slot the state extension registers
+// (`globalThis[Symbol.for("herdr-gentle.customize.v1")].sidebar`), whose
+// `apply` reuses the same `sidebarEnable` / `sidebarDisable` paths
+// unchanged. Only the command-handler UX tests (selector, toggle verb,
+// unknown verb, `status` text) are gone with the command; the read-only
+// reporting they offered lives on as `customize status`.
 //
 // Enable means OUR sidebar (owned native exclusion +
 // `configure` rows apply); disable means NATIVE (owned exclusion removed +
@@ -80,8 +89,7 @@ fs.mkdirSync(path.join(pluginRoot, 'bin'), { recursive: true });
 fs.copyFileSync(path.resolve(__dirname, '../herdr-plugin/bin/configure.js'), path.join(pluginRoot, 'bin', 'configure.js'));
 process.env.HERDR_SHIM_PLUGIN_ROOT = pluginRoot;
 
-const COMMAND = 'herdr-gentle:sidebar';
-const MOSHI_COMMAND = 'herdr-gentle:moshi';
+const SLOT_KEY = 'herdr-gentle.customize.v1';
 const NATIVE_ENTRY = '-extensions/herdr-agent-state.ts';
 const OTHER_ENTRY = '-extensions/other-state.ts';
 const MANAGED_BEGIN = '# BEGIN herdr-gentle-agents (managed; do not edit)';
@@ -198,10 +206,9 @@ function seedManagedConfig() {
 // Minimal fake Pi: only the surfaces this feature touches (plus the event
 // registries the rest of the factory uses). `registerCommand` is optional on
 // purpose — installed harnesses without it must keep loading the extension.
-function harness({ withCommand = true, select = undefined } = {}) {
+function harness({ withCommand = true } = {}) {
   const commands = new Map();
   const notices = [];
-  const selects = [];
   const handlers = new Map();
   const emitted = [];
   const pi = {
@@ -230,45 +237,51 @@ function harness({ withCommand = true, select = undefined } = {}) {
     isIdle: () => false,
     ui: {
       notify: (message, kind) => notices.push([message, kind]),
-      select: async (title, items) => {
-        selects.push([title, items]);
-        if (typeof select === 'function') return select(title, items);
-        return select;
-      },
     },
   };
-  return { pi, commands, notices, selects, handlers, emitted, ctx };
+  return { pi, commands, notices, handlers, emitted, ctx };
 }
 
-async function run(h, args) {
-  await h.commands.get(COMMAND).handler(args, h.ctx);
+function slotOf() {
+  const slot = globalThis[Symbol.for(SLOT_KEY)];
+  assert.ok(slot && typeof slot === 'object', 'expected the provider slot to be registered at load');
+  assert.equal(typeof slot.sidebar.read, 'function', 'sidebar.read');
+  assert.equal(typeof slot.sidebar.apply, 'function', 'sidebar.apply');
+  return slot;
 }
 
-test('registers /herdr-gentle:sidebar; missing mode defaults to enabled and status writes nothing', async () => {
+test('no /herdr-gentle:sidebar command; missing mode reads as gentle and read writes nothing', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir();
   const h = harness();
   factory(h.pi);
-  assert.ok(h.commands.has(COMMAND), `expected the /${COMMAND} command`);
-
-  await run(h, 'status');
-  assert.equal(readMode(), null, 'status must not create the mode file');
-  assert.ok(!fs.existsSync(stateDir), 'status must not mkdir the state dir');
-  assert.equal(settingsRaw(), null, 'status must not create settings.json');
-  assert.equal(configRaw(), null, 'status must not create the Herdr config');
-  assert.deepEqual(shimCalls(), [], 'status must not invoke herdr');
-  assert.match(h.notices.at(-1)[0], /enabled|ours/i, 'missing mode reports enabled for compatibility');
+  assert.ok(!h.commands.has('herdr-gentle:sidebar'), 'the command is removed outright (S7)');
+  assert.equal(slotOf().sidebar.read(), 'gentle', 'missing mode reports enabled for compatibility');
+  assert.equal(readMode(), null, 'read must not create the mode file');
+  assert.ok(!fs.existsSync(stateDir), 'read must not mkdir the state dir');
+  assert.equal(settingsRaw(), null, 'read must not create settings.json');
+  assert.equal(configRaw(), null, 'read must not create the Herdr config');
+  assert.deepEqual(shimCalls(), [], 'read must not invoke herdr');
 });
 
-test('enable converges: mode, owned exclusion, verified rows, /reload notice', async () => {
+test('apply gentle converges: mode, owned exclusion, verified rows, always reloads', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { theme: 'x', extensions: [OTHER_ENTRY] } });
+  // Seed disabled: applying the already-read value is a no-op by design,
+  // so the full path needs a real change.
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
+  const result = await slot.sidebar.apply('gentle', h.ctx);
+  assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: true, needsReload: true },
+    'S6: the sidebar switch always reloads');
+  assert.match(result.text, /ours/, 'the verdict says what changed');
+  assert.ok(!result.text.includes('/reload'), 'the panel never asks the user to run /reload');
   assert.deepEqual(readMode(), { version: 1, enabled: true });
   const settings = readSettings();
   assert.deepEqual(settings.extensions, [OTHER_ENTRY, NATIVE_ENTRY]);
@@ -278,82 +291,92 @@ test('enable converges: mode, owned exclusion, verified rows, /reload notice', a
   const calls = shimCalls();
   assert.ok(calls.some((c) => c.includes('plugin list')), 'installed root resolved via read-only plugin list');
   assert.ok(!calls.some((c) => c.includes('action invoke')), 'no acceptance-based action invoke drives the outcome');
-  assert.match(h.notices.at(-1)[0], /enabled \(ours\)/);
-  assert.match(h.notices.at(-1)[0], /Managed rows applied and verified/);
-  assert.doesNotMatch(h.notices.at(-1)[0], /accepted|reload applied through/i, 'never claims completion on acceptance');
-  assert.match(h.notices.at(-1)[0], /\/reload/, 'enable warns that running sessions need /reload');
-  assert.equal(h.notices.at(-1)[1], 'info');
 });
 
-test('enable refuses when the installed plugin root cannot be resolved', async () => {
+test('apply refuses when the installed plugin root cannot be resolved', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
   const before = settingsRaw();
   process.env.HERDR_SHIM_LIST_EXIT = '1';
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
+  const result = await slot.sidebar.apply('gentle', h.ctx);
   delete process.env.HERDR_SHIM_LIST_EXIT;
-  assert.equal(h.notices.at(-1)[1], 'error');
-  assert.match(h.notices.at(-1)[0], /plugin root|resolve/i);
-  assert.equal(readMode(), null, 'mode never committed without completion proof');
+  assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: false, needsReload: false });
+  assert.match(result.text, /plugin root|resolve/i);
+  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'mode never committed without completion proof');
   assert.equal(settingsRaw(), before, 'settings untouched');
   assert.equal(configRaw(), null, 'config untouched');
 });
 
-test('enable is idempotent: single entry, converged state, no duplication', async () => {
+test('apply is idempotent: single entry, converged state, no duplication', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
   seedManagedConfig();
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
-  await run(h, 'enable');
+  const first = await slot.sidebar.apply('gentle', h.ctx);
+  assert.equal(first.changed, true);
+  const second = await slot.sidebar.apply('gentle', h.ctx);
+  assert.deepEqual({ changed: second.changed, needsReload: second.needsReload }, { changed: false, needsReload: false },
+    'the already-active value changes nothing');
   assert.deepEqual(readSettings().extensions, [OTHER_ENTRY, NATIVE_ENTRY], 'no duplicate entry');
   assert.deepEqual(readMode(), { version: 1, enabled: true });
 });
 
-test('disable converges: mode false, only the owned entry removed, rows verified', async () => {
+test('apply native converges: mode false, only the owned entry removed, rows verified', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY], model: 'm' } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
-  assert.deepEqual(readSettings().extensions, [OTHER_ENTRY, NATIVE_ENTRY], 'enable stages the owned entry');
+  const enabled = await slot.sidebar.apply('gentle', h.ctx);
+  assert.equal(enabled.changed, true, 'staging apply converges first');
+  assert.deepEqual(readSettings().extensions, [OTHER_ENTRY, NATIVE_ENTRY], 'apply stages the owned entry');
   clearShimLog();
-  await run(h, 'disable');
+  const disabled = await slot.sidebar.apply('native', h.ctx);
+  assert.deepEqual({ changed: disabled.changed, needsReload: disabled.needsReload }, { changed: true, needsReload: true },
+    'S6: the sidebar switch always reloads');
   assert.deepEqual(readMode(), { version: 1, enabled: false });
   const settings = readSettings();
   assert.deepEqual(settings.extensions, [OTHER_ENTRY], 'only the owned entry is removed');
   assert.equal(settings.model, 'm', 'unrelated keys are preserved');
   const body = configRaw() ?? '';
   assert.ok(!(body.includes(MANAGED_BEGIN) && body.includes(MANAGED_END)), 'managed rows were actually removed');
-  assert.match(h.notices.at(-1)[0], /disabled \(native/);
-  assert.match(h.notices.at(-1)[0], /Managed rows removed and verified/);
-  assert.doesNotMatch(h.notices.at(-1)[0], /accepted|reload applied through/i);
-  assert.match(h.notices.at(-1)[0], /\/reload/);
 });
 
-test('disable reload failure restores exclusion, mode, and rows', async () => {
+test('apply native reload failure restores exclusion, mode, and rows', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
+  const enabled = await slot.sidebar.apply('gentle', h.ctx);
+  assert.equal(enabled.changed, true, 'staging apply converges first');
   assert.deepEqual(readMode(), { version: 1, enabled: true }, 'seeded enabled');
   process.env.HERDR_SHIM_RELOAD_EXIT = '1';
-  await run(h, 'disable');
+  const result = await slot.sidebar.apply('native', h.ctx);
   delete process.env.HERDR_SHIM_RELOAD_EXIT;
-  assert.equal(h.notices.at(-1)[1], 'error');
-  assert.match(h.notices.at(-1)[0], /re-run \/herdr-gentle:sidebar disable/i, 'explicit recoverable state');
+  assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: false, needsReload: false });
+  assert.match(result.text, /customize|converge/i, 'explicit recoverable state');
   assert.deepEqual(readMode(), { version: 1, enabled: true }, 'mode unchanged');
   assert.deepEqual(readSettings().extensions, [OTHER_ENTRY, NATIVE_ENTRY], 'owned exclusion restored');
   assert.ok(fs.existsSync(markerFile), 'ownership record kept');
@@ -361,24 +384,31 @@ test('disable reload failure restores exclusion, mode, and rows', async () => {
   assert.ok(body.includes(MANAGED_BEGIN) && body.includes(MANAGED_END), 'prior owned rows restored');
 });
 
-test('disable is idempotent and toggle cycles missing -> disable -> enable -> disable', async () => {
+test('apply is a no-op for the already-active value; apply cycles missing -> native -> gentle -> native', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir();
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'toggle');
-  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'missing (enabled) toggles to disabled');
-  await run(h, 'toggle');
-  assert.deepEqual(readMode(), { version: 1, enabled: true }, 'disabled toggles to enabled');
-  await run(h, 'toggle');
-  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'enabled toggles to disabled');
-  await run(h, 'disable');
-  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'repeat disable is a no-op state');
+  // Missing mode reads as gentle, so the first real change is to native.
+  // (The old `toggle` verb is gone with the command; the panel rows carry
+  // the same cycle through explicit values.)
+  const first = await slot.sidebar.apply('native', h.ctx);
+  assert.equal(first.changed, true);
+  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'missing (gentle) applies to native');
+  await slot.sidebar.apply('gentle', h.ctx);
+  assert.deepEqual(readMode(), { version: 1, enabled: true }, 'native applies to gentle');
+  await slot.sidebar.apply('native', h.ctx);
+  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'gentle applies to native');
+  const repeat = await slot.sidebar.apply('native', h.ctx);
+  assert.deepEqual({ changed: repeat.changed, needsReload: repeat.needsReload }, { changed: false, needsReload: false },
+    'repeat native is a no-op state');
+  assert.deepEqual(readMode(), { version: 1, enabled: false });
 });
 
-test('an unknown option changes nothing and says so', async () => {
+test('an unknown value changes nothing', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
@@ -387,76 +417,43 @@ test('an unknown option changes nothing and says so', async () => {
   const beforeConfig = configRaw();
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'banana');
+  const result = await slot.sidebar.apply('banana', h.ctx);
+  assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: false, needsReload: false });
   assert.equal(readMode(), null, 'mode untouched');
   assert.equal(settingsRaw(), beforeSettings, 'settings untouched');
   assert.equal(configRaw(), beforeConfig, 'config untouched');
   assert.deepEqual(shimCalls(), [], 'herdr never invoked');
-  assert.equal(h.notices.at(-1)[1], 'error');
-  assert.match(h.notices.at(-1)[0], /toggle\|enable\|disable\|status/);
 });
 
-test('no argument opens the selector and applies the chosen option', async () => {
-  const { default: factory } = await factoryPromise;
-  resetState();
-  resetAgentDir();
-  const h = harness({ select: () => 'Disable' });
-  factory(h.pi);
-
-  await run(h, '');
-  assert.equal(h.selects.length, 1, 'a selector is offered');
-  assert.equal(h.selects[0][1].length, 3);
-  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'the chosen option is applied');
-});
-
-test('no argument with no selector falls back to status without writes', async () => {
-  const { default: factory } = await factoryPromise;
-  resetState();
-  resetAgentDir();
-  const h = harness({ select: undefined });
-  delete h.ctx.ui.select;
-  factory(h.pi);
-
-  await run(h, '');
-  assert.equal(readMode(), null, 'fallback status writes nothing');
-  assert.match(h.notices.at(-1)[0], /enabled|ours/i);
-});
-
-test('status reports exclusion and managed-rows state', async () => {
-  const { default: factory } = await factoryPromise;
-  resetState();
-  resetAgentDir({ settings: { extensions: [NATIVE_ENTRY] } });
-  seedManagedConfig();
-  const h = harness();
-  factory(h.pi);
-
-  await run(h, 'enable');
-  await run(h, 'status');
-  const message = h.notices.at(-1)[0];
-  assert.match(message, /enabled|ours/i);
-  assert.match(message, /herdr-agent-state\.ts/);
-  assert.match(message, /excluded yes/i);
-  assert.match(message, /managed/i);
-});
-
+// NOTE (customize-command T2/S7): the no-argument selector, the
+// no-selector status fallback, and the `status` verb died with the
+// command. Panel selection coverage lives in tools/customize-panel.test.js
+// and the read-only reporting lives on as `customize status` (pinned
+// there as `customize status: sidebar=… moshi=… worktree=…`).
 test('foreign or misbound marker refuses with everything preserved', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  // Seed disabled so both applies below take the changing path (applying
+  // the already-read value is a no-op by design).
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
   const before = settingsRaw();
   // Foreign record: authorizes a different entry.
-  fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(
     markerFile,
     `${JSON.stringify({ version: 1, entry: '-extensions/someone-else.ts', settings: settingsFile })}\n`,
   );
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
-  assert.equal(h.notices.at(-1)[1], 'error');
-  assert.equal(readMode(), null, 'mode untouched on foreign marker');
+  const foreign = await slot.sidebar.apply('gentle', h.ctx);
+  assert.deepEqual({ changed: foreign.changed, needsReload: foreign.needsReload }, { changed: false, needsReload: false });
+  assert.match(foreign.text, /foreign|invalid|resolving/i);
+  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'mode untouched on foreign marker');
   assert.equal(settingsRaw(), before, 'settings untouched on foreign marker');
   assert.deepEqual(shimCalls(), [], 'herdr untouched on foreign marker');
 
@@ -465,39 +462,45 @@ test('foreign or misbound marker refuses with everything preserved', async () =>
     markerFile,
     `${JSON.stringify({ version: 1, entry: NATIVE_ENTRY, settings: '/elsewhere/settings.json' })}\n`,
   );
-  await run(h, 'disable');
-  assert.equal(h.notices.at(-1)[1], 'error');
-  assert.equal(readMode(), null, 'mode untouched on misbound marker');
+  const misbound = await slot.sidebar.apply('gentle', h.ctx);
+  assert.deepEqual({ changed: misbound.changed, needsReload: misbound.needsReload }, { changed: false, needsReload: false });
+  assert.match(misbound.text, /misbound|bound|resolving/i);
+  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'mode untouched on misbound marker');
   assert.equal(settingsRaw(), before, 'settings untouched on misbound marker');
 });
 
-test('preexisting user exclusion is preserved: disable keeps it, enable does not adopt it', async () => {
+test('preexisting user exclusion is preserved: native keeps it, gentle does not adopt it', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY, NATIVE_ENTRY] } });
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'disable');
+  const native = await slot.sidebar.apply('native', h.ctx);
+  assert.equal(native.changed, true, 'missing reads as gentle, so native is a change');
   assert.deepEqual(readSettings().extensions, [OTHER_ENTRY, NATIVE_ENTRY], 'user entry preserved');
   assert.ok(!fs.existsSync(markerFile), 'no ownership taken on remove');
   assert.deepEqual(readMode(), { version: 1, enabled: false });
 
-  await run(h, 'enable');
+  await slot.sidebar.apply('gentle', h.ctx);
   assert.deepEqual(readSettings().extensions, [OTHER_ENTRY, NATIVE_ENTRY], 'user entry left as-is');
   assert.ok(!fs.existsSync(markerFile), 'foreign entry is never adopted');
   assert.deepEqual(readMode(), { version: 1, enabled: true });
 });
 
-test('enable leaves settings.json untouched when the native hook is absent', async () => {
+test('apply leaves settings.json untouched when the native hook is absent', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ nativeInstalled: false, settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
   const before = settingsRaw();
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
+  await slot.sidebar.apply('gentle', h.ctx);
   assert.deepEqual(readMode(), { version: 1, enabled: true }, 'our sidebar still turns on');
   assert.equal(settingsRaw(), before, 'settings bytes are unchanged without the native target');
 });
@@ -508,9 +511,13 @@ test('invalid settings.json fails closed with no mode write and no herdr invoke'
   resetAgentDir({ settings: '{ not json' });
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
-  assert.equal(h.notices.at(-1)[1], 'error', 'the failure is reported');
+  // Missing mode reads as gentle, so native takes the changing path and
+  // hits the unreadable-settings preflight before anything mutates.
+  const result = await slot.sidebar.apply('native', h.ctx);
+  assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: false, needsReload: false });
+  assert.match(result.text, /unreadable|invalid/i, 'the failure is reported');
   assert.equal(readMode(), null, 'mode is not written when settings cannot be read');
   assert.equal(settingsRaw(), '{ not json', 'the unparseable file is never rewritten');
   assert.deepEqual(shimCalls(), [], 'configure is never invoked after a settings failure');
@@ -520,16 +527,19 @@ test('configure failure leaves mode, settings, and config untouched', async () =
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
   const before = settingsRaw();
   process.env.HERDR_SHIM_EXIT = '1';
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'enable');
+  const result = await slot.sidebar.apply('gentle', h.ctx);
   delete process.env.HERDR_SHIM_EXIT;
-  assert.equal(h.notices.at(-1)[1], 'error');
-  assert.match(h.notices.at(-1)[0], /re-run|recover|resolve/i, 'explicit recoverable state');
-  assert.equal(readMode(), null, 'mode never committed without completion proof');
+  assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: false, needsReload: false });
+  assert.match(result.text, /customize|converge/i, 'explicit recoverable state');
+  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'mode never committed without completion proof');
   assert.equal(settingsRaw(), before, 'settings untouched when completion fails first');
   assert.ok(!fs.existsSync(markerFile), 'no orphaned ownership record');
   assert.equal(configRaw(), null, 'config untouched');
@@ -597,7 +607,7 @@ test('package disable reload failure restores exclusion, mode, and rows', async 
   }
 });
 
-test('malformed mode is reported and never publishes: toggle refuses, producer stays silent', async () => {
+test('malformed mode reads as native and a native apply writes nothing', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir();
@@ -606,15 +616,17 @@ test('malformed mode is reported and never publishes: toggle refuses, producer s
   const beforeSettings = settingsRaw();
   const h = harness();
   factory(h.pi);
+  const slot = slotOf();
 
-  await run(h, 'toggle');
-  assert.equal(h.notices.at(-1)[1], 'error');
-  assert.match(h.notices.at(-1)[0], /malformed|invalid/i);
+  // Malformed never enables (fail closed): the panel marks Gentle inactive
+  // and applying the read value is a no-op (the old `toggle` refusal and
+  // `status` report died with the command; read-only reporting lives on
+  // as `customize status`).
+  assert.equal(slot.sidebar.read(), 'native');
+  const result = await slot.sidebar.apply('native', h.ctx);
+  assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: false, needsReload: false });
   assert.equal(settingsRaw(), beforeSettings, 'no settings mutation on malformed mode');
   assert.deepEqual(shimCalls(), [], 'no herdr invoke on malformed mode');
-
-  await run(h, 'status');
-  assert.match(h.notices.at(-1)[0], /malformed|invalid|unknown/i);
 });
 
 test('disabled producer publishes nothing and claims no native lifecycle', async () => {
@@ -682,23 +694,31 @@ test('disabled producer publishes nothing and claims no native lifecycle', async
   }
 });
 
-test('sidebar work leaves the Moshi switch untouched and registered', async () => {
-  const { default: factory } = await factoryPromise;
+test('sidebar work leaves the Moshi switch untouched; both providers share the slot', async () => {
+  const loaded = await factoryPromise;
+  const factory = loaded.default;
+  // Stubbed S38 prerequisites (never a real spawn): CLI present, paired.
+  loaded.setMoshiHookResolver(() => '/test-only/moshi-hook');
+  loaded.setMoshiStatusRunner(() => ({ ok: true }));
   resetState();
   resetAgentDir();
   const h = harness();
   factory(h.pi);
-  assert.ok(h.commands.has(MOSHI_COMMAND), 'Moshi command still registered');
+  const slot = slotOf();
+  assert.ok(slot.moshi && typeof slot.moshi.apply === 'function', 'the moshi provider shares the slot');
 
-  await run(h, 'enable');
-  assert.equal(readMode().enabled, true);
+  const result = await slot.sidebar.apply('native', h.ctx);
+  assert.equal(result.changed, true);
+  assert.deepEqual(readMode(), { version: 1, enabled: false });
   const moshiFlag = path.join(stateDir, 'gentle-moshi.json');
-  assert.ok(!fs.existsSync(moshiFlag), 'sidebar enable never writes the Moshi flag');
+  assert.ok(!fs.existsSync(moshiFlag), 'sidebar apply never writes the Moshi flag');
 
-  await h.commands.get(MOSHI_COMMAND).handler('enable', h.ctx);
-  assert.equal(JSON.parse(fs.readFileSync(moshiFlag, 'utf8')).enabled, true, 'Moshi enable still works');
-  await h.commands.get(MOSHI_COMMAND).handler('status', h.ctx);
-  assert.match(h.notices.at(-1)[0], /moshi/i);
+  const moshi = await slot.moshi.apply('on', h.ctx);
+  assert.equal(moshi.changed, true, 'moshi apply still works through the slot');
+  assert.equal(JSON.parse(fs.readFileSync(moshiFlag, 'utf8')).enabled, true);
+  assert.equal(slot.moshi.read(), 'on');
+  loaded.setMoshiHookResolver(null);
+  loaded.setMoshiStatusRunner(null);
 });
 
 test('loads without registerCommand (older/limited hosts)', async () => {
@@ -707,6 +727,7 @@ test('loads without registerCommand (older/limited hosts)', async () => {
   resetAgentDir();
   const h = harness({ withCommand: false });
   assert.doesNotThrow(() => factory(h.pi));
+  assert.ok(slotOf().sidebar, 'the provider slot registers without commands');
 });
 
 test('package CLI status is read-only: exit 0, no writes', async () => {

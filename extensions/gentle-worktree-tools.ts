@@ -371,7 +371,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; run /herdr-gentle:worktree enabled to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
       { state: modeState ? modeState.state : "unknown", branch, issues },
     );
   }
@@ -1275,7 +1275,7 @@ async function executeWorktreeList(params, ctx) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; run /herdr-gentle:worktree enabled to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
       { state: modeState ? modeState.state : "unknown", tool: "worktree_list" },
     );
   }
@@ -2265,7 +2265,7 @@ async function executeWorktreeClose(params, ctx, opts) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; run /herdr-gentle:worktree enabled to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
       { state: modeState ? modeState.state : "unknown", tool: "worktree_close" },
     );
   }
@@ -3258,7 +3258,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; run /herdr-gentle:worktree enabled to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
       { state: modeState ? modeState.state : "unknown", tool: "worktree_session_open" },
     );
   }
@@ -3781,7 +3781,7 @@ async function executeWorktreeWarpTool(params, ctx, opts) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; run /herdr-gentle:worktree enabled to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
       { state: modeState ? modeState.state : "unknown", tool: "worktree_warp" },
     );
   }
@@ -6901,92 +6901,6 @@ function setCustomizeTuiLoader(loader) {
   customizeTuiLoader = loader;
 }
 
-function worktreeStatusMessage(modeState, toolsRegistered) {
-  const state = !modeState || typeof modeState.state !== "string"
-    ? "unknown (mode file unreadable)"
-    : modeState.state === "missing"
-      ? "enabled (default; no mode file)"
-      : modeState.state === "malformed"
-        ? "unknown (mode file malformed)"
-        : modeState.state;
-  const registered = toolsRegistered ? "yes" : "no";
-  let reload = "unknown";
-  try {
-    reload = (modeState && modeState.enabled === true) !== toolsRegistered ? "yes" : "no";
-  } catch {
-    reload = "unknown";
-  }
-  return `Worktree tools are ${state} (tools registered: ${registered}; /reload needed: ${reload}). Use /herdr-gentle:worktree enabled|disabled|status|warp <name>.`;
-}
-
-// Registered before any gate on purpose (like the sidebar toggle): the
-// switch belongs to the Pi session, so it must exist even while the tools
-// themselves are unregistered. Hosts without commands simply skip it.
-function registerWorktreeCommand(pi, toolsRegistered) {
-  if (typeof pi?.registerCommand !== "function") return;
-  pi.registerCommand("herdr-gentle:worktree", {
-    description: "Manage agent worktrees: turn the worktree tools on or off, check their status, or warp this session to a named checkout",
-    handler: async (args, ctx) => {
-      const notify = ctx?.ui?.notify;
-      const raw = String(args ?? "").trim();
-      const parts = raw.split(/\s+/).filter((part) => part.length > 0);
-      const head = (parts[0] || "").toLowerCase();
-      // S23: the warp verb moves the SESSION to the named checkout. It
-      // resolves through the same name resolver as the listing and the
-      // close-by-name path, and reports the outcome as a notification.
-      if (head === "warp") {
-        const target = parts[1] || "";
-        if (!target || parts.length > 2) {
-          notify?.("worktree warp needs exactly one name: use /herdr-gentle:worktree warp <name> (the flattened branch slug, or principal).", "error");
-          return;
-        }
-        const out = await executeWorktreeWarp(target, ctx);
-        notify?.(out.text, out.isError ? "error" : "info");
-        return;
-      }
-      let verb = head;
-      if (verb === "enable") verb = "enabled";
-      if (verb === "disable") verb = "disabled";
-      if (verb !== "enabled" && verb !== "disabled" && verb !== "status") {
-        notify?.(`Unknown option "${raw}". Use /herdr-gentle:worktree enabled|disabled|status|warp <name>.`, "error");
-        return;
-      }
-      const mode = libRequire("worktree-mode.js");
-      if (verb === "status") {
-        let state;
-        try {
-          state = mode.readMode();
-        } catch {
-          state = { state: "malformed", enabled: false };
-        }
-        notify?.(worktreeStatusMessage(state, toolsRegistered), "info");
-        return;
-      }
-      const enabled = verb === "enabled";
-      try {
-        mode.writeMode(enabled, process.env);
-      } catch (err) {
-        notify?.(`Could not write ${mode.modePath(process.env)}: ${(err && err.message) || err}`, "error");
-        return;
-      }
-      // Registration changes apply on `/reload`: enabling a session that
-      // loaded while disabled (or vice versa) only takes full effect after
-      // one, while repeating the already-loaded state needs none.
-      const needsReload = enabled !== toolsRegistered;
-      notify?.(
-        enabled
-          ? (needsReload
-            ? "Worktree tools enabled. Sessions already running need /reload to register the tools."
-            : "Worktree tools enabled (already registered in this session; no /reload needed).")
-          : (needsReload
-            ? "Worktree tools disabled. Sessions already running need /reload to unload the tools (calls stay blocked until then)."
-            : "Worktree tools disabled (already unregistered in this session; no /reload needed)."),
-        "info",
-      );
-    },
-  });
-}
-
 const CUSTOMIZE_CATEGORIES = [
   {
     id: "sidebar",
@@ -7570,17 +7484,16 @@ export default function (pi) {
   // notify through this host object.
   sessionNotifyPi = pi;
   // Load-time gate (D9): missing means enabled, malformed never enables.
-  // The toggle command and the customize panel always stay registered so
-  // the mode can be flipped back; the current registration state feeds
-  // the panel's worktree rows and `customize status` (mode state, what is
-  // active, whether a reload is needed).
+  // The customize panel always stays registered so the mode can be
+  // flipped back; the current registration state feeds its worktree rows
+  // and `customize status` (mode state, what is active, whether a reload
+  // is needed).
   let toolsRegistered = false;
   try {
     toolsRegistered = libRequire("worktree-mode.js").readMode().enabled === true;
   } catch {
     toolsRegistered = false;
   }
-  registerWorktreeCommand(pi, toolsRegistered);
   registerWarpCommand(pi);
   registerWarpMessageRenderer(pi);
   registerCustomizeCommand(pi, toolsRegistered);

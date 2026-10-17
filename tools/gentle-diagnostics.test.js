@@ -211,7 +211,7 @@ describe('doctor sidebar-mode handoff', () => {
     const before = stateSnapshot();
     const r = run(DOCTOR, []);
     assert.equal(r.status, 1);
-    assert.equal(r.stdout, 'fail: sidebar mode invalid (Gentle publishing disabled)\nremedy: inspect gentle-sidebar-mode.json and /herdr-gentle:sidebar status before changing modes\n');
+    assert.equal(r.stdout, 'fail: sidebar mode invalid (Gentle publishing disabled)\nremedy: inspect gentle-sidebar-mode.json and /herdr-gentle:customize status before changing modes\n');
     assert.equal(r.stderr, 'gentle-doctor: one or more checks failed\n');
     assert.equal(callCount(), 0);
     assert.deepEqual(stateSnapshot(), before);
