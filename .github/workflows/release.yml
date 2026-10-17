@@ -6,7 +6,7 @@ name: Release
 #
 # Tag series (exactly two, strict semver, no prerelease or build metadata):
 #   pi-vX.Y.Z     the Pi package (package.json, npm name
-#                 @jonasotoaguilar/herdr-gentle-agents). Runs the shared gate,
+#                 @jonasotoaguilar/herdr-gentle-shell). Runs the shared gate,
 #                 publishes the npm package, AND creates the GitHub Release
 #                 with the installer assets.
 #   herdr-vX.Y.Z  the Herdr plugin (herdr-plugin/herdr-plugin.toml). Runs the

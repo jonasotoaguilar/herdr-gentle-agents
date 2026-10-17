@@ -3,7 +3,7 @@
 #
 # Tag series (exactly two, strict semver, no prerelease or build metadata):
 #   pi-vX.Y.Z     the Pi package (repository root, package.json,
-#                 npm name @jonasotoaguilar/herdr-gentle-agents).
+#                 npm name @jonasotoaguilar/herdr-gentle-shell).
 #                 Publishes the npm package AND the GitHub Release with the
 #                 installer assets, so releases/latest/download/install.sh
 #                 keeps resolving after either series.

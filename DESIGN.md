@@ -1,4 +1,4 @@
-# herdr-gentle-agents — DESIGN.md (Task 4, as implemented)
+# herdr-gentle-shell — DESIGN.md (Task 4, as implemented)
 
 Status protocol for the Herdr sidebar: producer (Pi sidecar extension) →
 pane-metadata tokens → consumer (plugin daemon) → sidebar state + badges.
@@ -564,10 +564,11 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   stays in-flow/native; `error` is visible as sidebar state (native `blocked`
   attention on `herdr:blocked` already fires per E9 — the plugin adds no
   toast path).
-- Optional Moshi replacement (off by default): `/herdr-gentle:moshi` —
-  registered by the producer extension, which owns the flag file
-  `gentle-moshi.json` in the plugin state root — takes `enable` / `disable` /
-  `status` (no argument opens a selector with those three options). With it
+- Optional Moshi replacement (off by default): the `Moshi notifications`
+  rows of `/herdr-gentle:customize` (`On` / `Off`; read-only state via
+  `customize status`) — driven by the producer extension through its
+  provider slot (see below), which owns the flag file
+  `gentle-moshi.json` in the plugin state root. With it
   on, the producer extension replaces the Moshi-managed Pi hook entirely: it
   speaks the same wire protocol (category-less `session.update` carriers plus
   categorized events over the Moshi daemon socket), so Chat View, Live
@@ -606,11 +607,12 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   unverified): the phone-side approval round-trip through Moshi's TUI bridge,
   the Live Activity lifecycle, and whether a `task_complete` renders as a
   separate banner or only updates a running Live Activity are Moshi's.
-- Mid-session enable needs `/reload`: enabling the toggle activates our
-  sender immediately, but an already-running Pi session keeps the original
-  hook loaded until it reloads — both would notify in that window. The
-  enable notice warns about it; fresh sessions are single-emitter by
-  construction (exclusion record + flag).
+- Mid-session enable reloads automatically when the Pi settings exclusion
+  actually changed: the panel applies the change first, then calls
+  `ctx.reload()` itself — no surface ever asks the user to run `/reload`.
+  The flag itself is re-read per event, so our sender reacts immediately;
+  fresh sessions are single-emitter by construction (exclusion record +
+  flag).
 - Gentle mode is enabled by default: while selected, the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq seeded from the clock as
 `Date.now() * 1000` exactly like Herdr's own plugin SDK, serial latest-wins
 coalesced queue, bounded retries; never `done`/`finished`, never a
@@ -622,13 +624,39 @@ the producer keeps beating for the new one — the consumer then rejects those
 fresh tokens as a session-hash mismatch and the pane stays on `idle` until a
 report with a higher seq lands. Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once with no re-emit on repeat settles). Live background jobs come from Gentle Shell's own bus event `gentle-ai:jobs-sidebar` (`bash_background` / `monitor`), session-scoped; an absent Gentle Shell simply reports none (today's behavior). `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Single publisher by design: the managed native extension file is excluded
   reversibly (`-extensions/herdr-agent-state.ts` in Pi settings, bytes
-  preserved on disk, never auto-loaded next to ours). `/herdr-gentle:sidebar`
-  accepts `toggle`, `enable`, `disable`, and read-only `status`; disable gates
+  preserved on disk, never auto-loaded next to ours). The `Agentes sidebar`
+  rows of `/herdr-gentle:customize` (`Gentle (this extension)` / `Native
+  Herdr`, plus read-only `customize status`) select the publisher: native
+  gates
   our producer/daemon, removes only our ownership-bound native exclusion and
-  managed sidebar rows, and reports the Pi `/reload` requirement. Its shared
+  managed sidebar rows, and reloads the extension runtime automatically
+  (every sidebar switch needs it — the exclusion and the native sidebar
+  only take effect on the next Pi extension load). Its shared
   `gentle-sidebar-mode.json` uses `{version:1,enabled:boolean}`; missing means
   enabled, malformed fails closed. Never run both publishers on the same pane
   (dual publishers collide). See [docs/sidebar-control.md](docs/sidebar-control.md). Limits (unverified, host-owned): the host `idle`->`done`->`finished` mapping (finished text, toast/sound) and unknown-state handling are owned by Herdr.
+
+### Customize panel contract
+
+`/herdr-gentle:customize` is the single surface for the three switches
+(sidebar, Moshi, worktree tools); `/herdr-gentle:warp <name>` moves the
+session between checkouts. The sidebar and Moshi actions stay inline in
+the producer extension (`extensions/gentle-herdr-state.ts`) and are
+reached through one in-process provider slot,
+`globalThis[Symbol.for("herdr-gentle.customize.v1")]`, written once at
+load as `{sidebar:{read,apply}, moshi:{read,apply}}` — the single
+cross-extension contract (`Symbol.for` yields the same symbol in both
+modules without a shared import, so the key literal is the contract).
+`read()` returns the active value id; `apply(value, ctx)` reuses the
+existing paths unchanged and returns `{changed, needsReload, text}`.
+Reload matrix: sidebar ALWAYS (the Pi settings exclusion and the native
+sidebar only take effect on the next Pi extension load), Moshi only when
+the exclusion entry actually changed (the flag itself is re-read per
+event), worktree tools only when the runtime registration must change
+(`enabled !== toolsRegistered`). Ordering is mandatory: the panel closes
+first (`done()`), then the notification, then `await ctx.reload()` — no
+surface ever asks the user to run `/reload`. A missing or malformed
+provider renders its category unavailable and `Enter` writes nothing.
 
 ## 8. Limits
 
@@ -694,11 +722,11 @@ report with a higher seq lands. Parity contract: `working` carries the specific 
   versioning (not sidebar-config versioning) is the compatibility mechanism.
 - Packaging (two-package split): the repository ships two independently
   versioned packages — the Pi package at the repository root (published to
-  npm as `@jonasotoaguilar/herdr-gentle-agents`, installed with
+  npm as `@jonasotoaguilar/herdr-gentle-shell`, installed with
   `pi install`, updated with `pi update --extensions`) and the Herdr plugin
   in `herdr-plugin/` (installed with `herdr plugin install
   jonasotoaguilar/herdr-gentle-agents/herdr-plugin`, updated with
-  `herdr plugin update herdr-gentle-agents`). Releases run on two tag
+  `herdr plugin update herdr-gentle-shell`). Releases run on two tag
   series, `pi-vX.Y.Z` and `herdr-vX.Y.Z`; the Herdr side is not bumped when
   it carries no change. The old managed-copy install (the installer copying
   `extensions/gentle-herdr-state.ts` into the Pi agent dir) is retired: the
@@ -771,8 +799,9 @@ list, not silent.
 
 Agent-callable worktrees: `worktree_create` / `worktree_list` /
 `worktree_close` as Pi extension tools (`extensions/gentle-worktree-tools.ts`,
-listed in the Pi package's `pi.extensions`), plus the
-`/herdr-gentle:worktree enabled|disabled|status` mode command. Surface is
+listed in the Pi package's `pi.extensions`), plus the `Worktree tools`
+rows of `/herdr-gentle:customize` (`Enabled` / `Disabled`, plus read-only
+`customize status`). Surface is
 extension tools via `pi.registerTool()` — codemode is a QuickJS sandbox
 with no filesystem, network, or timers and adds no tools, so it cannot
 implement this; it may call these tools. Normative detail (parameters,
@@ -825,13 +854,15 @@ replaced.
 
 ### Mode gate
 
-The `/herdr-gentle:worktree` command follows the `/herdr-gentle:sidebar`
-pattern: a shared mode file (`gentle-worktree-mode.json`,
+The `Worktree tools` rows of `/herdr-gentle:customize` flip a shared mode
+file (`gentle-worktree-mode.json`,
 `{version:1,enabled:boolean}`) in the plugin state directory, default
 enabled, malformed failing closed. Gating is two-level — load-time
-registration plus per-execution re-read — and the command itself always
+registration plus per-execution re-read — and the panel itself always
 stays registered so the mode can be flipped back. Registration changes
-apply on `/reload`, which the `status` verb reports. Create and close
+reload the extension runtime automatically when the registration must
+change (`enabled !== toolsRegistered`, i.e. enabling while the runtime
+loaded disabled or vice versa), which `customize status` reports. Create and close
 prompt for approval when the host offers dialog UI; list is read-only
 and never prompts.
 

@@ -584,7 +584,11 @@ describe('worktree_create hook wiring', { concurrency: false }, () => {
       const result = await tool.execute('call-1', { branch: 'feat/hooked', issues: [35] }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, `hooks must never fail creation: ${JSON.stringify(result)}`);
       const text = (result.content || []).map((p) => p.text || '').join('\n');
-      assert.equal(text, `worktree create: ${target}`);
+      assert.deepEqual(text.split('\n'), [
+        'created: feat-hooked · feat/hooked',
+        `path: ${target}`,
+        'issues: 35',
+      ]);
       // Hook side effects happened: the env copy lands, and S21 means no
       // odd/ symlink is created in the worktree.
       assert.equal(fs.readFileSync(path.join(target, '.env'), 'utf8'), 'HOOKED=1\n');
@@ -638,12 +642,315 @@ describe('worktree_create hook wiring', { concurrency: false }, () => {
       const result = await tool.execute('call-1', { branch: 'feat/hookfail', issues: [35] }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, 'hooks never turn success into error');
       const text = (result.content || []).map((p) => p.text || '').join('\n');
-      assert.equal(text, `worktree create: ${target}`);
+      assert.deepEqual(text.split('\n'), [
+        'created: feat-hookfail · feat/hookfail',
+        `path: ${target}`,
+        'issues: 35',
+      ]);
       const failed = (result.details.hooks.steps || []).filter((s) => s.status === 'failed');
       assert.ok(failed.length >= 1, `a failed step is visible: ${JSON.stringify(result.details.hooks.steps)}`);
       assert.ok((result.details.hooks.warnings || []).length >= 1, 'a warning is recorded');
     } finally {
       restoreEnv();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S63 freeze proof + async counterpart (T49, test-first RED).
+//
+// The public creation hook route must never run a long spawnSync on the
+// main thread: a slow child has to let Pi input/render/event-loop work
+// run WHILE it is still active. The sync contract stays exported
+// untouched; the async twin reuses the same detection/format pipeline.
+// ---------------------------------------------------------------------------
+
+describe('worktree-hooks: S63 event-loop stall proof (sync blocks)', { concurrency: false }, () => {
+  test('a slow sync hook runner blocks timers (the reported freeze)', () => {
+    const principal = makePrincipal('syncblock');
+    const worktree = addLinkedWorktree(principal, 'hooks/syncblock');
+    fs.writeFileSync(path.join(worktree, 'custom.lock'), 'x\n');
+    let heartbeats = 0;
+    const timer = setInterval(() => { heartbeats += 1; }, 10);
+    try {
+      const result = hooksLib().runCreationHooks({
+        principalRoot: principal,
+        worktreePath: worktree,
+        root: principal,
+        env: process.env,
+        unversionedCandidates: [],
+        installTable: [{ key: 'slow', markers: ['custom.lock'], argv: ['fake-slow', 'install'] }],
+        run: () => {
+          const start = Date.now();
+          while (Date.now() - start < 200) { /* busy-block the event loop like spawnSync does */ }
+          return { status: 0, stdout: '', stderr: '', error: null };
+        },
+        hasBinary: () => true,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(heartbeats, 0, 'no timer fired while the sync hook blocked the loop');
+    } finally {
+      clearInterval(timer);
+    }
+  });
+});
+
+describe('worktree-hooks: S63 async counterpart (nonblocking)', { concurrency: false }, () => {
+  test('runCreationHooksAsync is exported alongside the sync contract', () => {
+    const lib = hooksLib();
+    assert.equal(typeof lib.runCreationHooks, 'function', 'sync contract stays');
+    assert.equal(typeof lib.runCreationHooksAsync, 'function', 'async twin exists');
+  });
+
+  test('timers advance WHILE the slow async hook is still running', async () => {
+    const principal = makePrincipal('asyncbeat');
+    const worktree = addLinkedWorktree(principal, 'hooks/asyncbeat');
+    fs.writeFileSync(path.join(worktree, 'custom.lock'), 'x\n');
+    const lib = hooksLib();
+    let heartbeats = 0;
+    const timer = setInterval(() => { heartbeats += 1; }, 10);
+    try {
+      const pending = lib.runCreationHooksAsync({
+        principalRoot: principal,
+        worktreePath: worktree,
+        root: principal,
+        env: process.env,
+        unversionedCandidates: [],
+        timeoutMs: 5000,
+        installTable: [{ key: 'slow', markers: ['custom.lock'], argv: ['fake-slow', 'install'] }],
+        runAsync: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          return { status: 0, stdout: '', stderr: '', error: null };
+        },
+        hasBinary: () => true,
+      });
+      // Let the event loop turn while the child is still pending.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.ok(heartbeats > 0, `heartbeat ran while async hook pending (got ${heartbeats})`);
+      const result = await pending;
+      assert.equal(result.ok, true);
+      assert.ok((result.steps || []).some((s) => s.name === 'install:slow' && s.status === 'done'));
+    } finally {
+      clearInterval(timer);
+    }
+  });
+
+  test('async keeps exact step order, warnings and no skipped hooks vs sync', async () => {
+    const principal = makePrincipal('asyncparity');
+    const worktree = addLinkedWorktree(principal, 'hooks/asyncparity');
+    fs.writeFileSync(path.join(worktree, 'custom.lock'), 'x\n');
+    const lib = hooksLib();
+    const table = [
+      { key: 'custom', markers: ['custom.lock'], argv: ['custom-bin', 'sync'] },
+    ];
+    const syncRes = lib.runCreationHooks({
+      principalRoot: principal,
+      worktreePath: worktree,
+      root: principal,
+      env: process.env,
+      unversionedCandidates: [],
+      installTable: table,
+      run: (bin, args) => ({ status: 0, stdout: `${bin}`, stderr: '', error: null }),
+      hasBinary: (bin) => bin === 'custom-bin',
+    });
+    const asyncRes = await lib.runCreationHooksAsync({
+      principalRoot: principal,
+      worktreePath: worktree,
+      root: principal,
+      env: process.env,
+      unversionedCandidates: [],
+      installTable: table,
+      runAsync: async (bin) => ({ status: 0, stdout: `${bin}`, stderr: '', error: null }),
+      hasBinary: (bin) => bin === 'custom-bin',
+    });
+    assert.deepEqual(
+      (asyncRes.steps || []).map((s) => [s.name, s.status]),
+      (syncRes.steps || []).map((s) => [s.name, s.status]),
+    );
+    assert.deepEqual(asyncRes.warnings, syncRes.warnings);
+    assert.equal(asyncRes.ok, syncRes.ok);
+    const names = (asyncRes.steps || []).map((s) => s.name);
+    assert.ok(names.includes('copy-unversioned'), 'copy step kept');
+    assert.ok(names.some((n) => n.startsWith('install:')), 'install step kept');
+    assert.ok(names.includes('codegraph-init'), 'codegraph step kept, never silently skipped');
+  });
+
+  test('async timeout kills the owned child (no zombie, no hang)', async () => {
+    const principal = makePrincipal('asynckill');
+    const worktree = addLinkedWorktree(principal, 'hooks/asynckill');
+    fs.writeFileSync(path.join(worktree, 'custom.lock'), 'x\n');
+    let killed = false;
+    const fakeSpawn = () => {
+      const handlers = {};
+      const child = {
+        stdout: { on: () => {} },
+        stderr: { on: () => {} },
+        on: (ev, fn) => { handlers[ev] = fn; },
+        kill: () => { killed = true; if (handlers.close) handlers.close(null); return true; },
+      };
+      return child;
+    };
+    const lib = hooksLib();
+    const result = await lib.runCreationHooksAsync({
+      principalRoot: principal,
+      worktreePath: worktree,
+      root: principal,
+      env: process.env,
+      unversionedCandidates: [],
+      timeoutMs: 50,
+      installTable: [{ key: 'slow', markers: ['custom.lock'], argv: ['fake-slow', 'install'] }],
+      hasBinary: () => true,
+      spawnFn: fakeSpawn,
+    });
+    assert.equal(killed, true, 'the timed-out child was killed, not left running');
+    const step = (result.steps || []).find((s) => s.name === 'install:slow');
+    assert.ok(step && step.status === 'failed', 'timeout surfaces as failed, never silent success');
+  });
+
+  test('heartbeat advances during a slow async copy (meaningful, not only a sleep runner)', async () => {
+    const principal = makePrincipal('asynccopy');
+    const worktree = addLinkedWorktree(principal, 'hooks/asynccopy');
+    fs.writeFileSync(path.join(principal, 'custom.secret'), 'X=1\n');
+    const lib = hooksLib();
+    let heartbeats = 0;
+    const timer = setInterval(() => { heartbeats += 1; }, 10);
+    try {
+      const pending = lib.runCreationHooksAsync({
+        principalRoot: principal,
+        worktreePath: worktree,
+        root: principal,
+        env: process.env,
+        unversionedCandidates: ['custom.secret'],
+        installTable: [],
+        runAsync: async (bin, args) => ({ status: 1, stdout: '', stderr: '', error: null }),
+        hasBinary: () => false,
+        copyAsync: async (src, dest) => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          await fs.promises.copyFile(src, dest);
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.ok(heartbeats > 0, `heartbeat ran while the async copy was pending (got ${heartbeats})`);
+      const result = await pending;
+      assert.equal(result.ok, true);
+      assert.equal(fs.readFileSync(path.join(worktree, 'custom.secret'), 'utf8'), 'X=1\n', 'exact contents preserved');
+      assert.equal((result.steps || []).find((s) => s.name === 'copy-unversioned').status, 'done');
+    } finally {
+      clearInterval(timer);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S63 follow-up: owned-child cleanup proof (test-first RED).
+//
+// The effective production runner is `lib/worktree-git.js` runArgvAsync
+// (the wizard passes it as runAsync); the hooks default must share it.
+// A child that ignores SIGTERM — plus a background grandchild — must be
+// gone after the bounded settle, never left writing while the next step
+// proceeds. Real POSIX executables only (no Node-fake-only proof); on
+// win32 the group-containment branch is documented-unsupported and skipped.
+// ---------------------------------------------------------------------------
+
+function writeTermIgnorer(dir, tag) {
+  const pidFile = path.join(dir, `${tag}.pid`);
+  const gcPidFile = path.join(dir, `${tag}.grandchild.pid`);
+  const script = path.join(dir, `${tag}.sh`);
+  fs.writeFileSync(script, [
+    '#!/bin/sh',
+    `echo $$ > "${pidFile}"`,
+    `sleep 30 > /dev/null 2>&1 & echo $! > "${gcPidFile}"`,
+    `trap '' TERM`,
+    'wait',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { script, pidFile, gcPidFile };
+}
+
+function readPid(p) {
+  const n = Number(String(fs.readFileSync(p, 'utf8')).trim());
+  assert.ok(Number.isInteger(n) && n > 0, `expected a pid in ${p}`);
+  return n;
+}
+
+// ESRCH-polled: a freshly KILLed grandchild may need one scheduler turn
+// before init reaps it; never an unbounded wait.
+async function pidGone(pid, label) {
+  for (let i = 0; i < 40; i += 1) {
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+      alive = true;
+    } catch (err) {
+      alive = false;
+    }
+    if (!alive) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(`process still alive after escalation: ${label} pid ${pid}`);
+}
+
+describe('worktree-hooks: S63 owned-child cleanup (effective runner)', { concurrency: false }, () => {
+  test('git runArgvAsync reaps a SIGTERM-ignoring child AND its grandchild', async () => {
+    if (process.platform === 'win32') {
+      assert.ok(true, 'documented limitation: process-group containment is POSIX-only; grandchildren may survive on win32');
+      return;
+    }
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-own-')));
+    const { script, pidFile, gcPidFile } = writeTermIgnorer(dir, 'ignorer');
+    const gitLib = require('../lib/worktree-git.js');
+    const started = Date.now();
+    const result = await gitLib.runArgvAsync(script, [], { timeoutMs: 300, killGraceMs: 200 });
+    assert.equal(result.status, null, 'settles as a timeout, never a fake success');
+    assert.match(String(result.error || ''), /timed out/, 'timeout cause preserved');
+    assert.ok(Date.now() - started < 15000, 'bounded well under the 30s child lifetime');
+    await pidGone(readPid(pidFile), 'ignoring child');
+    await pidGone(readPid(gcPidFile), 'grandchild');
+  });
+
+  test('abort settles as aborted and leaves no child behind', async () => {
+    if (process.platform === 'win32') {
+      assert.ok(true, 'documented limitation: abort group containment is POSIX-only');
+      return;
+    }
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-abort-')));
+    const { script, pidFile } = writeTermIgnorer(dir, 'aborter');
+    const gitLib = require('../lib/worktree-git.js');
+    const ctl = new AbortController();
+    const pending = gitLib.runArgvAsync(script, [], { timeoutMs: 10000, killGraceMs: 200, signal: ctl.signal });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    ctl.abort();
+    const started = Date.now();
+    const result = await pending;
+    assert.match(String(result.error || ''), /aborted/i, 'abort cause preserved, never a hang to the 10s bound');
+    assert.ok(Date.now() - started < 8000, 'settles on abort, never waits out the timeout');
+    await pidGone(readPid(pidFile), 'aborted child');
+  });
+
+  test('hooks default runner shares the effective cleanup (real ignorer, no injected spawn)', async () => {
+    if (process.platform === 'win32') {
+      assert.ok(true, 'documented limitation: process-group containment is POSIX-only');
+      return;
+    }
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-hookown-')));
+    const { script, pidFile } = writeTermIgnorer(dir, 'hookignorer');
+    const principal = makePrincipal('hookown');
+    const worktree = addLinkedWorktree(principal, 'hooks/hookown');
+    fs.writeFileSync(path.join(worktree, 'custom.lock'), 'x\n');
+    const lib = hooksLib();
+    const result = await lib.runCreationHooksAsync({
+      principalRoot: principal,
+      worktreePath: worktree,
+      root: principal,
+      env: process.env,
+      unversionedCandidates: [],
+      timeoutMs: 300,
+      killGraceMs: 200,
+      installTable: [{ key: 'slow', markers: ['custom.lock'], argv: [script] }],
+      hasBinary: () => true,
+    });
+    const step = (result.steps || []).find((s) => s.name === 'install:slow');
+    assert.ok(step && step.status === 'failed', 'timeout surfaces as failed, never silent success');
+    await pidGone(readPid(pidFile), 'hooks ignoring child');
   });
 });

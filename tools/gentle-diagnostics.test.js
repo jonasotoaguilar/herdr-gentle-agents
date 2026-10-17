@@ -211,7 +211,7 @@ describe('doctor sidebar-mode handoff', () => {
     const before = stateSnapshot();
     const r = run(DOCTOR, []);
     assert.equal(r.status, 1);
-    assert.equal(r.stdout, 'fail: sidebar mode invalid (Gentle publishing disabled)\nremedy: inspect gentle-sidebar-mode.json and /herdr-gentle:sidebar status before changing modes\n');
+    assert.equal(r.stdout, 'fail: sidebar mode invalid (Gentle publishing disabled)\nremedy: inspect gentle-sidebar-mode.json and /herdr-gentle:customize status before changing modes\n');
     assert.equal(r.stderr, 'gentle-doctor: one or more checks failed\n');
     assert.equal(callCount(), 0);
     assert.deepEqual(stateSnapshot(), before);
@@ -228,6 +228,41 @@ describe('doctor sidebar-mode handoff', () => {
     assert.equal(r.stdout, `pass: daemon running (pid ${process.pid})\npass: 1/1 owned pane(s) with fresh activity\npass: managed sidebar override present\n`);
     assert.equal(r.stderr, '');
     assert.equal(callCount(), 1);
+    assert.deepEqual(stateSnapshot(), before);
+  });
+
+  it('injected new-id state dir keeps the stored pre-rename mode readable', () => {
+    const legacyDir = path.join(dir, 'xdg-state', 'herdr', 'plugins', 'herdr-gentle-agents');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
+    writeAgents([ownedEntry('wBG:p1', HASH_A, { stale: true })]);
+    const before = stateSnapshot();
+    const configBefore = fs.readFileSync(configFile, 'utf8');
+    const r = run(DOCTOR, [], {
+      GENTLE_STATUS_STATE_DIR: undefined,
+      HERDR_PLUGIN_STATE_DIR: path.join(dir, 'injected-shell'),
+    });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, 'pass: native sidebar selected (Gentle supervision inactive)\npass: agent snapshot available (1 pane(s))\n');
+    assert.equal(r.stderr, '');
+    assert.equal(callCount(), 1);
+    assert.deepEqual(stateSnapshot(), before);
+    assert.equal(fs.readFileSync(configFile, 'utf8'), configBefore);
+  });
+
+  it('explicit user state dir wins over injected and stored dirs', () => {
+    const legacyDir = path.join(dir, 'xdg-state', 'herdr', 'plugins', 'herdr-gentle-agents');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
+    fs.writeFileSync(path.join(stateDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: true }));
+    fs.writeFileSync(path.join(stateDir, 'gentle-status.pid'), String(process.pid));
+    writeAgents([ownedEntry('wBG:p1', HASH_A)]);
+    fs.writeFileSync(configFile, '# BEGIN herdr-gentle-agents (managed; do not edit)\n[ui.sidebar.agents.rows_by_agent]\n# END herdr-gentle-agents\n');
+    const before = stateSnapshot();
+    const r = run(DOCTOR, [], { HERDR_PLUGIN_STATE_DIR: path.join(dir, 'injected-shell') });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, `pass: daemon running (pid ${process.pid})\npass: 1/1 owned pane(s) with fresh activity\npass: managed sidebar override present\n`);
+    assert.equal(r.stderr, '');
     assert.deepEqual(stateSnapshot(), before);
   });
 });
@@ -644,5 +679,230 @@ describe('C1 trace disappeared-agent merge', () => {
     assert.deepEqual(JSON.parse(r.stdout), { ok: false, error: 'pane_not_found', pane_id: 'wBG:p1' });
     assert.ok(!r.stdout.includes(evil) && !r.stderr.includes(evil), 'malformed ledger bait leaked');
     assert.equal(callCount(), 1);
+  });
+});
+
+// S15 identity rename: the daemon shares the stored-dir fallback contract
+// (same rule as diagnostics and the sidebar provider). Required directly
+// from the daemon module because no CLI flag observes the mode read: the
+// module has no load-time side effects (main is require-guarded).
+describe('daemon stored-dir fallback (S15)', () => {
+  it('reads the stored pre-rename mode under an injected new-id dir', () => {
+    const status = require('../herdr-plugin/bin/gentle-status.js');
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-daemon-state-'));
+    const legacyDir = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
+    const saved = {
+      GENTLE_STATUS_STATE_DIR: process.env.GENTLE_STATUS_STATE_DIR,
+      HERDR_PLUGIN_STATE_DIR: process.env.HERDR_PLUGIN_STATE_DIR,
+      XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+    };
+    delete process.env.GENTLE_STATUS_STATE_DIR;
+    process.env.HERDR_PLUGIN_STATE_DIR = path.join(sandbox, 'injected-shell');
+    process.env.XDG_STATE_HOME = sandbox;
+    try {
+      assert.deepEqual(status.readSidebarMode(), { enabled: false, malformed: false, raw: null });
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the explicit user state dir without fallback', () => {
+    const status = require('../herdr-plugin/bin/gentle-status.js');
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-daemon-state-'));
+    const legacyDir = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
+    const explicitDir = path.join(sandbox, 'explicit');
+    fs.mkdirSync(explicitDir, { recursive: true });
+    fs.writeFileSync(path.join(explicitDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: true }));
+    const saved = {
+      GENTLE_STATUS_STATE_DIR: process.env.GENTLE_STATUS_STATE_DIR,
+      HERDR_PLUGIN_STATE_DIR: process.env.HERDR_PLUGIN_STATE_DIR,
+      XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+    };
+    process.env.GENTLE_STATUS_STATE_DIR = explicitDir;
+    process.env.HERDR_PLUGIN_STATE_DIR = path.join(sandbox, 'injected-shell');
+    process.env.XDG_STATE_HOME = sandbox;
+    try {
+      assert.deepEqual(status.readSidebarMode(), { enabled: true, malformed: false, raw: null });
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+});
+
+/* S15 daemon pid placement (black-box): the started daemon must write its
+   pidfile into the stored dir when stored holds only the worktree disabled
+   flag, keep the flag disabled across pid creation, and stop without
+   orphans. Fully isolated (HOME/XDG/config/socket/fake herdr); the host
+   daemon is never touched. */
+const DAEMON_BIN = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-status.js');
+const FAKE_DAEMON_HERDR = `#!/bin/sh
+if [ "$1" = "agent" ] && [ "$2" = "list" ]; then printf '{"result":{"agents":[]}}\\n'; exit 0; fi
+if [ "$1" = "pane" ] && [ "$2" = "list" ]; then printf '{"result":{"panes":[]}}\\n'; exit 0; fi
+echo "fake-herdr: unknown command $*" >&2
+exit 1
+`;
+
+function cmdlineNamesUs(pid) {
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('gentle-status.js');
+  } catch {
+    return false;
+  }
+}
+
+async function pollFor(fn, timeoutMs, label) {
+  const start = Date.now();
+  for (;;) {
+    const got = fn();
+    if (got) return got;
+    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+describe('daemon pid placement under an injected dir (S15)', () => {
+  it('starts stored, stays disabled across pid creation, stops without orphans', async () => {
+    const modeLib = require('../lib/worktree-mode.js');
+    const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-daemon-bb-'));
+    const xdg = path.join(sb, 'xdg');
+    const stored = path.join(xdg, 'herdr', 'plugins', 'herdr-gentle-agents');
+    const injected = path.join(sb, 'injected-shell');
+    fs.mkdirSync(stored, { recursive: true });
+    fs.mkdirSync(injected, { recursive: true });
+    fs.writeFileSync(path.join(stored, 'gentle-worktree-mode.json'), JSON.stringify({ version: 1, enabled: false }));
+    const fake = path.join(sb, 'herdr');
+    fs.writeFileSync(fake, FAKE_DAEMON_HERDR, { mode: 0o755 });
+    const env = { ...process.env };
+    delete env.GENTLE_STATUS_STATE_DIR;
+    Object.assign(env, {
+      HOME: sb,
+      XDG_STATE_HOME: xdg,
+      HERDR_PLUGIN_STATE_DIR: injected,
+      HERDR_BIN_PATH: fake,
+      HERDR_SOCKET_PATH: path.join(sb, 'no-socket.sock'),
+      HERDR_CONFIG_PATH: path.join(sb, 'config.toml'),
+      COLUMNS: '80',
+    });
+    const fb = { HERDR_PLUGIN_STATE_DIR: injected, XDG_STATE_HOME: xdg };
+    const storedPid = path.join(stored, 'gentle-status.pid');
+    const injectedPid = path.join(injected, 'gentle-status.pid');
+    const readPids = () => {
+      const out = [];
+      for (const file of [storedPid, injectedPid]) {
+        try {
+          const n = Number(fs.readFileSync(file, 'utf8').trim());
+          if (Number.isSafeInteger(n) && n > 0 && cmdlineNamesUs(n)) out.push(n);
+        } catch {
+          // Absent or foreign; never kill blindly.
+        }
+      }
+      return out;
+    };
+    assert.deepEqual(modeLib.readMode(fb), { state: 'disabled', enabled: false }, 'pre-start disabled');
+    try {
+      const start = spawnSync('node', [DAEMON_BIN], { encoding: 'utf8', timeout: 15000, env });
+      assert.equal(start.status, 0, `ensure failed: stdout=${start.stdout} stderr=${start.stderr}`);
+      await pollFor(() => {
+        try {
+          fs.readFileSync(storedPid, 'utf8');
+          return true;
+        } catch {
+          return null;
+        }
+      }, 10000, 'stored pidfile');
+      const pid = Number(fs.readFileSync(storedPid, 'utf8').trim());
+      assert.ok(Number.isSafeInteger(pid) && pid > 0, 'stored pid parses');
+      assert.doesNotThrow(() => process.kill(pid, 0), 'daemon child is alive');
+      assert.deepEqual(modeLib.readMode(fb), { state: 'disabled', enabled: false }, 'disabled after pid creation');
+      assert.ok(!fs.existsSync(injectedPid), 'no pidfile leaks into the injected dir');
+    } finally {
+      try {
+        const stop = spawnSync('node', [DAEMON_BIN, '--stop'], { encoding: 'utf8', timeout: 15000, env });
+        for (const pid of readPids()) {
+          try {
+            process.kill(pid, 0);
+          } catch {
+            continue;
+          }
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            // Already gone; the death poll below is authoritative.
+          }
+        }
+        await pollFor(() => (readPids().length === 0 ? true : null), 5000, 'daemon death');
+        assert.ok(!fs.existsSync(storedPid) && !fs.existsSync(injectedPid), 'no pidfile remains');
+        assert.equal(stop.status, 0, `stop failed: stdout=${stop.stdout} stderr=${stop.stderr}`);
+      } finally {
+        fs.rmSync(sb, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+describe('daemon resolver on explicit empty GENTLE (S15)', () => {
+  it('keeps the stored dir instead of an injected dir holding flags', () => {
+    const status = require('../herdr-plugin/bin/gentle-status.js');
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-daemon-empty-'));
+    const stored = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-agents');
+    fs.mkdirSync(stored, { recursive: true });
+    fs.writeFileSync(path.join(stored, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
+    const injected = path.join(sandbox, 'injected-shell');
+    fs.mkdirSync(injected, { recursive: true });
+    fs.writeFileSync(path.join(injected, 'gentle-status.pid'), '123456\n');
+    const saved = {
+      GENTLE_STATUS_STATE_DIR: process.env.GENTLE_STATUS_STATE_DIR,
+      HERDR_PLUGIN_STATE_DIR: process.env.HERDR_PLUGIN_STATE_DIR,
+      XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+    };
+    process.env.GENTLE_STATUS_STATE_DIR = '';
+    process.env.HERDR_PLUGIN_STATE_DIR = injected;
+    process.env.XDG_STATE_HOME = sandbox;
+    try {
+      assert.deepEqual(status.readSidebarMode(), { enabled: false, malformed: false, raw: null });
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('still honors an injected dir holding flags when GENTLE is omitted', () => {
+    const status = require('../herdr-plugin/bin/gentle-status.js');
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-daemon-omit-'));
+    const injected = path.join(sandbox, 'injected-shell');
+    fs.mkdirSync(injected, { recursive: true });
+    fs.writeFileSync(path.join(injected, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: true }));
+    const saved = {
+      GENTLE_STATUS_STATE_DIR: process.env.GENTLE_STATUS_STATE_DIR,
+      HERDR_PLUGIN_STATE_DIR: process.env.HERDR_PLUGIN_STATE_DIR,
+      XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+    };
+    delete process.env.GENTLE_STATUS_STATE_DIR;
+    process.env.HERDR_PLUGIN_STATE_DIR = injected;
+    process.env.XDG_STATE_HOME = sandbox;
+    try {
+      assert.deepEqual(status.readSidebarMode(), { enabled: true, malformed: false, raw: null });
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 });

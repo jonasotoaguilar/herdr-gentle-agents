@@ -12,7 +12,7 @@ labels, or review verdicts. Herdr is reached only through fixed-argv
   (signal 0; presence alone is not liveness), producer/token freshness
   from one `herdr agent list` snapshot, managed sidebar override marker
   scan. Prints `pass:`/`warn:`/`fail:` lines plus actionable `remedy:`
-  lines. When `/herdr-gentle:sidebar disable` selects native mode, skips
+  lines. When native mode is selected in `/herdr-gentle:customize`, skips
   inactive Gentle daemon/producer/override checks and still checks snapshot
   availability. An invalid mode file fails closed without exposing its contents.
   Exit 0 pass/warn only, 1 any fail or failed snapshot, 2 bad args.

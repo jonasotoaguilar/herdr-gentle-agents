@@ -205,7 +205,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { generateUnifiedPatch } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { delimiter as pathDelimiter, dirname, join, resolve as resolvePath, relative as pathRelative, basename as pathBasename, isAbsolute as pathIsAbsolute } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 // Inlined presence reconciliation (T1). Single-file deployment boundary:
 // the installed copy/symlink of this file ships WITHOUT the sibling
@@ -1006,15 +1006,14 @@ export function computeNativeState({
 }
 
 // ---------------------------------------------------------------------------
-// Session-changes aggregation (G1/G2: transcript facts only, never git)
+// Live session-changes metric (S62: authoritative publisher, never transcript)
 //
-// Mirrors the Gentle Shell SessionChanges model semantics over the same
-// SESSION_CHANGE_ENTRY evidence: files keyed by (root, path), evidence-ID
-// dedup, identical before/after records skipped, first before preserved with
-// latest after, unavailable on broken snapshot continuity or any
-// kind:unavailable snapshot (unavailable files stay in the file count with
-// 0 added/0 deleted), and unified-patch line accounting for available
-// text/absent snapshots (absent maps to empty text for patch counts).
+// Gentle-shell shows the CURRENT working tree against HEAD for the session's
+// subscribed roots. The transcript aggregate below (aggregateChanges over
+// SESSION_CHANGE_ENTRY before/after patches) is retained as legacy evidence
+// for other needs but is NOT the publisher authority: beats publish the
+// live Git scan instead, so external/untracked edits and scope registration
+// reflect immediately with numerical equality to the reference.
 // ---------------------------------------------------------------------------
 
 function sameSnapshot(before, after) {
@@ -1139,6 +1138,254 @@ function aggregateChanges(entries, sessionId) {
 }
 
 // ---------------------------------------------------------------------------
+// Live Git scope + scan (S62, mirrored from gentle-shell shell-changes.ts +
+// session-changes.ts + bounded-writer-admission.ts). Self-contained like the
+// rest of this file: no relative imports. lib/live-session-changes.js is the
+// extracted canonical copy; this inline mirror keeps the installed single-file
+// copy working with zero sibling files. A parity test pins them equal.
+// Reference argv, never -z/-M on numstat: `diff --numstat HEAD` +
+// `status --porcelain=v1 --untracked-files=all -z`.
+// ---------------------------------------------------------------------------
+
+const LIVE_GIT_TIMEOUT_MS = 5000;
+const LIVE_DIFF_MAX_BYTES = 1024 * 1024;
+const LIVE_NUMSTAT_ARGS = ["diff", "--numstat", "HEAD"];
+const LIVE_PORCELAIN_ARGS = ["status", "--porcelain=v1", "--untracked-files=all", "-z"];
+const LIVE_SESSION_WORKTREE_ENTRY = "gentle-pi.session-worktree/v1";
+const LIVE_STATUS_BY_CODE = { A: "added", D: "deleted", R: "renamed", C: "added", "?": "untracked" };
+const LIVE_RENAME_BRACES = /\{([^{}]*) => ([^{}]*)\}/g;
+const LIVE_HAS_RENAME_BRACES = /\{[^{}]* => [^{}]*\}/;
+const LIVE_RENAME_ARROW = " => ";
+const LIVE_BROAD_HOME_FOLDER = /^(?:documents|desktop|downloads|onedrive(?: - .+)?)$/i;
+const LIVE_BROAD_ONEDRIVE_FOLDER = /^(?:documents|desktop)$/i;
+
+export function liveRenamedPath(p) {
+  if (LIVE_HAS_RENAME_BRACES.test(p)) return p.replace(LIVE_RENAME_BRACES, "$2").replace(/\/\//g, "/");
+  const arrow = p.indexOf(LIVE_RENAME_ARROW);
+  return arrow === -1 ? p : p.slice(arrow + LIVE_RENAME_ARROW.length);
+}
+
+export function liveCount(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export function liveParseNumstat(text) {
+  const entries = [];
+  for (const line of String(text ?? "").split("\n")) {
+    const [added, deleted, ...rest] = line.split("\t");
+    if (added === undefined || deleted === undefined || rest.length === 0) continue;
+    entries.push({ path: liveRenamedPath(rest.join("\t")), added: liveCount(added), deleted: liveCount(deleted) });
+  }
+  return entries;
+}
+
+export function liveParsePorcelain(text) {
+  const statuses = new Map();
+  const records = String(text ?? "").split("\0").filter((record) => record.length > 0);
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    const code = record.slice(0, 2);
+    const p = record.slice(3);
+    if (!p.endsWith("/")) statuses.set(p, LIVE_STATUS_BY_CODE[code[0]] ?? LIVE_STATUS_BY_CODE[code[1]] ?? "modified");
+    if (code[0] === "R" || code[0] === "C") index += 1;
+  }
+  return statuses;
+}
+
+export function liveSnapshotChanges(snapshot) {
+  const counts = new Map(liveParseNumstat(snapshot.numstat).map((entry) => [entry.path, entry]));
+  const files = [];
+  for (const [p, status] of liveParsePorcelain(snapshot.porcelain)) {
+    if (status === "untracked" && /(?:^|\/)node_modules\.backup-[^/]+\//.test(p)) continue;
+    const entry = counts.get(p);
+    files.push({ path: p, added: entry?.added ?? 0, deleted: entry?.deleted ?? 0, status });
+  }
+  return files;
+}
+
+export function liveIsHomeOrBroad(targetPath, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const fold = (value) => (platform === "win32" ? String(value).toLowerCase() : String(value));
+  let home;
+  try {
+    home = options.home ?? fs.realpathSync.native(homedir());
+  } catch {
+    return true;
+  }
+  const target = fold(targetPath);
+  const canonicalHome = fold(home);
+  const towardHome = pathRelative(target, canonicalHome);
+  if (towardHome === "" || (!pathIsAbsolute(towardHome) && towardHome !== ".." && !towardHome.startsWith("..\\") && !towardHome.startsWith("../"))) return true;
+  const parent = dirname(target);
+  if (parent === canonicalHome) return LIVE_BROAD_HOME_FOLDER.test(pathBasename(targetPath));
+  return dirname(parent) === canonicalHome
+    && /^onedrive(?: - .+)?$/i.test(pathBasename(parent))
+    && LIVE_BROAD_ONEDRIVE_FOLDER.test(pathBasename(targetPath));
+}
+
+function liveValidEvidence(evidence) {
+  if (!isRecord(evidence)) return false;
+  if (typeof evidence.id !== "string" || evidence.id.length === 0) return false;
+  if (typeof evidence.root !== "string" || !pathIsAbsolute(evidence.root)) return false;
+  if (typeof evidence.path !== "string" || evidence.path.length === 0) return false;
+  if (pathIsAbsolute(evidence.path) || /[\0\r\n]/.test(evidence.root + evidence.path)) return false;
+  if (evidence.path.split(/[\\/]/).some((part) => part === ".." || part === ".git")) return false;
+  return true;
+}
+
+export function liveSessionChangeRoots(sessionId, entries) {
+  const roots = new Set();
+  for (const entry of entries ?? []) {
+    if (!isRecord(entry) || entry.type !== "custom" || !isRecord(entry.data)) continue;
+    const data = entry.data;
+    if (data.sessionId !== sessionId) continue;
+    if (entry.customType === LIVE_SESSION_WORKTREE_ENTRY && typeof data.root === "string" && pathIsAbsolute(data.root)) roots.add(data.root);
+    if (entry.customType === CHANGE_ENTRY && liveValidEvidence(data.evidence)) roots.add(data.evidence.root);
+  }
+  return [...roots];
+}
+
+function liveRootExists(root) {
+  try {
+    return fs.existsSync(join(root, ".git"));
+  } catch {
+    return false;
+  }
+}
+
+export function liveResolveScopeRoots(entries, sessionId, cwdRoot) {
+  const candidates = [];
+  if (typeof cwdRoot === "string" && cwdRoot.length > 0) candidates.push(cwdRoot);
+  for (const root of liveSessionChangeRoots(sessionId, entries)) candidates.push(root);
+  const seen = new Set();
+  const out = [];
+  for (const candidate of candidates) {
+    let real = candidate;
+    try {
+      real = fs.realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    const key = process.platform === "win32" ? real.toLowerCase() : real;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let exists = false;
+    try {
+      exists = liveRootExists(real);
+    } catch {
+      exists = false;
+    }
+    if (!exists) continue;
+    try {
+      if (liveIsHomeOrBroad(real)) continue;
+    } catch {
+      continue;
+    }
+    out.push(real);
+  }
+  return out;
+}
+
+function liveSanitizedEnv(env = process.env) {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !key.toUpperCase().startsWith("GIT_")));
+}
+
+function liveRunGit(root, args) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    let child;
+    try {
+      child = spawn("git", ["-C", root, ...args], { env: liveSanitizedEnv(), shell: false, windowsHide: true, timeout: LIVE_GIT_TIMEOUT_MS });
+    } catch (err) {
+      finish({ stdout: "", code: 1, error: (err && err.message) || String(err) });
+      return;
+    }
+    let stdout = "";
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish({ stdout, code: 1, error: `timed out after ${LIVE_GIT_TIMEOUT_MS}ms` });
+    }, LIVE_GIT_TIMEOUT_MS + 500);
+    if (timer.unref) timer.unref();
+    child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      finish({ stdout, code: 1, error: (err && err.message) || String(err) });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      finish({ stdout, code: typeof code === "number" ? code : 1 });
+    });
+  });
+}
+
+async function liveReadUntrackedLines(root, rel) {
+  const target = join(root, rel);
+  let info;
+  try {
+    info = await fs.promises.lstat(target);
+  } catch {
+    return 0;
+  }
+  if (!info.isFile() || info.size > LIVE_DIFF_MAX_BYTES) return 0;
+  let text;
+  try {
+    text = await fs.promises.readFile(target, "utf8");
+  } catch {
+    return 0;
+  }
+  return text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+}
+
+export async function liveSummarizeRoots(roots) {
+  const list = Array.isArray(roots) ? roots.slice() : [];
+  if (list.length === 0) return { ok: true, files: 0, added: 0, deleted: 0, failedRoots: [] };
+  const perRoot = [];
+  const failedRoots = [];
+  await Promise.all(list.map(async (root) => {
+    let numstat;
+    let porcelain;
+    try {
+      [numstat, porcelain] = await Promise.all([liveRunGit(root, LIVE_NUMSTAT_ARGS), liveRunGit(root, LIVE_PORCELAIN_ARGS)]);
+    } catch {
+      failedRoots.push(root);
+      return;
+    }
+    if (!porcelain || porcelain.code !== 0) {
+      failedRoots.push(root);
+      return;
+    }
+    const files = liveSnapshotChanges({ numstat: (numstat && numstat.code === 0 ? numstat.stdout : ""), porcelain: porcelain.stdout });
+    await Promise.all(files.map(async (file) => {
+      if (file.status !== "untracked") return;
+      try {
+        file.added = await liveReadUntrackedLines(root, file.path);
+      } catch {
+        file.added = 0;
+      }
+    }));
+    perRoot.push({ files });
+  }));
+  if (failedRoots.length > 0) return { ok: false, error: `cannot read git changes in ${failedRoots.length} checkout(s)`, failedRoots };
+  let files = 0;
+  let added = 0;
+  let deleted = 0;
+  for (const tree of perRoot) {
+    for (const file of tree.files) {
+      files += 1;
+      added += file.added;
+      deleted += file.deleted;
+    }
+  }
+  return { ok: true, files, added, deleted, failedRoots: [] };
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
@@ -1155,14 +1402,72 @@ function aggregateChanges(entries, sessionId) {
 const MOSHI_HOOKS_REL = "extensions/moshi-hooks.ts";
 const MOSHI_EXCLUSION_ENTRY = "-extensions/moshi-hooks.ts";
 
-function moshiFlagPath() {
+// S15 identity rename: the active plugin lookup id is herdr-gentle-shell,
+// but every stored state path keeps the herdr-gentle-agents segment (no
+// migration step, no orphaned flags). GENTLE_STATUS_STATE_DIR (explicit
+// user override) is used as-is; HERDR_PLUGIN_STATE_DIR is Herdr-injected
+// and changes with the plugin id, so when it holds none of our files
+// while the stored dir does, the stored dir wins. Fresh installs with no
+// stored files converge on the injected dir.
+const SIDEBAR_STATE_SEGMENT = "herdr-gentle-agents";
+const SIDEBAR_STATE_KNOWN_FILES = [
+  "gentle-sidebar-mode.json",
+  "gentle-moshi.json",
+  "pi-extension-exclusion-owned",
+  "gentle-status.pid",
+  "gentle-interruptions.json",
+  "installer-state",
+  "gentle-worktree-mode.json",
+];
+
+function sidebarStoredDir() {
   const env = process.env;
-  const override = env.GENTLE_STATUS_STATE_DIR ?? env.HERDR_PLUGIN_STATE_DIR;
-  if (typeof override === "string" && override.length > 0) return join(override, "gentle-moshi.json");
   const base = env.XDG_STATE_HOME
     ? join(env.XDG_STATE_HOME, "herdr")
     : join(homedir(), ".local", "state", "herdr");
-  return join(base, "plugins", "herdr-gentle-agents", "gentle-moshi.json");
+  return join(base, "plugins", SIDEBAR_STATE_SEGMENT);
+}
+
+function sidebarEffectiveDir() {
+  const env = process.env;
+  const explicit = env.GENTLE_STATUS_STATE_DIR;
+  if (typeof explicit === "string" && explicit.length > 0) return explicit;
+  const stored = sidebarStoredDir();
+  // HEAD parity: an explicit-but-empty (or otherwise invalid non-nullish)
+  // value ignores every override and uses the stored default. Only an
+  // omitted (null/undefined) explicit falls through to the injected dir.
+  if (explicit !== undefined && explicit !== null) return stored;
+  const injected = env.HERDR_PLUGIN_STATE_DIR;
+  if (typeof injected !== "string" || injected.length === 0) return stored;
+  if (injected === stored) return injected;
+  try {
+    let injectedHas = false;
+    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
+      try {
+        if (fs.existsSync(join(injected, name))) {
+          injectedHas = true;
+          break;
+        }
+      } catch {
+        // A single unreadable entry never decides; keep scanning.
+      }
+    }
+    if (injectedHas) return injected;
+    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
+      try {
+        if (fs.existsSync(join(stored, name))) return stored;
+      } catch {
+        // A single unreadable entry never decides; keep scanning.
+      }
+    }
+  } catch {
+    // Fall through to the injected dir on unexpected failure.
+  }
+  return injected;
+}
+
+function moshiFlagPath() {
+  return join(sidebarEffectiveDir(), "gentle-moshi.json");
 }
 
 function moshiFlagEnabled(path) {
@@ -1283,75 +1588,11 @@ function setMoshiExclusion(want) {
   return { ok: true, note: want ? `added ${MOSHI_EXCLUSION_ENTRY}.` : `removed ${MOSHI_EXCLUSION_ENTRY}.` };
 }
 
-function moshiStatusMessage() {
-  const installed = fs.existsSync(moshiHooksPath());
-  const excluded = installed ? moshiExclusionPresent() : null;
-  const hook = installed
-    ? `${MOSHI_HOOKS_REL}: installed, excluded ${excluded === null ? "unknown (settings.json unreadable)" : excluded ? "yes" : "no"}`
-    : `${MOSHI_HOOKS_REL}: not installed`;
-  return `Moshi notifications are ${moshiFlagEnabled(moshiFlagPath()) ? "on" : "off"} (${hook}). Use /herdr-gentle:moshi enable|disable|status.`;
-}
-
-// Registered before the `enabled()` guard on purpose: the switch belongs to
-// the Pi session, not to a Herdr pane, so it must exist even where this
-// extension publishes nothing. Hosts whose Pi build has no commands simply
-// skip it.
-function registerMoshiToggle(pi) {
-  if (typeof pi?.registerCommand !== "function") return;
-  pi.registerCommand("herdr-gentle:moshi", {
-    description: "Turn Moshi notifications for Gentle (ask + real finish) on or off",
-    handler: async (args, ctx) => {
-      const raw = String(args ?? "").trim().toLowerCase();
-      let verb = raw;
-      // No argument opens the selector when the host can render one; a
-      // cancelled or unavailable selector falls back to status.
-      if (verb === "") {
-        let choice;
-        try {
-          choice = await ctx?.ui?.select?.("Moshi notifications", ["Enable", "Disable", "Status"]);
-        } catch {
-          choice = undefined;
-        }
-        verb = typeof choice === "string" && choice.length > 0 ? choice.toLowerCase() : "status";
-      }
-      if (verb === "on") verb = "enable";
-      if (verb === "off") verb = "disable";
-      if (verb !== "enable" && verb !== "disable" && verb !== "status") {
-        ctx?.ui?.notify?.(`Unknown option "${raw}". Use /herdr-gentle:moshi enable|disable|status.`, "error");
-        return;
-      }
-      if (verb === "status") {
-        ctx?.ui?.notify?.(moshiStatusMessage(), "info");
-        return;
-      }
-      const enabled = verb === "enable";
-      const path = moshiFlagPath();
-      try {
-        writeMoshiFlag(path, enabled);
-      } catch (error) {
-        ctx?.ui?.notify?.(`Could not write ${path}: ${error?.message ?? error}`, "error");
-        return;
-      }
-      const exclusion = setMoshiExclusion(enabled);
-      // A running session keeps the previously loaded hook until /reload:
-      // enabling here activates our sender immediately while the original
-      // hook stays live in that session, so both would notify. Warn once.
-      const reloadNote =
-        enabled && exclusion.ok
-          ? " Sessions already running need /reload to unload the original hook."
-          : "";
-      ctx?.ui?.notify?.(
-        `Moshi notifications ${enabled ? "enabled" : "disabled"}. ${exclusion.note}${reloadNote}`,
-        exclusion.ok ? "info" : "error",
-      );
-    },
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Sidebar integration switch (S7): OUR sidebar versus the native Herdr
-// sidebar. `/herdr-gentle:sidebar toggle|enable|disable|status` (no
-// argument opens a selector, following the Moshi convention above).
+// sidebar. Reached through the `/herdr-gentle:customize` panel's sidebar
+// rows (the old `toggle|enable|disable|status` command is removed); the
+// provider slot below drives `sidebarEnable`/`sidebarDisable`.
 // Enable means OURS (owned native exclusion + managed `configure` rows);
 // disable means NATIVE (only the owned exclusion removed + managed rows
 // unconfigured, so the native sidebar renders again). This block is
@@ -1368,7 +1609,8 @@ const SIDEBAR_NATIVE_REL = "extensions/herdr-agent-state.ts";
 const SIDEBAR_NATIVE_ENTRY = "-extensions/herdr-agent-state.ts";
 const SIDEBAR_MODE_VERSION = 1;
 const SIDEBAR_MARKER_VERSION = 1;
-const SIDEBAR_PLUGIN_ID = "herdr-gentle-agents";
+const SIDEBAR_PLUGIN_ID = "herdr-gentle-shell";
+const SIDEBAR_LEGACY_PLUGIN_ID = "herdr-gentle-agents";
 const SIDEBAR_MARKER_NAME = "pi-extension-exclusion-owned";
 const SIDEBAR_MANAGED_BEGIN = "# BEGIN herdr-gentle-agents (managed; do not edit)";
 const SIDEBAR_MANAGED_END = "# END herdr-gentle-agents";
@@ -1377,13 +1619,7 @@ const SIDEBAR_MANAGED_END = "# END herdr-gentle-agents";
 // resolution as the Moshi flag above): {version:1,enabled:boolean}.
 // Missing defaults to enabled for current-install compatibility.
 function sidebarModePath() {
-  const env = process.env;
-  const override = env.GENTLE_STATUS_STATE_DIR ?? env.HERDR_PLUGIN_STATE_DIR;
-  if (typeof override === "string" && override.length > 0) return join(override, "gentle-sidebar-mode.json");
-  const base = env.XDG_STATE_HOME
-    ? join(env.XDG_STATE_HOME, "herdr")
-    : join(homedir(), ".local", "state", "herdr");
-  return join(base, "plugins", "herdr-gentle-agents", "gentle-sidebar-mode.json");
+  return join(sidebarEffectiveDir(), "gentle-sidebar-mode.json");
 }
 
 function sidebarMarkerPath() {
@@ -1644,13 +1880,17 @@ function removeSidebarExclusion() {
 // never commits state and never claims success.
 // Resolve the installed plugin root via read-only `herdr plugin list
 // --json` (verified shape: result.plugins[] with plugin_id/plugin_root).
-// Fail-closed: zero, ambiguous, non-absolute, or script-less roots refuse.
-function resolveSidebarPluginRoot() {
+// The active (renamed) id is queried first; a zero match falls through to
+// one explicit lookup by the retired id so pre-rename installs keep
+// working. Ambiguous roots fail closed on either id — the legacy lookup
+// is never a silent weak fallback. Other failures (spawn, exit, parse)
+// fail closed on the id that produced them.
+function querySidebarPluginRoots(id) {
   let result;
   try {
     result = spawnSync(
       sidebarHerdrBin(),
-      ["plugin", "list", "--plugin", SIDEBAR_PLUGIN_ID, "--json"],
+      ["plugin", "list", "--plugin", id, "--json"],
       { encoding: "utf8", timeout: 15000, windowsHide: true },
     );
   } catch (error) {
@@ -1662,23 +1902,42 @@ function resolveSidebarPluginRoot() {
   if (result.status !== 0) {
     return { ok: false, note: `could not resolve the installed plugin root (plugin list exited ${result.status}).` };
   }
-  let roots;
   try {
     const doc = JSON.parse(result.stdout || "");
     const arr = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
     if (!Array.isArray(arr)) throw new Error("no plugins array");
-    const hits = arr.filter((p) => p && (p.plugin_id === SIDEBAR_PLUGIN_ID || p.id === SIDEBAR_PLUGIN_ID));
-    roots = [...new Set(hits.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0))];
+    const hits = arr.filter((p) => p && (p.plugin_id === id || p.id === id));
+    const roots = [...new Set(hits.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0))];
+    return { ok: true, roots };
   } catch (error) {
     return { ok: false, note: `could not resolve the installed plugin root: malformed plugin list (${error?.message ?? error}).` };
   }
-  if (roots.length !== 1 || !roots[0].startsWith("/")) {
-    return { ok: false, note: `could not resolve the installed plugin root (${roots.length === 0 ? "no match" : "ambiguous or non-absolute"}).` };
+}
+
+function checkSidebarPluginRoot(root) {
+  if (!root.startsWith("/")) {
+    return { ok: false, note: `could not resolve the installed plugin root (ambiguous or non-absolute).` };
   }
-  if (!fs.existsSync(join(roots[0], "bin", "configure.js"))) {
-    return { ok: false, note: `could not resolve the installed plugin root (${roots[0]} has no bin/configure.js).` };
+  if (!fs.existsSync(join(root, "bin", "configure.js"))) {
+    return { ok: false, note: `could not resolve the installed plugin root (${root} has no bin/configure.js).` };
   }
-  return { ok: true, root: roots[0] };
+  return { ok: true, root };
+}
+
+function resolveSidebarPluginRoot() {
+  const active = querySidebarPluginRoots(SIDEBAR_PLUGIN_ID);
+  if (!active.ok) return active;
+  if (active.roots.length === 1) return checkSidebarPluginRoot(active.roots[0]);
+  if (active.roots.length > 1) {
+    return { ok: false, note: `could not resolve the installed plugin root (ambiguous for ${SIDEBAR_PLUGIN_ID}).` };
+  }
+  const legacy = querySidebarPluginRoots(SIDEBAR_LEGACY_PLUGIN_ID);
+  if (!legacy.ok) return legacy;
+  if (legacy.roots.length === 1) return checkSidebarPluginRoot(legacy.roots[0]);
+  if (legacy.roots.length > 1) {
+    return { ok: false, note: `could not resolve the installed plugin root (ambiguous for retired id ${SIDEBAR_LEGACY_PLUGIN_ID}).` };
+  }
+  return { ok: false, note: `could not resolve the installed plugin root (no match for ${SIDEBAR_PLUGIN_ID} or ${SIDEBAR_LEGACY_PLUGIN_ID}).` };
 }
 
 // Run the installed configure script synchronously (fixed argv, no
@@ -1713,53 +1972,14 @@ function sidebarRowsManaged(text) {
   return typeof text === "string" && text.includes(SIDEBAR_MANAGED_BEGIN) && text.includes(SIDEBAR_MANAGED_END);
 }
 
-// Read-only managed-rows probe for status (never writes the config).
-function sidebarRowsState() {
-  const file = sidebarConfigPath();
-  let body;
-  try {
-    body = fs.readFileSync(file, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") return "rows absent (no Herdr config yet)";
-    return "rows unknown (config unreadable)";
-  }
-  if (body.includes(SIDEBAR_MANAGED_BEGIN) && body.includes(SIDEBAR_MANAGED_END)) {
-    return "managed rows present";
-  }
-  return "managed rows absent";
-}
-
-function sidebarStatusMessage() {
-  const mode = readSidebarMode();
-  const state = mode.state === "missing"
-    ? "enabled (default; no mode file)"
-    : mode.state === "malformed"
-      ? "unknown (mode file malformed)"
-      : mode.state;
-  const which = mode.publish ? "ours" : mode.state === "disabled" ? "native" : "unknown";
-  const installed = fs.existsSync(sidebarNativePath());
-  let excluded;
-  if (!installed) excluded = "not installed";
-  else {
-    const loaded = readSettingsDoc(piSettingsPath());
-    if (loaded === null) excluded = "unknown (settings.json unreadable)";
-    else {
-      const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
-      excluded = list.includes(SIDEBAR_NATIVE_ENTRY) ? "excluded yes" : "excluded no";
-    }
-  }
-  const hook = `${SIDEBAR_NATIVE_REL}: ${excluded}`;
-  return `Gentle sidebar is ${state} (${which}; ${hook}; ${sidebarRowsState()}). Use /herdr-gentle:sidebar toggle|enable|disable|status.`;
-}
-
 async function sidebarEnable(ctx) {
   const notify = ctx?.ui?.notify;
-  const reRun = "Re-run /herdr-gentle:sidebar enable to converge.";
+  const reRun = "Retry via /herdr-gentle:customize to converge.";
   // Preflight before any mutation: unreadable settings or a
   // foreign/misbound record fails closed with nothing touched.
   if (fs.existsSync(sidebarNativePath())) {
     if (readSettingsDoc(piSettingsPath()) === null) {
-      notify?.(`Could not enable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then re-run /herdr-gentle:sidebar enable.`, "error");
+      notify?.(`Could not enable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then retry via /herdr-gentle:customize.`, "error");
       return;
     }
     const binding = checkSidebarMarker(piSettingsPath());
@@ -1824,10 +2044,10 @@ async function sidebarEnable(ctx) {
 
 async function sidebarDisable(ctx) {
   const notify = ctx?.ui?.notify;
-  const reRun = "Re-run /herdr-gentle:sidebar disable to converge.";
+  const reRun = "Retry via /herdr-gentle:customize to converge.";
   if (fs.existsSync(sidebarNativePath())) {
     if (readSettingsDoc(piSettingsPath()) === null) {
-      notify?.(`Could not disable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then re-run /herdr-gentle:sidebar disable.`, "error");
+      notify?.(`Could not disable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then retry via /herdr-gentle:customize.`, "error");
       return;
     }
     const binding = checkSidebarMarker(piSettingsPath());
@@ -1883,52 +2103,6 @@ async function sidebarDisable(ctx) {
     `Gentle sidebar disabled (native renders again). ${exclusion.note} Managed rows removed and verified (configure exit 0). Sessions already running need /reload to pick up the extension-list change.`,
     "info",
   );
-}
-
-// Registered before the `enabled()` guard on purpose: the switch belongs
-// to the Pi session, not to a Herdr pane, so it must exist even where
-// this extension publishes nothing. Hosts whose Pi build has no commands
-// simply skip it.
-function registerSidebarToggle(pi) {
-  if (typeof pi?.registerCommand !== "function") return;
-  pi.registerCommand("herdr-gentle:sidebar", {
-    description: "Switch OUR Herdr sidebar integration versus the native sidebar",
-    handler: async (args, ctx) => {
-      const raw = String(args ?? "").trim().toLowerCase();
-      let verb = raw;
-      // No argument opens the selector when the host can render one; a
-      // cancelled or unavailable selector falls back to status.
-      if (verb === "") {
-        let choice;
-        try {
-          choice = await ctx?.ui?.select?.("Gentle sidebar", ["Enable", "Disable", "Status"]);
-        } catch {
-          choice = undefined;
-        }
-        verb = typeof choice === "string" && choice.length > 0 ? choice.toLowerCase() : "status";
-      }
-      if (verb === "on") verb = "enable";
-      if (verb === "off") verb = "disable";
-      if (verb !== "enable" && verb !== "disable" && verb !== "status" && verb !== "toggle") {
-        ctx?.ui?.notify?.(`Unknown option "${raw}". Use /herdr-gentle:sidebar toggle|enable|disable|status.`, "error");
-        return;
-      }
-      if (verb === "status") {
-        ctx?.ui?.notify?.(sidebarStatusMessage(), "info");
-        return;
-      }
-      if (verb === "toggle") {
-        const mode = readSidebarMode();
-        if (mode.state === "malformed") {
-          ctx?.ui?.notify?.(`Could not toggle: ${sidebarModePath()} is malformed (expected {"version":1,"enabled":boolean}); fix or remove it, then re-run. Nothing was changed.`, "error");
-          return;
-        }
-        verb = mode.publish ? "disable" : "enable";
-      }
-      if (verb === "enable") await sidebarEnable(ctx);
-      else await sidebarDisable(ctx);
-    },
-  });
 }
 
 /* ------------------------------------------------------------ moshi */
@@ -2165,9 +2339,306 @@ function lastFinishedLabel(taskMap) {
   return clean || undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Customize panel providers (customize-command S6, T1).
+//
+// The sidebar and moshi actions stay inline above — nothing is extracted
+// or rewritten here. This block only registers the two actions once at
+// load into the single cross-extension provider slot the worktree
+// extension reads when the panel opens. `Symbol.for` yields the same
+// symbol in both modules without a shared import, so the key literal is
+// the contract: it must stay byte-identical in both files (a test asserts
+// it). Provider contract: read() returns the active value id;
+// apply(value, ctx) returns {changed, needsReload, text} through the
+// existing sidebarEnable/sidebarDisable and writeMoshiFlag/
+// setMoshiExclusion/moshiFlagEnabled paths unchanged. No text here ever
+// asks the user to run /reload (S5): the command notifies once itself
+// and reloads on its own when the verdict says so.
+// ---------------------------------------------------------------------------
+
+function customizeSidebarRead() {
+  try {
+    return readSidebarMode().publish ? "gentle" : "native";
+  } catch {
+    return "native";
+  }
+}
+
+async function customizeSidebarApply(value, ctx) {
+  if (value !== "gentle" && value !== "native") {
+    return { changed: false, needsReload: false, text: `Unknown sidebar value ${JSON.stringify(value)}; nothing was changed.` };
+  }
+  let current = null;
+  try {
+    current = customizeSidebarRead();
+  } catch {
+    current = null;
+  }
+  if (current === value) {
+    return {
+      changed: false,
+      needsReload: false,
+      text: value === "gentle"
+        ? "Gentle sidebar already enabled (ours); nothing was changed."
+        : "Native sidebar already active; nothing was changed.",
+    };
+  }
+  // The existing enable/disable paths notify through ctx while the panel
+  // notifies once itself, so they run against a capturing ctx here and
+  // only their outcome — the re-read mode — decides the verdict.
+  const seen = [];
+  const capture = ctx && typeof ctx === "object"
+    ? { ...ctx, ui: { ...((ctx.ui) ?? {}), notify: (message, level) => { seen.push([message, level]); } } }
+    : ctx;
+  try {
+    if (value === "gentle") await sidebarEnable(capture);
+    else await sidebarDisable(capture);
+  } catch (err) {
+    return { changed: false, needsReload: false, text: `Could not update the sidebar: ${(err && err.message) || err}; nothing was changed.` };
+  }
+  let after = null;
+  try {
+    after = customizeSidebarRead();
+  } catch {
+    after = null;
+  }
+  if (after !== value) {
+    return {
+      changed: false,
+      needsReload: false,
+      text: seen.length > 0 ? String(seen[seen.length - 1][0]) : "Could not update the sidebar; nothing was changed.",
+    };
+  }
+  // S6 reload matrix: the Pi settings exclusion and the native sidebar
+  // only take effect on the next Pi extension load, so a successful
+  // switch ALWAYS reloads.
+  return {
+    changed: true,
+    needsReload: true,
+    text: value === "gentle"
+      ? "Gentle sidebar enabled (ours)."
+      : "Gentle sidebar disabled (native renders again).",
+  };
+}
+
+// Moshi enable prerequisites (customize-command S38). Before the switch
+// flips to On, the enable path verifies (a) the `moshi-hook` CLI resolves
+// on PATH by exact name, and (b) `moshi-hook status --json` (fixed argv,
+// short timeout) reports a top-level `paired: true`. Pairing is what lets
+// a notification reach the phone; the token itself is only consumed by
+// `moshi-hook pair --token` and is never read, logged, stored, or
+// returned here — only the `paired` flag the CLI reports. Either check
+// missing refuses with one message naming the fix, and changes NOTHING:
+// no flag write, no settings write, no exclusion entry, no reload, and
+// the switch stays Off. The `pi` hooks entry is deliberately NOT
+// required: enabling excludes `extensions/moshi-hooks.ts` on purpose, so
+// this plugin is the single notifier. The disable path never calls here;
+// disabling stays unconditional.
+//
+// Self-contained like the rest of this file: the installed copy ships
+// without sibling modules, so this mirrors lib/moshi-prereq.js inline
+// (keep the three refusal literals byte-identical in both files) instead
+// of importing it. The two seams below are the injectable test surface
+// (mirroring the customizeTuiLoader pattern): production uses the real
+// PATH scan + spawnSync, tests replace either seam so no real
+// `moshi-hook` — which may talk to a daemon — is ever spawned.
+const MOSHI_BIN_NAME = "moshi-hook";
+const MOSHI_STATUS_ARGS = ["status", "--json"];
+const MOSHI_STATUS_TIMEOUT_MS = 5000;
+
+let moshiHookResolver = null;
+let moshiStatusRunner = null;
+
+export function setMoshiHookResolver(fn) {
+  moshiHookResolver = typeof fn === "function" ? fn : null;
+}
+
+export function setMoshiStatusRunner(fn) {
+  moshiStatusRunner = typeof fn === "function" ? fn : null;
+}
+
+function defaultResolveMoshiHook() {
+  // Exact-name PATH scan; never through a shell (join + stat only).
+  const names = process.platform === "win32"
+    ? ["moshi-hook.exe", "moshi-hook.cmd", "moshi-hook.bat", MOSHI_BIN_NAME]
+    : [MOSHI_BIN_NAME];
+  const pathEnv = process.env.PATH ?? "";
+  for (const dir of String(pathEnv).split(pathDelimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      const candidate = join(dir, name);
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {
+        // Unreadable entries never decide; keep scanning.
+      }
+    }
+  }
+  return null;
+}
+
+function defaultRunMoshiStatus(cliPath) {
+  // Fixed argv, no shell, short timeout. Only the top-level `paired`
+  // flag is read; every other field (secretStore, hooks, ...) is ignored.
+  let result;
+  try {
+    result = spawnSync(cliPath, [...MOSHI_STATUS_ARGS], {
+      encoding: "utf8",
+      timeout: MOSHI_STATUS_TIMEOUT_MS,
+      windowsHide: true,
+    });
+  } catch {
+    return { ok: false, reason: "spawn-failed" };
+  }
+  if (!result || result.status !== 0) {
+    return { ok: false, reason: "non-zero-exit", status: result ? result.status : null };
+  }
+  const out = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  if (!out) return { ok: false, reason: "unparseable" };
+  let doc;
+  try {
+    doc = JSON.parse(out);
+  } catch {
+    return { ok: false, reason: "unparseable" };
+  }
+  if (!isRecord(doc)) return { ok: false, reason: "missing-field" };
+  if (doc.paired !== true) return { ok: false, reason: doc.paired === false ? "not-paired" : "missing-field" };
+  return { ok: true };
+}
+
+function moshiMissingCliText() {
+  return "Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.";
+}
+
+function moshiNotPairedText() {
+  return "Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from /herdr-gentle:customize.";
+}
+
+function moshiStatusFailedText(reason, status) {
+  let detail = "could not be run";
+  if (reason === "non-zero-exit") detail = `exited with status ${status ?? "unknown"}`;
+  else if (reason === "unparseable") detail = "produced no parseable JSON";
+  else if (reason === "missing-field") detail = "reported no paired flag";
+  return `Moshi notifications cannot be enabled: \`moshi-hook status --json\` did not confirm pairing (${detail}); make sure the Moshi CLI is installed and paired (\`moshi-hook pair --token <pairing-token>\`), then re-apply On from /herdr-gentle:customize.`;
+}
+
+async function checkMoshiEnablePrereqs() {
+  const resolve = moshiHookResolver ?? defaultResolveMoshiHook;
+  const run = moshiStatusRunner ?? defaultRunMoshiStatus;
+  let cliPath = null;
+  try {
+    cliPath = await resolve();
+  } catch {
+    cliPath = null;
+  }
+  if (typeof cliPath !== "string" || cliPath.length === 0) {
+    return { ok: false, text: moshiMissingCliText() };
+  }
+  let status;
+  try {
+    status = await run(cliPath);
+  } catch {
+    status = { ok: false, reason: "spawn-failed" };
+  }
+  if (status && status.ok === true) return { ok: true, cliPath };
+  if (status && status.reason === "not-paired") return { ok: false, text: moshiNotPairedText() };
+  const reason = status && typeof status.reason === "string" ? status.reason : "spawn-failed";
+  return { ok: false, text: moshiStatusFailedText(reason, status ? status.status : null) };
+}
+
+function customizeMoshiRead() {
+  try {
+    return moshiFlagEnabled(moshiFlagPath()) ? "on" : "off";
+  } catch {
+    return "off";
+  }
+}
+
+async function customizeMoshiApply(value, ctx) {
+  if (value !== "on" && value !== "off") {
+    return { changed: false, needsReload: false, text: `Unknown Moshi value ${JSON.stringify(value)}; nothing was changed.` };
+  }
+  let current = null;
+  try {
+    current = customizeMoshiRead();
+  } catch {
+    current = null;
+  }
+  if (current === value) {
+    return {
+      changed: false,
+      needsReload: false,
+      text: `Moshi notifications already ${value === "on" ? "on" : "off"}; nothing was changed.`,
+    };
+  }
+  const want = value === "on";
+  // S38: enabling requires the real prerequisites first. The gate runs
+  // before any write, so a refusal changes NOTHING (no flag file, no
+  // settings write, no exclusion entry, no reload) and the switch stays
+  // Off. Disabling skips the gate entirely and stays unconditional.
+  if (want) {
+    let gate;
+    try {
+      gate = await checkMoshiEnablePrereqs();
+    } catch (err) {
+      gate = { ok: false, text: moshiStatusFailedText("spawn-failed", null) };
+    }
+    if (!gate || gate.ok !== true) {
+      return {
+        changed: false,
+        needsReload: false,
+        text: (gate && typeof gate.text === "string" && gate.text) || moshiStatusFailedText("spawn-failed", null),
+      };
+    }
+  }
+  const file = moshiFlagPath();
+  let exclusionBefore = null;
+  try {
+    exclusionBefore = moshiExclusionPresent();
+  } catch {
+    exclusionBefore = null;
+  }
+  try {
+    writeMoshiFlag(file, want);
+  } catch (err) {
+    return { changed: false, needsReload: false, text: `Could not write ${file}: ${(err && err.message) || err}; nothing was changed.` };
+  }
+  let exclusion = { ok: true, note: "settings.json untouched." };
+  try {
+    exclusion = setMoshiExclusion(want);
+  } catch (err) {
+    exclusion = { ok: false, note: `could not update the Moshi hook exclusion: ${(err && err.message) || err}.` };
+  }
+  let exclusionAfter = null;
+  try {
+    exclusionAfter = moshiExclusionPresent();
+  } catch {
+    exclusionAfter = null;
+  }
+  // S6 reload matrix: the flag is re-read per event (hot, immediate), so
+  // a reload is only needed when the exclusion entry actually changed —
+  // it applies at the next Pi load.
+  return {
+    changed: true,
+    needsReload: exclusionBefore !== exclusionAfter,
+    text: `Moshi notifications ${want ? "enabled" : "disabled"}. ${exclusion.note}`,
+  };
+}
+
+function registerCustomizeProviders() {
+  try {
+    globalThis[Symbol.for("herdr-gentle.customize.v1")] = {
+      sidebar: { read: customizeSidebarRead, apply: customizeSidebarApply },
+      moshi: { read: customizeMoshiRead, apply: customizeMoshiApply },
+    };
+  } catch {
+    // Fail closed: without the slot the panel renders both categories
+    // unavailable instead of throwing at load.
+  }
+}
+
 export default function (pi) {
-  registerMoshiToggle(pi);
-  registerSidebarToggle(pi);
+  registerCustomizeProviders();
   if (!enabled()) return;
 
   let rootSession = false;
@@ -2349,6 +2820,12 @@ export default function (pi) {
   let emittedLabel;
 
   let changes = { files: 0, added: 0, deleted: 0 };
+  // S62 live-scan state: session cwd for scope, generation guard so a stale
+  // async scan never overwrites a newer session, coalesced in-flight flag.
+  let liveGen = 0;
+  let liveInFlight = false;
+  let liveQueued = false;
+  let sessionCwd;
   // T1 passive presence reconciliation state, per root-session binding
   // (session hash + incarnation) with monotonic generation. Reset with the
   // session so a new session never inherits another binding's witness set.
@@ -2381,6 +2858,10 @@ export default function (pi) {
   // session (seq itself never resets).
 
   function refreshSessionRef(ctx) {
+    try {
+      const cwd = ctx?.cwd;
+      if (typeof cwd === "string" && cwd.length > 0) sessionCwd = cwd;
+    } catch {}
     try {
       const file = ctx?.sessionManager?.getSessionFile?.();
       if (typeof file === "string" && file.length > 0) {
@@ -3025,12 +3506,49 @@ export default function (pi) {
   }
 
   function refreshChanges() {
-    if (!sessionManager || !sessionId) return;
+    void liveRefreshChanges();
+  }
+
+  // S62 authoritative publisher: live Git over the subscribed scope.
+  // Async, fixed-argv, coalesced; fail-stale keeps the last good totals
+  // (never 0/0, never partial) so a git failure cannot advertise clean.
+  async function liveRefreshChanges() {
+    if (!rootSession || !sessionManager || !sessionId) return;
+    if (liveInFlight) {
+      liveQueued = true;
+      return;
+    }
+    liveInFlight = true;
+    const gen = liveGen;
     try {
-      const entries = sessionManager.getEntries?.();
-      changes = aggregateChanges(entries, sessionId);
-    } catch {
-      // Observation must never break tool outcomes; keep last aggregate.
+      let entries;
+      try {
+        entries = sessionManager.getEntries?.() ?? [];
+      } catch {
+        return;
+      }
+      let cwdRoot;
+      if (typeof sessionCwd === "string" && sessionCwd.length > 0) {
+        try {
+          const probe = await liveRunGit(sessionCwd, ["rev-parse", "--show-toplevel"]);
+          if (probe && probe.code === 0 && typeof probe.stdout === "string") {
+            const top = probe.stdout.trim();
+            if (top.length > 0) cwdRoot = top;
+          }
+        } catch {}
+      }
+      const roots = liveResolveScopeRoots(entries, sessionId, cwdRoot);
+      const summary = await liveSummarizeRoots(roots);
+      if (gen !== liveGen || !rootSession) return;
+      if (!summary.ok) return;
+      changes = { files: summary.files, added: summary.added, deleted: summary.deleted };
+      schedulePublish();
+    } finally {
+      liveInFlight = false;
+      if (liveQueued) {
+        liveQueued = false;
+        if (gen === liveGen) void liveRefreshChanges();
+      }
     }
   }
 
@@ -3053,6 +3571,10 @@ export default function (pi) {
     nativeLastOk = undefined;
     nativeSettledPending = false;
     errorCode = undefined;
+    liveGen += 1;
+    liveInFlight = false;
+    liveQueued = false;
+    sessionCwd = undefined;
     changes = { files: 0, added: 0, deleted: 0 };
     agentActive = false;
     settled = false;
@@ -3189,6 +3711,15 @@ export default function (pi) {
   // -- session changes -------------------------------------------------------
 
   pi.events.on(CHANGE_EVENT, (event) => {
+    if (!rootSession || !isRecord(event)) return;
+    if (event.sessionId !== undefined && event.sessionId !== sessionId) return;
+    refreshChanges();
+    schedulePublish();
+  });
+
+  // S62 scope registration: a newly registered worktree affects the live
+  // aggregate immediately (same trigger shape as the transcript event).
+  pi.events.on("gentle-pi:session-worktree-changed", (event) => {
     if (!rootSession || !isRecord(event)) return;
     if (event.sessionId !== undefined && event.sessionId !== sessionId) return;
     refreshChanges();
@@ -3430,6 +3961,7 @@ export default function (pi) {
       errorCode = undefined;
       updateBlocker();
     }
+    refreshChanges();
     schedulePublish();
   });
 
@@ -3442,6 +3974,9 @@ export default function (pi) {
     // metadata hint clears (see nativeSettledPending above).
     if (pendingCalls.size > 0) nativeSettledPending = true;
     pendingCalls.clear();
+    // S62 turn-end: the working tree may have changed without transcript
+    // evidence (external/untracked edits), so re-scan before publishing.
+    refreshChanges();
     if (activeSubs().length === 0 && !askActiveNow() && !reviewActive) {
       clearEmittedLabel();
       void publishNow();

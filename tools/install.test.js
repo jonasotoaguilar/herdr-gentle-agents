@@ -28,8 +28,11 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const INSTALL_SH = path.join(REPO_ROOT, 'install.sh');
 const REAL_HELPER = path.join(REPO_ROOT, 'lib', 'pi-extension-exclusion.js');
 const EXCLUSION_ENTRY = '-extensions/herdr-agent-state.ts';
-const PI_NPM_SPEC = 'npm:@jonasotoaguilar/herdr-gentle-agents';
+const PI_NPM_SPEC = 'npm:@jonasotoaguilar/herdr-gentle-shell';
+const PI_LEGACY_NPM_SPEC = 'npm:@jonasotoaguilar/herdr-gentle-agents';
 const PI_GIT_SPEC = 'git:github.com/jonasotoaguilar/herdr-gentle-agents';
+const ACTIVE_PLUGIN_ID = 'herdr-gentle-shell';
+const LEGACY_PLUGIN_ID = 'herdr-gentle-agents';
 
 const FAKE_HERDR = `#!/bin/sh
 # Fake herdr for install.sh tests: logs argv, replays canned plugin-list JSON.
@@ -37,8 +40,24 @@ log="\${HERDR_LOG:-/dev/null}"
 printf '%s\\n' "$*" >>"$log"
 if [ -n "\${ORDER_LOG:-}" ]; then printf 'herdr %s\\n' "$*" >>"$ORDER_LOG"; fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "list" ]; then
+  want=""
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--plugin" ]; then want="$a"; fi
+    prev="$a"
+  done
   mode="\${FAKE_LIST_MODE:-valid}"
   root="\${FAKE_PLUGIN_ROOT:-/nonexistent}"
+  case "$want" in
+    herdr-gentle-shell)
+      mode="\${FAKE_LIST_MODE_ACTIVE:-$mode}"
+      if [ "$mode" = "empty" ] && [ "\${FAKE_ACTIVE_APPEARS_AFTER_INSTALL:-0}" = "1" ] && [ -f "\${FAKE_INSTALL_MARKER:-/dev/null}" ]; then
+        mode="valid"
+      fi ;;
+    *)
+      mode="\${FAKE_LIST_MODE_LEGACY:-$mode}"
+      root="\${FAKE_PLUGIN_ROOT_LEGACY:-$root}" ;;
+  esac
   ver="\${FAKE_PLUGIN_VERSION:-}"
   if [ -n "$ver" ]; then
     vfrag=',"version":"'"$ver"'"'
@@ -47,10 +66,10 @@ if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "list" ]; then
   fi
   case "$mode" in
     valid)
-      printf '{"result":{"plugins":[{"plugin_id":"herdr-gentle-agents","plugin_root":"%s","source":{"kind":"remote"}%s}]}}\\n' "$root" "$vfrag"
+      printf '{"result":{"plugins":[{"plugin_id":"%s","plugin_root":"%s","source":{"kind":"remote"}%s}]}}\\n' "$want" "$root" "$vfrag"
       exit 0 ;;
     local)
-      printf '{"result":{"plugins":[{"plugin_id":"herdr-gentle-agents","plugin_root":"%s","source":{"kind":"local"}%s}]}}\\n' "$root" "$vfrag"
+      printf '{"result":{"plugins":[{"plugin_id":"%s","plugin_root":"%s","source":{"kind":"local"}%s}]}}\\n' "$want" "$root" "$vfrag"
       exit 0 ;;
     empty)
       printf '{"result":{"plugins":[]}}\\n'
@@ -71,7 +90,10 @@ if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "list" ]; then
   exit 0
 fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "unlink" ]; then exit 0; fi
-if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "install" ]; then exit 0; fi
+if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "install" ]; then
+  if [ -n "\${FAKE_INSTALL_MARKER:-}" ]; then echo installed >"$FAKE_INSTALL_MARKER" 2>/dev/null || true; fi
+  exit 0
+fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "enable" ]; then exit 0; fi
 if [ "\${1:-}" = "plugin" ] && [ "\${2:-}" = "uninstall" ]; then
   case "\${FAKE_UNINSTALL_MODE:-ok}" in
@@ -143,6 +165,12 @@ if [ "\${1:-}" = "list" ]; then
   root="\${FAKE_PI_ROOT:-/nonexistent}"
   case "\${FAKE_PI_LIST_MODE:-valid-npm}" in
     valid-npm)
+      printf 'User packages:\\n  npm:@jonasotoaguilar/herdr-gentle-shell\\n    %s\\n  npm:@jonasotoaguilar/herdr-gentle-agents\\n    %s\\n' "$root" "$root"
+      exit 0 ;;
+    valid-new-npm)
+      printf 'User packages:\\n  npm:@jonasotoaguilar/herdr-gentle-shell\\n    %s\\n' "$root"
+      exit 0 ;;
+    valid-legacy-npm)
       printf 'User packages:\\n  npm:@jonasotoaguilar/herdr-gentle-agents\\n    %s\\n' "$root"
       exit 0 ;;
     valid-git)
@@ -278,6 +306,8 @@ function setup(t, opts = {}) {
     'FAKE_GIT_MODE', 'FAKE_GIT_TAGS', 'FAKE_PI_LIST_MODE',
     'FAKE_PI_INSTALL_MODE', 'FAKE_PI_REMOVE_MODE',
     'FAKE_NPM_MODE', 'FAKE_NPM_VERSION',
+    'FAKE_LIST_MODE_ACTIVE', 'FAKE_LIST_MODE_LEGACY', 'FAKE_PLUGIN_ROOT_LEGACY',
+    'FAKE_ACTIVE_APPEARS_AFTER_INSTALL', 'FAKE_INSTALL_MARKER',
     'CURL_LOG', 'GIT_LOG', 'PI_LOG', 'NPM_LOG', 'HERDR_GENTLE_LATEST_URL',
   ]) delete env[name];
   Object.assign(env, {
@@ -298,6 +328,7 @@ function setup(t, opts = {}) {
     FAKE_GIT_MODE: 'fail',
     FAKE_PLUGIN_ROOT: pluginRoot,
     FAKE_LIST_MODE: opts.listMode || 'valid',
+    FAKE_INSTALL_MARKER: path.join(tmp, 'installed.marker'),
     FAKE_PI_ROOT: piRoot,
     FAKE_PI_LIST_MODE: 'valid-npm',
     FAKE_NPM_MODE: 'ok',
@@ -359,7 +390,7 @@ describe('install.sh two-package behavior', () => {
     assert.match(r.stdout, /pi install/);
     assert.match(r.stdout, /herdr plugin install/);
     assert.match(r.stdout, /pi update --extensions/);
-    assert.match(r.stdout, /herdr plugin update herdr-gentle-agents/);
+    assert.match(r.stdout, /herdr plugin update herdr-gentle-shell/);
     assert.match(r.stdout, /managed copy/i);
     assert.match(r.stdout, /HERDR_GENTLE_PI_SOURCE/);
     assert.match(r.stdout, /PI_BIN_PATH/);
@@ -376,7 +407,7 @@ describe('install.sh two-package behavior', () => {
     assert.match(readLog(fx.curlLog), /example\.invalid/, 'latest resolution must run without network');
     const herdrLog = readLog(fx.herdrLog);
     assert.match(herdrLog, /plugin install jonasotoaguilar\/herdr-gentle-agents\/herdr-plugin --ref herdr-v0\.10\.0 --yes/);
-    assert.match(herdrLog, /plugin enable herdr-gentle-agents/);
+    assert.match(herdrLog, /plugin enable herdr-gentle-shell/);
     assert.ok(herdrLog.indexOf('plugin install') < herdrLog.indexOf('plugin enable'), 'install precedes enable');
     assert.match(readLog(fx.piLog), new RegExp(`install ${PI_NPM_SPEC.replace(/[.:/]/g, (c) => `\\${c}`)}`));
     const order = readLog(fx.orderLog);
@@ -515,7 +546,7 @@ describe('install.sh two-package behavior', () => {
     const r = run(['--ref', 'herdr-v0.2.0'], fx.env);
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     const log = readLog(fx.herdrLog);
-    assert.match(log, /plugin unlink herdr-gentle-agents/);
+    assert.match(log, /plugin unlink herdr-gentle-shell/);
     assert.match(log, /plugin install jonasotoaguilar\/herdr-gentle-agents\/herdr-plugin --ref herdr-v0\.2\.0 --yes/);
     assert.ok(log.indexOf('plugin unlink') < log.indexOf('plugin install'), 'unlink must precede install');
     assert.match(`${r.stdout}\n${r.stderr}`, /herdr plugin link/);
@@ -551,7 +582,7 @@ describe('install.sh two-package behavior', () => {
     const r = run(['--ref', 'herdr-v0.2.0'], fx.env);
     assert.equal(r.status, 1, `expected exit 1, got ${r.status}: ${r.stderr}`);
     assert.match(r.stderr, /pi install/);
-    assert.match(r.stderr, /herdr-gentle-agents at herdr-v0\.2\.0/);
+    assert.match(r.stderr, /herdr-gentle-shell at herdr-v0\.2\.0/);
     assert.match(r.stderr, /install\.sh --ref herdr-v0\.2\.0 --pi-source git/);
     assert.match(readLog(fx.herdrLog), /plugin install/, 'the Herdr side is already installed when Pi fails');
     assert.ok(!fs.existsSync(fx.stateFile), 'no state is recorded when pi install fails');
@@ -570,7 +601,7 @@ describe('install.sh two-package behavior', () => {
     const fx = setup(t);
     const r = run(['--ref', 'herdr-v0.2.0', '--pi-source=npm'], fx.env);
     assert.equal(r.status, 0, r.stderr);
-    assert.match(readLog(fx.piLog), /install npm:@jonasotoaguilar\/herdr-gentle-agents/);
+    assert.match(readLog(fx.piLog), /install npm:@jonasotoaguilar\/herdr-gentle-shell/);
     assert.equal(readStateJson(fx.stateFile).pi_source, PI_NPM_SPEC);
   });
 
@@ -585,11 +616,11 @@ describe('install.sh two-package behavior', () => {
     assert.equal(readStateJson(fx.stateFile).pi_source, PI_GIT_SPEC);
   });
 
-  it('unresolvable Pi root warns naming /herdr-gentle:sidebar enable and continues', (t) => {
+  it('unresolvable Pi root warns naming /herdr-gentle:customize and continues', (t) => {
     const fx = setup(t, { fakeEnv: { FAKE_PI_LIST_MODE: 'absent' } });
     const r = run(['--ref', 'herdr-v0.2.0'], fx.env);
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
-    assert.match(r.stderr, /\/herdr-gentle:sidebar enable/);
+    assert.match(r.stderr, /\/herdr-gentle:customize/);
     assert.match(readLog(fx.herdrLog), /plugin install/);
     assert.match(readLog(fx.piLog), /install/);
     assert.equal(readStateJson(fx.stateFile).ref, 'herdr-v0.2.0');
@@ -783,5 +814,128 @@ describe('install.sh two-package behavior', () => {
     assert.equal(r.status, 0, r.stderr);
     assert.equal(fs.readFileSync(canary, 'utf8'), 'canary\n', 'sibling temp file untouched');
     assert.ok(!fs.existsSync(path.join(REPO_ROOT, 'installer-state')), 'no state leaked into repo');
+  });
+});
+
+describe('install.sh plugin identity rename (S15)', () => {
+  it('fresh install enables the new plugin id and installs the new npm spec', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_CURL_TAGS: 'herdr-v0.2.0' } });
+    const r = run(['--ref', 'herdr-v0.2.0'], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    const herdrLog = readLog(fx.herdrLog);
+    assert.match(herdrLog, /plugin enable herdr-gentle-shell/);
+    assert.doesNotMatch(herdrLog, /plugin enable herdr-gentle-agents/);
+    assert.match(readLog(fx.piLog), new RegExp(`install ${PI_NPM_SPEC.replace(/[.:/]/g, (c) => `\\${c}`)}`));
+    assert.equal(readStateJson(fx.stateFile).pi_source, PI_NPM_SPEC);
+  });
+
+  it('installer state keeps the stored legacy plugin dir despite the new id', (t) => {
+    const fx = setup(t);
+    const r = run(['--ref', 'herdr-v0.2.0'], fx.env);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(fx.stateFile.includes(path.join('herdr', 'plugins', LEGACY_PLUGIN_ID)), 'state must live under the legacy dir');
+    assert.ok(fs.existsSync(fx.stateFile), 'state file must exist at the stored location');
+    const freshShellDir = path.join(fx.stateBase, 'herdr', 'plugins', ACTIVE_PLUGIN_ID);
+    assert.ok(!fs.existsSync(freshShellDir), 'the installer must not create a new-id state dir');
+  });
+
+  it('upgrade from a legacy-only install uses the new spec and removes the legacy plugin', (t) => {
+    const legacyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-legacy-root-'));
+    t.after(() => {
+      try { fs.rmSync(legacyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+    const fx = setup(t, {
+      fakeEnv: {
+        FAKE_LIST_MODE_ACTIVE: 'empty',
+        FAKE_LIST_MODE_LEGACY: 'valid',
+        FAKE_PLUGIN_ROOT_LEGACY: legacyRoot,
+        FAKE_PI_LIST_MODE: 'valid-legacy-npm',
+        FAKE_ACTIVE_APPEARS_AFTER_INSTALL: '1',
+      },
+    });
+    const r = run(['--ref', 'herdr-v0.2.0'], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(readLog(fx.piLog), new RegExp(`install ${PI_NPM_SPEC.replace(/[.:/]/g, (c) => `\\${c}`)}`));
+    const herdrLog = readLog(fx.herdrLog);
+    assert.match(herdrLog, /plugin enable herdr-gentle-shell/);
+    assert.match(herdrLog, /plugin uninstall herdr-gentle-agents/);
+    assert.ok(!fs.existsSync(fx.dest), 'the retired managed copy must never be recreated');
+    assert.equal(readStateJson(fx.stateFile).ref, 'herdr-v0.2.0');
+  });
+
+  it('an active-current install with a legacy residue still cleans the legacy plugin', (t) => {
+    const legacyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-legacy-root-'));
+    t.after(() => {
+      try { fs.rmSync(legacyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+    const fx = setup(t, {
+      fakeEnv: {
+        FAKE_CURL_TAGS: 'herdr-v0.2.0',
+        FAKE_LIST_MODE_ACTIVE: 'valid',
+        FAKE_LIST_MODE_LEGACY: 'valid',
+        FAKE_PLUGIN_ROOT_LEGACY: legacyRoot,
+        FAKE_PLUGIN_VERSION: '0.2.0',
+      },
+    });
+    const r = run([], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.notEqual(r.stdout, 'install.sh: already up to date (herdr-v0.2.0)\n', 'legacy residue means not converged');
+    assert.match(readLog(fx.herdrLog), /plugin uninstall herdr-gentle-agents/);
+    assert.equal(readStateJson(fx.stateFile).ref, 'herdr-v0.2.0');
+  });
+
+  it('an ambiguous legacy plugin list fails closed naming the legacy id', (t) => {
+    const fx = setup(t, { fakeEnv: { FAKE_LIST_MODE_ACTIVE: 'empty', FAKE_LIST_MODE_LEGACY: 'multiple' } });
+    const r = run(['--ref', 'herdr-v0.2.0'], fx.env);
+    assert.notEqual(r.status, 0, `expected failure, got ${r.status}: ${r.stderr}`);
+    assert.match(r.stderr, /legacy.*herdr-gentle-agents|herdr-gentle-agents.*legacy/i);
+    assert.doesNotMatch(readLog(fx.herdrLog), /plugin install/);
+    assert.ok(!fs.existsSync(fx.stateFile), 'no state is recorded on ambiguity');
+  });
+
+  it('a locally linked legacy plugin is left in place with a warning', (t) => {
+    const legacyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-legacy-root-'));
+    t.after(() => {
+      try { fs.rmSync(legacyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+    const fx = setup(t, {
+      fakeEnv: {
+        FAKE_LIST_MODE_ACTIVE: 'empty',
+        FAKE_LIST_MODE_LEGACY: 'local',
+        FAKE_PLUGIN_ROOT_LEGACY: legacyRoot,
+        FAKE_ACTIVE_APPEARS_AFTER_INSTALL: '1',
+      },
+    });
+    const r = run(['--ref', 'herdr-v0.2.0'], fx.env);
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(`${r.stdout}\n${r.stderr}`, /legacy.*local|local.*legacy/i);
+    assert.doesNotMatch(readLog(fx.herdrLog), /plugin unlink herdr-gentle-agents/);
+    assert.doesNotMatch(readLog(fx.herdrLog), /plugin uninstall herdr-gentle-agents/);
+  });
+
+  it('uninstall removes both the active and the legacy plugin', (t) => {
+    const legacyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-legacy-root-'));
+    t.after(() => {
+      try { fs.rmSync(legacyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+    const fx = setup(t, {
+      fakeEnv: {
+        FAKE_LIST_MODE_ACTIVE: 'valid',
+        FAKE_LIST_MODE_LEGACY: 'valid',
+        FAKE_PLUGIN_ROOT_LEGACY: legacyRoot,
+      },
+    });
+    assert.equal(run(['--ref', 'herdr-v0.2.0'], fx.env).status, 0);
+    for (const f of [fx.herdrLog, fx.piLog]) truncate(f);
+    const r = run(['--uninstall'], { ...fx.env, FAKE_PI_LIST_MODE: 'valid-new-npm' });
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    const herdrLog = readLog(fx.herdrLog);
+    assert.match(herdrLog, /plugin uninstall herdr-gentle-shell/);
+    assert.match(herdrLog, /plugin uninstall herdr-gentle-agents/);
+    assert.ok(
+      herdrLog.indexOf('plugin uninstall herdr-gentle-shell') < herdrLog.indexOf('plugin uninstall herdr-gentle-agents'),
+      `active before legacy:\n${herdrLog}`,
+    );
+    assert.ok(!fs.existsSync(fx.stateFile), 'state file must be removed');
   });
 });

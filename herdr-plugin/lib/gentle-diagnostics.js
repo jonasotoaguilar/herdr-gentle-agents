@@ -21,7 +21,25 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const PLUGIN_ID = 'herdr-gentle-agents';
+// Active plugin lookup identity (S15 rename). The stored state dir below
+// intentionally keeps the pre-rename segment: no migration, no orphaned
+// flags. Used by install.sh and the sidebar provider for lookups.
+const ACTIVE_PLUGIN_ID = 'herdr-gentle-shell';
+const STATE_PLUGIN_ID = 'herdr-gentle-agents';
+const PLUGIN_ID = STATE_PLUGIN_ID;
+// Family of files proving a state dir is ours: when the Herdr-injected
+// dir (which changes with the plugin id) holds none of these while the
+// stored dir does, the stored dir wins so pre-rename flags stay readable.
+// Fresh installs with no stored files converge on the injected dir.
+const STATE_KNOWN_FILES = [
+  'gentle-sidebar-mode.json',
+  'gentle-moshi.json',
+  'pi-extension-exclusion-owned',
+  'gentle-status.pid',
+  'gentle-interruptions.json',
+  'installer-state',
+  'gentle-worktree-mode.json',
+];
 const CLI_TIMEOUT_MS = 5000;
 const MAX_FILE_BYTES = 256 * 1024;
 const HASH_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -43,15 +61,49 @@ function herdrBinary() {
 
 // Existing state-directory precedence (mirrors bin/gentle-status.js) but
 // WITHOUT mkdir: readers fail closed to "absent" instead of creating.
-function resolveStateDir(env = process.env) {
-  const override = env?.GENTLE_STATUS_STATE_DIR ?? env?.HERDR_PLUGIN_STATE_DIR;
-  if (typeof override === 'string' && override.length > 0) return path.resolve(override);
-  if (env?.XDG_STATE_HOME) return path.join(env.XDG_STATE_HOME, 'herdr', 'plugins', PLUGIN_ID);
+// S15 rename compat: GENTLE_STATUS_STATE_DIR (explicit user override) is
+// used as-is; HERDR_PLUGIN_STATE_DIR is Herdr-injected and changes with
+// the plugin id, so an empty injected dir never orphans the stored
+// pre-rename flags (see STATE_KNOWN_FILES above).
+function storedStateDir(env = process.env) {
+  if (env?.XDG_STATE_HOME) return path.join(env.XDG_STATE_HOME, 'herdr', 'plugins', STATE_PLUGIN_ID);
   const base =
     process.platform === 'win32'
       ? (env?.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local'))
       : path.join(os.homedir(), '.local', 'state');
-  return path.join(base, 'herdr', 'plugins', PLUGIN_ID);
+  return path.join(base, 'herdr', 'plugins', STATE_PLUGIN_ID);
+}
+
+function dirHasKnownFiles(dir) {
+  for (const name of STATE_KNOWN_FILES) {
+    try {
+      if (fs.existsSync(path.join(dir, name))) return true;
+    } catch {
+      // A single unreadable entry never decides; keep scanning.
+    }
+  }
+  return false;
+}
+
+function resolveStateDir(env = process.env) {
+  const explicit = env?.GENTLE_STATUS_STATE_DIR;
+  if (typeof explicit === 'string' && explicit.length > 0) return path.resolve(explicit);
+  const stored = storedStateDir(env);
+  // HEAD parity: an explicit-but-empty (or otherwise invalid non-nullish)
+  // value ignores every override and uses the stored default. Only an
+  // omitted (null/undefined) explicit falls through to the injected dir.
+  if (explicit !== undefined && explicit !== null) return stored;
+  const injected = env?.HERDR_PLUGIN_STATE_DIR;
+  if (typeof injected !== 'string' || injected.length === 0) return stored;
+  const resolvedInjected = path.resolve(injected);
+  if (resolvedInjected === stored) return resolvedInjected;
+  try {
+    if (dirHasKnownFiles(resolvedInjected)) return resolvedInjected;
+    if (dirHasKnownFiles(stored)) return stored;
+  } catch {
+    // Fall through to the injected dir on unexpected failure.
+  }
+  return resolvedInjected;
 }
 
 function resolveConfigPath(env = process.env) {
@@ -336,6 +388,8 @@ function summarizePane(entry, contract, now = Date.now()) {
 
 module.exports = {
   PLUGIN_ID,
+  ACTIVE_PLUGIN_ID,
+  STATE_PLUGIN_ID,
   HASH_RE,
   UNFINISHED_DISPLAYS,
   INTERRUPTION_REASON,

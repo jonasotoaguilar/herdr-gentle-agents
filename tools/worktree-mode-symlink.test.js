@@ -6,7 +6,7 @@
 //
 // Only observable behavior is asserted: the thrown refusal, the untouched
 // canary bytes, the still-symlink path, the exact bytes of the normal path,
-// and the mode command surfacing the refusal instead of claiming success.
+// and the customize command surfacing the refusal instead of claiming success.
 
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -84,9 +84,10 @@ async function loadExtension() {
       return () => {};
     },
   };
-  const factory = (await import(pathToFileURL(copy).href)).default;
+  const mod = await import(pathToFileURL(copy).href);
+  const factory = mod.default;
   factory(pi);
-  return { tools, commands, handlers };
+  return { tools, commands, handlers, mod };
 }
 
 // A state dir whose mode path is a symlink to a canary file. Writing the
@@ -151,16 +152,26 @@ describe('worktree writeMode symlink guard', { concurrency: false }, () => {
     );
   });
 
-  test('the mode command surfaces the refusal and never claims success', async () => {
+  test('customize surfaces the refusal and never claims success', async () => {
     const { dir, canary } = makeSymlinkedModeState();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: dir });
     try {
-      const { commands } = await loadExtension();
-      const def = commands.get('herdr-gentle:worktree');
-      assert.ok(def, 'expected the herdr-gentle:worktree command');
+      const { commands, mod } = await loadExtension();
+      // No TUI helpers: the command degrades to the plain select menu,
+      // which runs the same worktree apply path as the panel.
+      mod.setCustomizeTuiLoader(async () => { throw new Error('no TUI here'); });
+      const def = commands.get('herdr-gentle:customize');
+      assert.ok(def, 'expected the herdr-gentle:customize command');
       const notes = [];
-      const ctx = { ui: { notify: (message, level) => { notes.push([message, level]); } } };
-      await def.handler('enabled', ctx);
+      const answers = ['Worktree tools', 'Enabled'];
+      const ctx = {
+        ui: {
+          notify: (message, level) => { notes.push([message, level]); },
+          select: async () => answers.shift(),
+        },
+        reload: async () => { notes.push(['reloaded', 'reload']); },
+      };
+      await def.handler('', ctx);
       assert.ok(notes.length > 0, 'expected at least one notification');
       assert.ok(
         notes.some(([message, level]) => level === 'error' && /symlink|refus|could not write/i.test(message)),
@@ -169,6 +180,10 @@ describe('worktree writeMode symlink guard', { concurrency: false }, () => {
       assert.ok(
         !notes.some(([message]) => /Worktree tools enabled/.test(message)),
         `success is never claimed: ${JSON.stringify(notes)}`,
+      );
+      assert.ok(
+        !notes.some(([message]) => message === 'reloaded'),
+        'a refused write never reloads',
       );
       assert.equal(
         fs.readFileSync(canary, 'utf8'),

@@ -221,7 +221,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
       const { tools } = await loadExtension();
       assert.deepEqual(
         [...tools.keys()].sort(),
-        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open'],
+        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'],
       );
       const params = tools.get('worktree_session_open').parameters;
       assert.deepEqual(Object.keys(params.properties).sort(), ['name', 'notify', 'session', 'worktree']);
@@ -238,7 +238,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
       require('../lib/worktree-mode.js').writeMode(false, process.env);
       const { tools, commands } = await loadExtension();
       assert.deepEqual([...tools.keys()], [], 'no worktree tool is registered while disabled');
-      assert.ok(commands.has('herdr-gentle:worktree'), 'the toggle itself stays registered');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
     } finally {
       restoreEnv();
     }
@@ -260,7 +260,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
       require('../lib/worktree-mode.js').writeMode(false, process.env);
       const result = await callSessionOpen(tools, { worktree: 'feat-gated' }, makeCtx(root));
       assert.equal(result.isError, true);
-      assert.ok(resultText(result).includes('/herdr-gentle:worktree enabled'), `names the toggle: ${resultText(result)}`);
+      assert.ok(resultText(result).includes('/herdr-gentle:customize'), `names the new command: ${resultText(result)}`);
       assert.deepEqual(shimArgv(herdr.log), [], 'herdr is never invoked');
     } finally {
       restoreEnv();
@@ -269,7 +269,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
 });
 
 describe('worktree_session_open scope guard (S25)', { concurrency: false }, () => {
-  test('an absolute PATH is refused with an actionable message before any backend runs', async () => {
+  test('S29: an absolute PATH of a project worktree resolves (name first, then path)', async () => {
     const root = makeRepo('abspath');
     const target = addRegistered(root, 'feat/real');
     const herdr = makeHerdrStub();
@@ -285,11 +285,17 @@ describe('worktree_session_open scope guard (S25)', { concurrency: false }, () =
     });
     try {
       const { tools } = await loadExtension();
+      // The checkout path of a registered live worktree resolves to it.
       const result = await callSessionOpen(tools, { worktree: target }, makeCtx(root));
-      assert.equal(result.isError, true);
-      assert.match(resultText(result), /not a path|refuses a path|pass the (worktree )?name/i);
-      assert.ok(resultText(result).includes('worktree list'), `names the listing: ${resultText(result)}`);
-      assert.deepEqual(shimArgv(herdr.log), [], 'herdr is never invoked for a path');
+      assert.equal(result.isError, undefined, `expected the path to resolve, got: ${resultText(result)}`);
+      assert.equal(result.details.worktree, 'feat-real', 'the path resolves to its registered row');
+      assert.equal(result.details.path, target, 'the checkout path is reported');
+      assert.ok(shimArgv(herdr.log).length > 0, 'herdr runs for a project path');
+      // A foreign path still fails closed before any backend runs.
+      const foreign = await callSessionOpen(tools, { worktree: '/tmp/wt-ou-definitely-foreign' }, makeCtx(root));
+      assert.equal(foreign.isError, true, 'a foreign path fails closed');
+      assert.match(resultText(foreign), /not a path|refuses a path|pass the (worktree )?name/i);
+      assert.ok(resultText(foreign).includes('worktree list'), `names the listing: ${resultText(foreign)}`);
     } finally {
       restoreEnv();
     }
@@ -368,6 +374,35 @@ describe('worktree_session_open scope guard (S25)', { concurrency: false }, () =
     }
   });
 
+  test('an unregistered name preserves its exact refusal without side effects', async () => {
+    const root = makeRepo('unregistered-refusal');
+    const target = track(path.join(path.dirname(root), `${path.basename(root)}-ghost`));
+    git(root, ['worktree', 'add', '-b', 'feat/ghost', target, 'HEAD']);
+    const registry = require('../lib/worktree-registry.js');
+    const registryPath = registry.registryPath(root);
+    const beforeRegistry = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
+    const beforeLive = git(root, ['worktree', 'list', '--porcelain']);
+    const herdr = makeHerdrStub();
+    const modeEnv = scratchModeEnv();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const { tools } = await loadExtension();
+      const result = await callSessionOpen(tools, { worktree: 'feat-ghost' }, makeCtx(root));
+      assert.equal(result.isError, true);
+      assert.equal(resultText(result), `no registered worktree for "feat-ghost": 'feat/ghost' at ${fs.realpathSync(target)} is unregistered, and neither close nor warp acts on an unregistered checkout`);
+      assert.deepEqual(shimArgv(herdr.log), [], 'no backend invocation');
+      assert.equal(git(root, ['worktree', 'list', '--porcelain']), beforeLive);
+      assert.deepEqual(fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null, beforeRegistry);
+    } finally {
+      restoreEnv();
+    }
+  });
+
   test('a branch name resolves through the one resolver to its printed slug', async () => {
     const root = makeRepo('bybranch');
     const target = addRegistered(root, 'feat/by-branch');
@@ -386,7 +421,11 @@ describe('worktree_session_open scope guard (S25)', { concurrency: false }, () =
       const { tools } = await loadExtension();
       const result = await callSessionOpen(tools, { worktree: 'feat/by-branch' }, makeCtx(root));
       assert.equal(result.isError, undefined, `a branch name resolves: ${resultText(result)}`);
-      assert.match(resultText(result), /^worktree session open: feat-by-branch [0-9a-f-]{36}$/);
+      assert.deepEqual(resultText(result).split('\n'), [
+        `opened: feat-by-branch · ${result.details.sessionId}`,
+        `path: ${target}`,
+      ]);
+      assert.match(result.details.sessionId, /^[0-9a-f-]{36}$/);
       assert.equal(result.details.worktree, 'feat-by-branch');
       assert.equal(result.details.branch, 'feat/by-branch');
     } finally {
@@ -607,7 +646,10 @@ describe('worktree_session_open agent argv (S25)', { concurrency: false }, () =>
       assert.equal(result.details.sessionId, minted[1], 'the minted id is returned');
       assert.equal(result.details.resumed, false);
       assert.equal(result.details.agentName, 'feat-new-sess');
-      assert.match(resultText(result), new RegExp(`^worktree session open: feat-new-sess ${minted[1]}$`));
+      assert.deepEqual(resultText(result).split('\n'), [
+        `opened: feat-new-sess · ${minted[1]}`,
+        `path: ${target}`,
+      ]);
     } finally {
       restoreEnv();
     }
@@ -644,7 +686,10 @@ describe('worktree_session_open agent argv (S25)', { concurrency: false }, () =>
       assert.ok(afterDash.includes('--session abc123'), `resume id: ${afterDash}`);
       assert.ok(!afterDash.includes('--session-id'), `never mints on resume: ${afterDash}`);
       assert.ok(!afterDash.includes('--session-dir'), `the pane cwd is the worktree: ${afterDash}`);
-      assert.equal(resultText(result), 'worktree session open: feat-resume abc123');
+      assert.deepEqual(resultText(result).split('\n'), [
+        'opened: feat-resume · abc123',
+        'resumed',
+      ]);
       assert.equal(result.details.sessionId, 'abc123');
       assert.equal(result.details.resumed, true);
       assert.equal(result.details.agentName, 'delegate-1');
@@ -894,18 +939,18 @@ describe('worktree_session_open preserves the existing tools (S25)', { concurren
       const { tools, commands } = await loadExtension();
       assert.deepEqual(
         [...tools.keys()].sort(),
-        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open'],
+        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'],
       );
       assert.deepEqual(
         Object.keys(tools.get('worktree_create').parameters.properties).sort(),
-        ['branch', 'issues'],
+        ['branch', 'issues', 'odd'],
       );
       assert.deepEqual(
         Object.keys(tools.get('worktree_close').parameters.properties).sort(),
         ['branch', 'force', 'name', 'path'],
       );
       assert.ok(tools.get('worktree_list'), 'worktree_list stays registered');
-      assert.ok(commands.has('herdr-gentle:worktree'), 'the mode command stays registered');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
       // List still answers the principal line when nothing else is registered.
       const listResult = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       assert.equal(listResult.isError, undefined);
@@ -1073,7 +1118,10 @@ describe('worktree_session_open finish subscription (S26)', { concurrency: false
       const result = await callSessionOpen(tools, { worktree: 'feat-watch-finished' }, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       const sessionId = result.details.sessionId;
-      assert.match(resultText(result), new RegExp(`^worktree session open: feat-watch-finished ${sessionId}$`));
+      assert.deepEqual(resultText(result).split('\n'), [
+        `opened: feat-watch-finished · ${sessionId}`,
+        `path: ${target}`,
+      ]);
       // The first poll observes `working`: a finish is impossible yet, so
       // nothing may be delivered on that poll.
       await waitUntil(() => readAgentGetCount(seq.count) >= 1, 3000, 'the first agent get poll');
@@ -1328,7 +1376,10 @@ describe('worktree_session_open finish subscription (S26)', { concurrency: false
       const { tools, sent } = loaded;
       const result = await callSessionOpen(tools, { worktree: 'feat-watch-t34' }, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      assert.match(resultText(result), /^worktree session open: feat-watch-t34 [0-9a-f-]{36}$/);
+      assert.deepEqual(resultText(result).split('\n'), [
+        `opened: feat-watch-t34 · ${result.details.sessionId}`,
+        `path: ${target}`,
+      ]);
       assert.deepEqual(Object.keys(result.details).sort(), [
         'agentName', 'branch', 'notify', 'paneId', 'path',
         'resumed', 'sessionId', 'workspaceId', 'worktree',
@@ -1993,6 +2044,66 @@ describe('worktree_session_open adversarial regressions (round 3)', { concurrenc
       assert.equal(timer._idleTimeout, -1, 'the watcher stopped at the maximum wait');
     } finally {
       try { if (mod && mod.clearSessionWatchers) mod.clearSessionWatchers(); } catch {}
+      restoreEnv();
+    }
+  });
+});
+
+describe('S19: bounded session_open compact (agent text)', { concurrency: false }, () => {
+  function stdEnvS19(herdr, world, modeEnv) {
+    return {
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_STUB_WORKTREE_LIST: world.worktreeList,
+      HERDR_STUB_PANE_LIST: world.paneList,
+    };
+  }
+
+  test('fresh open returns exactly the ordered opened/path lines', async () => {
+    const root = makeRepo('s19-fresh');
+    const target = addRegistered(root, 'feat/s19-fresh');
+    const herdr = makeHerdrStub();
+    const world = workspaceWorld(root, 'feat/s19-fresh', target, { workspaceId: 'ws-s19-fresh' });
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnvS19(herdr, world, modeEnv));
+    try {
+      const { tools } = await loadExtension();
+      const result = await callSessionOpen(tools, { worktree: 'feat-s19-fresh', notify: false }, makeCtx(root));
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const lines = resultText(result).split('\n');
+      assert.equal(lines.length, 2, `exactly two ordered lines: ${JSON.stringify(resultText(result))}`);
+      assert.equal(lines[0], `opened: feat-s19-fresh · ${result.details.sessionId}`);
+      assert.equal(lines[1], `path: ${target}`);
+      assert.equal(result.details.path, target);
+      assert.equal(result.details.resumed, false);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('resume returns exactly the ordered opened/resumed lines', async () => {
+    const root = makeRepo('s19-resume');
+    const target = addRegistered(root, 'feat/s19-resume');
+    const herdr = makeHerdrStub();
+    const world = workspaceWorld(root, 'feat/s19-resume', target, { workspaceId: 'ws-s19-resume' });
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnvS19(herdr, world, modeEnv));
+    try {
+      const { tools } = await loadExtension();
+      const result = await callSessionOpen(
+        tools,
+        { worktree: 'feat-s19-resume', session: 'abc123', notify: false },
+        makeCtx(root),
+      );
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.deepEqual(resultText(result).split('\n'), [
+        'opened: feat-s19-resume · abc123',
+        'resumed',
+      ]);
+      assert.equal(result.details.resumed, true);
+    } finally {
       restoreEnv();
     }
   });
