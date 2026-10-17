@@ -3553,9 +3553,6 @@ describe('warp selector Ctrl+D delete (human selector)', { concurrency: false },
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      const tui = await import('@earendil-works/pi-tui');
-      const helpers = { matchesKey: tui.matchesKey, isKeyRelease: tui.isKeyRelease };
-      void helpers;
       void pickerLib;
       let closeCalls = [];
       const { commands, mod } = await loadExtension();

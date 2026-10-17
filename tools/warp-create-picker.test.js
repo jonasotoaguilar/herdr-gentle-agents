@@ -25,6 +25,25 @@ const path = require('node:path');
 
 const picker = require('../lib/warp-create-picker.js');
 
+// Optional real dependency: the host's pi-tui package. CI installs NO
+// dependencies, so resolve it once here and SKIP the tests that genuinely
+// need the real module instead of failing (the
+// worktree-warp-real-session pattern). Every test that only needs the
+// raw-byte fallback keeps running everywhere, with or without the package.
+let TUI_AVAILABLE = false;
+try {
+  require.resolve('@earendil-works/pi-tui');
+  TUI_AVAILABLE = true;
+} catch {
+  TUI_AVAILABLE = false;
+}
+if (!TUI_AVAILABLE) {
+  console.error(
+    'warp-create-picker: SKIPPING real-matcher tests (no @earendil-works/pi-tui found; '
+    + 'install the package, e.g. npm install @earendil-works/pi-tui, to run them)',
+  );
+}
+
 const roots = [];
 after(() => {
   for (const dir of roots) {
@@ -1540,7 +1559,7 @@ describe('freeze/cancel/key regression (S52: real matcher + raw fallback)', { co
     return { view, finished };
   }
 
-  test("the installed matcher accepts the ids the picker passes ('escape', 'enter', 'tab')", async () => {
+  test("the installed matcher accepts the ids the picker passes ('escape', 'enter', 'tab')", { skip: !TUI_AVAILABLE }, async () => {
     const tui = await import('@earendil-works/pi-tui');
     assert.equal(typeof tui.matchesKey, 'function', 'the host exposes matchesKey');
     // The explorer claim that 'escape' is invalid never executed: the
@@ -1552,7 +1571,7 @@ describe('freeze/cancel/key regression (S52: real matcher + raw fallback)', { co
     assert.equal(tui.matchesKey('\t', 'tab'), true, 'raw Tab matches tab');
   });
 
-  test('with the real helpers, raw terminal keys drive the picker', async () => {
+  test('with the real helpers, raw terminal keys drive the picker', { skip: !TUI_AVAILABLE }, async () => {
     const tui = await import('@earendil-works/pi-tui');
     const helpers = { matchesKey: tui.matchesKey, isKeyRelease: tui.isKeyRelease };
     const first = open({ helpers });
@@ -1890,7 +1909,7 @@ describe('the inline name input (S52 Back on every field)', { concurrency: false
     assert.ok(!text.includes('picked'), 'no stale value renders either');
   });
 
-  test('first typing lands as the actual value with the cursor after it', async () => {
+  test('first typing lands as the actual value with the cursor after it', { skip: !TUI_AVAILABLE }, async () => {
     const tui = await import('@earendil-works/pi-tui');
     const { view } = open();
     view.handleInput('a');
@@ -1905,7 +1924,7 @@ describe('the inline name input (S52 Back on every field)', { concurrency: false
     assert.ok(line.indexOf('a') < at, 'the marker (and cursor) sit after the actual value, never after a placeholder');
   });
 
-  test('the cursor marker is zero-width: Unicode/ANSI width stays exact', async () => {
+  test('the cursor marker is zero-width: Unicode/ANSI width stays exact', { skip: !TUI_AVAILABLE }, async () => {
     const tui = await import('@earendil-works/pi-tui');
     const { view } = open();
     for (const ch of 'caf\u00e9 \u4e2d') view.handleInput(ch);
@@ -1965,7 +1984,7 @@ describe('the inline name input (S52 Back on every field)', { concurrency: false
     assert.deepEqual(finished, ['picked'], 'submitting unchanged keeps it');
   });
 
-  test('raw terminal keys drive it with and without helpers', async () => {
+  test('raw terminal keys drive it with real helpers', { skip: !TUI_AVAILABLE }, async () => {
     const tui = await import('@earendil-works/pi-tui');
     const helpers = { matchesKey: tui.matchesKey, isKeyRelease: tui.isKeyRelease };
     const first = open({ helpers });
@@ -1974,6 +1993,8 @@ describe('the inline name input (S52 Back on every field)', { concurrency: false
     first.view.handleInput('b');
     first.view.handleInput('\t');
     assert.deepEqual(first.finished, [{ back: true, value: 'b' }], 'raw Tab goes back carrying the typed value with real helpers');
+  });
+  test('raw terminal keys drive it with the raw fallback (no helpers)', () => {
     const second = open();
     second.view.handleInput('x');
     second.view.handleInput('\x1b');
@@ -2021,7 +2042,7 @@ describe('the inline type single-select (Tab Back, no selectable rows)', { concu
     view.handleInput('\t');
     assert.deepEqual(finished, [{ back: true }], 'raw Tab returns Back (single-select carries no list state)');
   });
-  test('raw keys with the real matcher: arrows move, Enter confirms, Tab goes back', async () => {
+  test('raw keys with the real matcher: arrows move, Enter confirms, Tab goes back', { skip: !TUI_AVAILABLE }, async () => {
     const tui = await import('@earendil-works/pi-tui');
     const helpers = { matchesKey: tui.matchesKey, isKeyRelease: tui.isKeyRelease };
     const first = openType({ helpers });
@@ -2147,7 +2168,7 @@ describe('warp selector Ctrl+D delete (single-select extension)', { concurrency:
     view.handleInput('\x04');
     assert.deepEqual(finished, [{ delete: true, index: 1, value: ITEMS[1] }], 'raw Ctrl+D deletes the focused eligible row');
   });
-  test('raw Ctrl+D via the installed matcher invokes delete on the eligible row', async () => {
+  test('raw Ctrl+D via the installed matcher invokes delete on the eligible row', { skip: !TUI_AVAILABLE }, async () => {
     const tui = await import('@earendil-works/pi-tui');
     assert.equal(tui.matchesKey('\x04', 'ctrl+d'), true, 'precondition: the installed matcher owns Ctrl+D');
     const { view, finished } = openWarp({ helpers: { matchesKey: tui.matchesKey, isKeyRelease: tui.isKeyRelease } });
